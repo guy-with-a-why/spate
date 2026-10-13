@@ -116,7 +116,8 @@ pub struct RegistrySection {
     /// Basic-auth username (optional).
     #[serde(default)]
     pub username: Option<String>,
-    /// Basic-auth password (optional; use `${VAR}` interpolation).
+    /// Basic-auth password (optional; use `${VAR}` interpolation). Requires
+    /// `username`.
     #[serde(default)]
     pub password: Option<String>,
     /// Trust settings for an `https://` registry.
@@ -268,7 +269,8 @@ impl AvroDeserializerBuilder {
     /// # Errors
     ///
     /// [`AvroConfigError::SchemaLoad`] for a schema that cannot be loaded,
-    /// [`AvroConfigError::Invalid`] for settings the mode rejects or registry URL credentials, and
+    /// [`AvroConfigError::Invalid`] for settings the mode rejects, registry URL credentials, or a
+    /// registry password without a username, and
     /// [`AvroConfigError::Registry`] for a registry client that cannot be built.
     pub fn from_settings(
         settings: &AvroSettings,
@@ -283,6 +285,16 @@ impl AvroDeserializerBuilder {
             return Err(AvroConfigError::Invalid {
                 detail: "registry.url contains credentials; set them in registry.username and registry.password"
                     .into(),
+            });
+        }
+        if settings.mode == AvroMode::Confluent
+            && settings
+                .registry
+                .as_ref()
+                .is_some_and(|registry| registry.password.is_some() && registry.username.is_none())
+        {
+            return Err(AvroConfigError::Invalid {
+                detail: "registry.password is set, but registry.username is not".into(),
             });
         }
         let reader_schema = settings
@@ -643,6 +655,60 @@ mod tests {
         assert_credential_error(
             AvroDeserializerBuilder::from_component(&cfg, rt.handle()).unwrap_err(),
         );
+    }
+
+    /// A password without a username, an empty one included, fails during
+    /// settings load, ahead of reader-schema loading and TLS client
+    /// construction, with an error that names both fields and never the
+    /// password. Regression for #1034.
+    #[test]
+    fn a_registry_password_without_a_username_is_rejected() {
+        let rt = runtime();
+        let settings = |password: &str| {
+            let mut registry = RegistrySection::new("http://127.0.0.1:1");
+            registry.password = Some(password.into());
+            AvroSettings {
+                registry: Some(registry),
+                ..AvroSettings::default()
+            }
+        };
+        let cfg = component(
+            "registry: {url: 'https://sr', password: s3cret, \
+             tls: {root_ca: /nonexistent-spate-1034/ca.pem}}\n\
+             reader_schema: {inline: invalid-schema}\nprewarm_subjects: [orders-value]",
+        );
+        for error in [
+            AvroDeserializerBuilder::from_settings(&settings("s3cret"), rt.handle()).unwrap_err(),
+            AvroDeserializerBuilder::from_settings(&settings(""), rt.handle()).unwrap_err(),
+            AvroDeserializerBuilder::from_component(&cfg, rt.handle()).unwrap_err(),
+        ] {
+            assert!(matches!(error, AvroConfigError::Invalid { .. }), "{error}");
+            for printed in [error.to_string(), format!("{error:?}")] {
+                for field in ["registry.password", "registry.username"] {
+                    assert!(printed.contains(field), "{printed}");
+                }
+                assert!(!printed.contains("s3cret"), "{printed}");
+            }
+        }
+    }
+
+    /// A fixed-schema mode rejects a password-only `registry` section as a
+    /// section the mode does not use.
+    #[test]
+    fn a_fixed_schema_mode_rejects_a_password_only_registry_as_unused() {
+        let rt = runtime();
+        for mode in ["raw", "single_object"] {
+            let cfg = component(&format!(
+                "mode: {mode}\nschema: {{inline: '{SCHEMA}'}}\n\
+                 registry: {{url: http://sr, password: s3cret}}"
+            ));
+            let err = AvroDeserializerBuilder::from_component(&cfg, rt.handle()).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("does not use a `registry` section"),
+                "{mode}: {err}"
+            );
+        }
     }
 
     /// Credential-free parsed URLs accept configured auth and `@` in path/query data.
