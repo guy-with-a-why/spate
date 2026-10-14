@@ -73,6 +73,17 @@ fn start_with_options(
     options: RuntimeOptions,
     mode_factory: impl Fn(Arc<ChainShared>, Arc<Mutex<SourceLog>>) -> FakeChain + Send + 'static,
 ) -> Harness {
+    start_with(config, options, |runtime| runtime, mode_factory)
+}
+
+/// [`start_with_options`], with `customize` applied to the assembled runtime
+/// before it runs.
+fn start_with(
+    config: PipelineConfig,
+    options: RuntimeOptions,
+    customize: impl FnOnce(PipelineRuntime<FakeSource>) -> PipelineRuntime<FakeSource>,
+    mode_factory: impl Fn(Arc<ChainShared>, Arc<Mutex<SourceLog>>) -> FakeChain + Send + 'static,
+) -> Harness {
     let (source, shared, script) = FakeSource::new();
     let chain_shared = Arc::new(ChainShared::default());
     let (sink, drained) = test_sink();
@@ -91,6 +102,7 @@ fn start_with_options(
         budget,
     )
     .with_options(options);
+    let runtime = customize(runtime);
     let shutdown = runtime.shutdown_handle();
     let join = std::thread::spawn(move || runtime.run());
     Harness {
@@ -1045,6 +1057,78 @@ fn caller_owned_io_runtime_is_used_and_shut_down_by_run() {
     );
 }
 
+/// A caller-owned current-thread I/O runtime fails `run` with
+/// `StartError::Config` before any pipeline thread starts. Regression for
+/// #1155.
+#[test]
+fn current_thread_io_runtime_fails_startup() {
+    let io = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (queues, receivers) = shard_queues(1, 8);
+    let drain: super::SinkDrainFn = Box::new(move |_budget| {
+        Box::pin(async move {
+            let _receivers = receivers;
+            DrainReport::default()
+        })
+    });
+    let sink = SinkRuntime {
+        queues: vec![queues],
+        drain,
+        probe: None,
+        failures: SinkFailures::new(),
+    };
+
+    let (source, shared, _script) = FakeSource::new();
+    let chain_shared = Arc::new(ChainShared::default());
+    let log = Arc::new(Mutex::new(SourceLog::default()));
+    let chains_built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let chains_built_in = Arc::clone(&chains_built);
+    let runtime = PipelineRuntime::new(
+        test_config(1),
+        source,
+        move |_thread| {
+            chains_built_in.fetch_add(1, Ordering::Relaxed);
+            Box::new(FakeChain {
+                shared: Arc::clone(&chain_shared),
+                log: Arc::clone(&log),
+                mode: ChainMode::Ok,
+                batches_seen: 0,
+            }) as Box<dyn RunnableChain>
+        },
+        sink,
+        Arc::new(crate::backpressure::InflightBudget::new()),
+    )
+    .with_options(test_options())
+    .with_io_runtime(io);
+    // Without the check, a pre-triggered shutdown lets `run` drain and
+    // return `Ok`, so the assertion below fails instead of hanging.
+    runtime.shutdown_handle().trigger();
+    let (result, rendered) = std::thread::spawn(move || {
+        let mut result = None;
+        let rendered = crate::metrics::render_local(|| result = Some(runtime.run()));
+        (result.expect("run returned"), rendered)
+    })
+    .join()
+    .unwrap();
+
+    let Err(err @ StartError::Config(_)) = result else {
+        panic!("expected StartError::Config, got {result:?}");
+    };
+    assert!(err.to_string().contains("multi-thread"), "{err}");
+    assert!(!shared.lock().unwrap().opened, "the source must not open");
+    assert_eq!(
+        chains_built.load(Ordering::Relaxed),
+        0,
+        "no pipeline thread may start"
+    );
+    assert!(
+        !rendered.contains(names::PIPELINE_STATE),
+        "a refused runtime must register no series:\n{rendered}"
+    );
+}
+
 /// The source drops while the io runtime still runs, so work its `Drop`
 /// spawns there completes. Regression for #854.
 #[test]
@@ -1349,6 +1433,254 @@ fn the_inflight_budget_reaches_the_exposition_as_one_series() {
     h.script.lock().unwrap().push_back(Script::Drained);
     let report = h.join.join().unwrap().unwrap();
     assert_eq!(report.state, ExitState::Completed);
+}
+
+/// The value of one pipeline's `spate_pipeline_io_busy_ratio` line, if the
+/// exposition carries it.
+fn io_busy_ratio(rendered: &str, pipeline_name: &str) -> Option<f64> {
+    let prefix = format!(
+        r#"{}{{pipeline="{pipeline_name}",component="runtime",component_type="pipeline"}} "#,
+        names::PIPELINE_IO_BUSY_RATIO
+    );
+    rendered
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|v| v.parse().ok())
+}
+
+fn install_prometheus(cfg: &PipelineConfig) -> crate::metrics::MetricsHandle {
+    // Installed before the pipeline builds. Handles bind to the recorder
+    // present at construction, and `install` is idempotent, so the runtime
+    // reuses this one and renders through this handle.
+    crate::metrics::install(&crate::metrics::MetricsSettings {
+        exporter: crate::metrics::Exporter::Prometheus,
+        per_partition_detail: cfg.metrics.per_partition_detail,
+        e2e_basis: crate::metrics::E2eBasis::Ingest,
+    })
+    .expect("install the exporter")
+}
+
+/// The I/O busy gauge is in the exposition, at 0, before its first sample.
+#[test]
+fn the_io_busy_ratio_is_published_from_start() {
+    let mut cfg = test_config(1);
+    cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
+    let pipeline_name = cfg.pipeline.name.clone();
+    let handle = install_prometheus(&cfg);
+
+    let h = start_with_config(cfg, |shared, log| FakeChain {
+        shared,
+        log,
+        mode: ChainMode::Ok,
+        batches_seen: 0,
+    });
+    wait_for(
+        "the busy gauge is published",
+        Duration::from_secs(5),
+        || io_busy_ratio(&handle.render(), &pipeline_name) == Some(0.0),
+    );
+
+    h.script.lock().unwrap().push_back(Script::Drained);
+    let report = h.join.join().unwrap().unwrap();
+    assert_eq!(report.state, ExitState::Completed);
+}
+
+/// A caller-owned I/O runtime kept busy by a task of its own reads as busy
+/// in the exposition, sampled by the running pipeline.
+#[test]
+fn a_busy_io_runtime_reaches_the_exposition() {
+    let mut cfg = test_config(1);
+    cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
+    let pipeline_name = cfg.pipeline.name.clone();
+    let handle = install_prometheus(&cfg);
+
+    let io = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spin = Arc::clone(&stop);
+    io.spawn(async move {
+        // CPU work inside a poll is what tokio counts as busy.
+        while !spin.load(Ordering::Relaxed) {
+            let polled = Instant::now();
+            while polled.elapsed() < Duration::from_millis(10) {
+                std::hint::spin_loop();
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let h = start_with(
+        cfg,
+        test_options(),
+        |runtime| {
+            runtime
+                .with_io_runtime(io)
+                .with_io_busy_sampling(Duration::from_millis(50), Duration::from_secs(1))
+        },
+        |shared, log| FakeChain {
+            shared,
+            log,
+            mode: ChainMode::Ok,
+            batches_seen: 0,
+        },
+    );
+    wait_for(
+        "a busy sample is published",
+        Duration::from_secs(10),
+        || io_busy_ratio(&handle.render(), &pipeline_name).is_some_and(|r| r > 0.5),
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    h.script.lock().unwrap().push_back(Script::Drained);
+    let report = h.join.join().unwrap().unwrap();
+    assert_eq!(report.state, ExitState::Completed);
+}
+
+/// A running pipeline divides by its I/O runtime's worker count: one task
+/// holding one of two workers reads about half in the exposition.
+#[test]
+fn one_busy_worker_of_two_reads_half_in_the_exposition() {
+    let mut cfg = test_config(1);
+    cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
+    let pipeline_name = cfg.pipeline.name.clone();
+    let handle = install_prometheus(&cfg);
+
+    let io = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spin = Arc::clone(&stop);
+    io.spawn(async move {
+        while !spin.load(Ordering::Relaxed) {
+            let polled = Instant::now();
+            while polled.elapsed() < Duration::from_millis(10) {
+                std::hint::spin_loop();
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let h = start_with(
+        cfg,
+        test_options(),
+        |runtime| {
+            runtime
+                .with_io_runtime(io)
+                .with_io_busy_sampling(Duration::from_millis(50), Duration::from_secs(2))
+        },
+        |shared, log| FakeChain {
+            shared,
+            log,
+            mode: ChainMode::Ok,
+            batches_seen: 0,
+        },
+    );
+    // A reading counted against one worker sits near 1 once the window
+    // fills; against two it stays near half for many samples in a row.
+    let in_band = std::cell::Cell::new(0u32);
+    wait_for(
+        "the gauge to hold near half",
+        Duration::from_secs(15),
+        || {
+            let half = io_busy_ratio(&handle.render(), &pipeline_name)
+                .is_some_and(|r| (0.3..0.7).contains(&r));
+            in_band.set(if half { in_band.get() + 1 } else { 0 });
+            in_band.get() >= 500
+        },
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    h.script.lock().unwrap().push_back(Script::Drained);
+    let report = h.join.join().unwrap().unwrap();
+    assert_eq!(report.state, ExitState::Completed);
+}
+
+/// One event's fields, as `(name, debug value)` pairs.
+type Fields = Vec<(String, String)>;
+
+/// The fields of every warning event.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<Fields>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Record(Fields);
+        impl tracing::field::Visit for Record {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push((field.name().to_owned(), format!("{value:?}")));
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = Record(Vec::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+}
+
+/// Feeds `sample_io_busy` a sample every 5 s for ten minutes from a
+/// three-worker runtime busy `share` of the time, under a captured subscriber,
+/// and returns the fields of every warning it logged.
+fn io_busy_warnings(pipeline: &'static str, share: f64) -> Vec<Fields> {
+    use crate::metrics::{ComponentLabels, IoBusySampler, IoRuntimeMetrics};
+    use crate::pipeline::runtime::sample_io_busy;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    const WORKERS: usize = 3;
+    let labels = ComponentLabels::new(pipeline, "runtime", "pipeline");
+    let gauge = IoRuntimeMetrics::try_new(&labels).expect("free series");
+    let t0 = Instant::now();
+    let mut sampler = IoBusySampler::new(
+        Duration::from_secs(5),
+        IoBusySampler::WINDOW,
+        t0,
+        Duration::ZERO,
+    );
+    let warnings = Warnings::default();
+    let subscriber = tracing_subscriber::registry().with(warnings.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        for secs in (5..=600).step_by(5) {
+            let busy = Duration::from_secs_f64(share * (WORKERS as u64 * secs) as f64);
+            sample_io_busy(
+                &mut sampler,
+                &gauge,
+                t0 + Duration::from_secs(secs),
+                busy,
+                WORKERS,
+                pipeline,
+            );
+        }
+    });
+    warnings.0.lock().unwrap().clone()
+}
+
+/// Ten minutes of a saturated three-worker I/O runtime log one warning,
+/// carrying the pipeline and the worker count. Half busy on three workers
+/// logs nothing.
+#[test]
+fn a_saturated_io_runtime_logs_one_warning() {
+    let logged = io_busy_warnings("io-busy-warning", 0.95);
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let field = |name: &str| {
+        logged[0]
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(field("pipeline"), Some("\"io-busy-warning\""));
+    assert_eq!(field("io_workers"), Some("3"));
+
+    let half = io_busy_warnings("io-busy-half", 0.5);
+    assert!(half.is_empty(), "half busy warned: {half:?}");
 }
 
 /// One pipeline's `spate_checkpoint_pending_batches` lines, sorted. The

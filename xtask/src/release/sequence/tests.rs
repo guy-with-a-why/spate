@@ -49,6 +49,9 @@ struct FakeGit<'a> {
     push_fails: bool,
     /// The commit the checkout is at.
     head: &'static str,
+    /// A file whose content `commit_all` records, as the commit holds it.
+    watch: Option<PathBuf>,
+    committed: RefCell<Option<String>>,
 }
 
 impl<'a> FakeGit<'a> {
@@ -62,6 +65,8 @@ impl<'a> FakeGit<'a> {
             push_lands_then_fails: false,
             push_fails: false,
             head: SHA,
+            watch: None,
+            committed: RefCell::default(),
         }
     }
 }
@@ -81,6 +86,9 @@ impl Git for FakeGit<'_> {
     }
     fn commit_all(&self, subject: &str, _body: &str) -> Outcome {
         self.log.push(format!("commit {subject}"));
+        if let Some(path) = &self.watch {
+            *self.committed.borrow_mut() = Some(std::fs::read_to_string(path).unwrap());
+        }
         Ok(())
     }
     fn remote_tag(&self, tag: &str) -> Result<Option<String>, Error> {
@@ -391,9 +399,19 @@ struct FakeWorkspace<'a> {
     /// `package_unverified` writes bytes other than the attested ones.
     repackage_differs: bool,
     resolve_failures: RefCell<u32>,
+    /// The blog, holding a draft post for 0.3 to begin with.
+    blog: Scratch,
 }
 
+/// The draft post the 0.3.0 release requires.
+const POST_0_3: &str = "---\ntitle: Spate 0.3\nslug: releases/0.3\nauthors: [marcus]\ntags: [release]\ndraft: true\n---\n\nThe opener.\n\n<!-- truncate -->\n\n## A highlight\n";
+
 impl<'a> FakeWorkspace<'a> {
+    /// The path of the post file `name` in the blog.
+    fn post(&self, name: &str) -> PathBuf {
+        self.blog.join(name)
+    }
+
     fn new(log: &'a Log, crates: &[&str]) -> Self {
         Self {
             log,
@@ -406,6 +424,12 @@ impl<'a> FakeWorkspace<'a> {
             missing_metadata: Vec::new(),
             repackage_differs: false,
             resolve_failures: RefCell::new(0),
+            blog: {
+                let blog = Scratch::new("spate-xtask-release-blog").unwrap();
+                std::fs::write(blog.join("2026-10-11-spate-0-3.md"), POST_0_3).unwrap();
+                std::fs::write(blog.join("authors.yml"), "marcus:\n  name: M\n").unwrap();
+                blog
+            },
         }
     }
 }
@@ -433,6 +457,9 @@ impl Workspace for FakeWorkspace<'_> {
     fn generate(&self, version: Version) -> Outcome {
         self.log.push(format!("generate {version}"));
         Ok(())
+    }
+    fn blog(&self) -> PathBuf {
+        self.blog.dir().to_path_buf()
     }
     fn notes(&self, version: Version) -> Result<String, Error> {
         Ok(format!("notes for {version}"))
@@ -633,7 +660,7 @@ fn assemble_reuses_the_open_pull_request() {
 /// Every guard refuses before anything is generated.
 #[test]
 fn assemble_guards_refuse_before_generating() {
-    let cases: [(&str, Setup, &str); 6] = [
+    let cases: [(&str, Setup, &str); 8] = [
         ("dirty", |g, _| g.clean = false, "not clean"),
         ("not a version", |_, _| {}, "is not X.Y.Z"),
         (
@@ -658,6 +685,19 @@ fn assemble_guards_refuse_before_generating() {
             |_, w| w.derived = v("0.2.1"),
             "derives 0.2.1",
         ),
+        (
+            "no release post",
+            |_, w| std::fs::remove_file(w.post("2026-10-11-spate-0-3.md")).unwrap(),
+            "no post with 'slug: releases/0.3'",
+        ),
+        (
+            "two release posts",
+            |_, w| {
+                std::fs::create_dir(w.post("drafts")).unwrap();
+                std::fs::write(w.post("drafts/0-3.mdx"), POST_0_3).unwrap();
+            },
+            "more than one post",
+        ),
     ];
     for (name, setup, want) in cases {
         let log = Log::default();
@@ -677,6 +717,179 @@ fn assemble_guards_refuse_before_generating() {
         assert!(err.message.contains(want), "{name}: {}", err.message);
         assert!(log.entries().is_empty(), "{name}: {:?}", log.entries());
     }
+}
+
+/// A patch release requires no post, and assembles without one.
+#[test]
+fn assemble_needs_no_post_for_a_patch_release() {
+    let log = Log::default();
+    let git = FakeGit::new(&log);
+    let forge = FakeForge::new(&log);
+    let registry = FakeRegistry::default();
+    let mut workspace = FakeWorkspace::new(&log, &CRATES);
+    workspace.version = v("0.2.0");
+    workspace.derived = v("0.2.1");
+    std::fs::remove_file(workspace.post("2026-10-11-spate-0-3.md")).unwrap();
+    let pauses = Pauses::default();
+    assemble(&host!(&git, &forge, &registry, &workspace, pauses), "0.2.1").unwrap();
+    assert!(log.has("commit release: v0.2.1"), "{:?}", log.entries());
+}
+
+/// A draft flag the site build reads as a draft but the release commit would
+/// not remove stops `assemble`, so the release never links an unbuilt post.
+#[test]
+fn a_post_docusaurus_keeps_as_draft_is_not_assembled() {
+    for line in [
+        "draft: True",
+        "draft: true # until the release",
+        "draft: \"true\"",
+    ] {
+        let log = Log::default();
+        let git = FakeGit::new(&log);
+        let forge = FakeForge::new(&log);
+        let registry = FakeRegistry::default();
+        let mut workspace = FakeWorkspace::new(&log, &CRATES);
+        workspace.version = v("0.2.0");
+        let path = workspace.post("2026-10-11-spate-0-3.md");
+        std::fs::write(&path, POST_0_3.replace("draft: true", line)).unwrap();
+        let pauses = Pauses::default();
+        let result = assemble(&host!(&git, &forge, &registry, &workspace, pauses), "0.3.0");
+        let still_draft = std::fs::read_to_string(&path).unwrap().contains(line);
+        assert!(
+            result.is_err() || !still_draft,
+            "{line}: assembled and committed with the post still a draft"
+        );
+    }
+}
+
+/// A post in a file or directory the blog build excludes does not count as
+/// the release's post.
+#[test]
+fn an_excluded_post_does_not_satisfy_the_guard() {
+    for name in ["_2026-10-11-spate-0-3.md", "_wip/2026-10-11-spate-0-3.md"] {
+        let log = Log::default();
+        let git = FakeGit::new(&log);
+        let forge = FakeForge::new(&log);
+        let registry = FakeRegistry::default();
+        let mut workspace = FakeWorkspace::new(&log, &CRATES);
+        workspace.version = v("0.2.0");
+        std::fs::remove_file(workspace.post("2026-10-11-spate-0-3.md")).unwrap();
+        let path = workspace.post(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, POST_0_3).unwrap();
+        let pauses = Pauses::default();
+        let result = assemble(&host!(&git, &forge, &registry, &workspace, pauses), "0.3.0");
+        assert!(
+            result.is_err(),
+            "{name}: assembled on a post the site build excludes"
+        );
+    }
+}
+
+/// A `draft` key in any YAML spelling the site build reads as a draft stops
+/// `assemble` unless the release commit removes it.
+#[test]
+fn a_draft_key_spelled_otherwise_is_not_assembled() {
+    for line in [
+        "draft : true",
+        "\"draft\": true",
+        "'draft': true",
+        "draft\t: true",
+        "? draft\n: true",
+    ] {
+        let log = Log::default();
+        let git = FakeGit::new(&log);
+        let forge = FakeForge::new(&log);
+        let registry = FakeRegistry::default();
+        let mut workspace = FakeWorkspace::new(&log, &CRATES);
+        workspace.version = v("0.2.0");
+        let path = workspace.post("2026-10-11-spate-0-3.md");
+        std::fs::write(&path, POST_0_3.replace("draft: true", line)).unwrap();
+        let pauses = Pauses::default();
+        let result = assemble(&host!(&git, &forge, &registry, &workspace, pauses), "0.3.0");
+        let still_draft = std::fs::read_to_string(&path).unwrap().contains(line);
+        assert!(
+            result.is_err() || !still_draft,
+            "{line:?}: assembled and committed with the post still a draft"
+        );
+    }
+}
+
+/// A hidden post, which the blog build's glob never matches, does not count
+/// as the release's post.
+#[test]
+fn a_hidden_post_does_not_satisfy_the_guard() {
+    for name in [".2026-10-11-spate-0-3.md", ".wip/2026-10-11-spate-0-3.md"] {
+        let log = Log::default();
+        let git = FakeGit::new(&log);
+        let forge = FakeForge::new(&log);
+        let registry = FakeRegistry::default();
+        let mut workspace = FakeWorkspace::new(&log, &CRATES);
+        workspace.version = v("0.2.0");
+        std::fs::remove_file(workspace.post("2026-10-11-spate-0-3.md")).unwrap();
+        let path = workspace.post(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, POST_0_3).unwrap();
+        let pauses = Pauses::default();
+        let result = assemble(&host!(&git, &forge, &registry, &workspace, pauses), "0.3.0");
+        assert!(
+            result.is_err(),
+            "{name}: assembled on a post the site build excludes"
+        );
+    }
+}
+
+/// The release commit carries the post with its `draft: true` line removed and
+/// every other byte as written, so the post goes live with the release.
+#[test]
+fn the_release_commit_publishes_the_post() {
+    let log = Log::default();
+    let mut git = FakeGit::new(&log);
+    let forge = FakeForge::new(&log);
+    let registry = FakeRegistry::default();
+    let mut workspace = FakeWorkspace::new(&log, &CRATES);
+    workspace.version = v("0.2.0");
+    let path = workspace.post("2026-10-11-spate-0-3.md");
+    git.watch = Some(path.clone());
+    let pauses = Pauses::default();
+    assemble(&host!(&git, &forge, &registry, &workspace, pauses), "0.3.0").unwrap();
+    let published = POST_0_3.replace("draft: true\n", "");
+    assert_eq!(git.committed.borrow().as_deref(), Some(published.as_str()));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), published);
+}
+
+/// A second assemble over a post with no draft flag passes and leaves the post
+/// as it is.
+#[test]
+fn assemble_leaves_a_post_with_no_draft_flag_as_it_is() {
+    let log = Log::default();
+    let git = FakeGit::new(&log);
+    let mut forge = FakeForge::new(&log);
+    let registry = FakeRegistry::default();
+    let mut workspace = FakeWorkspace::new(&log, &CRATES);
+    workspace.version = v("0.2.0");
+    let path = workspace.post("2026-10-11-spate-0-3.md");
+    let pauses = Pauses::default();
+    assemble(&host!(&git, &forge, &registry, &workspace, pauses), "0.3.0").unwrap();
+    let published = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(published, POST_0_3.replace("draft: true\n", ""));
+
+    forge.pulls = vec![Pull {
+        number: 99,
+        head: "release/v0.3.0".into(),
+        cross_repository: false,
+    }];
+    assemble(&host!(&git, &forge, &registry, &workspace, pauses), "0.3.0").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), published);
+    assert_eq!(
+        log.entries()[5..],
+        [
+            "generate 0.3.0",
+            "commit release: v0.3.0",
+            "push HEAD:refs/heads/release/v0.3.0 force=true",
+            "auto-merge #99",
+        ]
+    );
 }
 
 /// A fresh release packages every crate and excludes none.
@@ -2390,4 +2603,41 @@ fn attestations_come_from_the_bundle_before_publish_and_the_store_after() {
     let after = forge.bundled.take();
     assert_eq!(after.len(), 6);
     assert!(after.iter().all(|b| !*b), "{after:?}");
+}
+
+/// A `draft` key hidden behind a merge key or a key that is not a plain
+/// string stops `assemble`, since the site build still reads it as a draft.
+#[test]
+fn a_hidden_draft_key_is_not_assembled() {
+    let mut shipped = Vec::new();
+    for line in [
+        "<<: {draft: true}",
+        "<<:\n  draft: true",
+        "x: &a {draft: true}\n<<: *a",
+        "<<: [{draft: true}]",
+        "!!merge <<: {draft: true}",
+        "<<: {<<: {draft: true}}",
+        "x: &a {draft: true}\n<<: [*a]",
+        "? [draft]\n: true",
+        "[draft]: true",
+        "? - draft\n: true",
+        "<<: {\"dr\\x61ft\": true}",
+        "[\"dr\\x61ft\"]: true",
+    ] {
+        let log = Log::default();
+        let git = FakeGit::new(&log);
+        let forge = FakeForge::new(&log);
+        let registry = FakeRegistry::default();
+        let mut workspace = FakeWorkspace::new(&log, &CRATES);
+        workspace.version = v("0.2.0");
+        let path = workspace.post("2026-10-11-spate-0-3.md");
+        std::fs::write(&path, POST_0_3.replace("draft: true", line)).unwrap();
+        let pauses = Pauses::default();
+        let result = assemble(&host!(&git, &forge, &registry, &workspace, pauses), "0.3.0");
+        let still_draft = std::fs::read_to_string(&path).unwrap().contains(line);
+        if result.is_ok() && still_draft {
+            shipped.push(line);
+        }
+    }
+    assert!(shipped.is_empty(), "shipped still a draft: {shipped:?}");
 }

@@ -9,8 +9,8 @@ use crate::checkpoint::Checkpointer;
 use crate::config::{MetricsExporter, PinningMode, PipelineConfig};
 use crate::metrics::{
     self, BackpressureMetrics, CheckpointMetrics, ComponentLabels, E2eBasis, Exporter,
-    InflightBudgetMetrics, Meter, MetricRole, MetricsHandle, MetricsSettings, PipelineMetrics,
-    PipelineState, SourceMetrics,
+    InflightBudgetMetrics, IoBusySampler, IoRuntimeMetrics, Meter, MetricRole, MetricsHandle,
+    MetricsSettings, PipelineMetrics, PipelineState, SourceMetrics,
 };
 use crate::ops::RunnableChain;
 use crate::source::{DrainBarrier, Source};
@@ -53,6 +53,10 @@ impl Default for RuntimeOptions {
         }
     }
 }
+
+/// How often the main thread samples `spate_pipeline_io_busy_ratio`; the
+/// upkeep cadence.
+const IO_BUSY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Triggers a graceful drain from anywhere (tests, custom signal wiring).
 #[derive(Clone, Debug)]
@@ -103,6 +107,8 @@ pub struct PipelineRuntime<S: Source> {
     shutdown: Arc<AtomicBool>,
     options: RuntimeOptions,
     io: Option<tokio::runtime::Runtime>,
+    io_busy_interval: Duration,
+    io_busy_window: Duration,
 }
 
 impl<S: Source> std::fmt::Debug for PipelineRuntime<S> {
@@ -133,7 +139,19 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             shutdown: Arc::new(AtomicBool::new(false)),
             options: RuntimeOptions::default(),
             io: None,
+            io_busy_interval: IO_BUSY_INTERVAL,
+            io_busy_window: IoBusySampler::WINDOW,
         }
+    }
+
+    /// Sample the I/O runtime's busy ratio every `interval`, averaged over
+    /// the trailing `window`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_io_busy_sampling(mut self, interval: Duration, window: Duration) -> Self {
+        self.io_busy_interval = interval;
+        self.io_busy_window = window;
+        self
     }
 
     /// Override runtime options (returns `self` for chaining).
@@ -151,6 +169,13 @@ impl<S: Source + 'static> PipelineRuntime<S> {
     /// built one; connector tasks spawned on it earlier keep running until
     /// then. Without this, assemblies end up running a second runtime,
     /// doubling `pipeline.io_threads`.
+    ///
+    /// The runtime must be multi-thread, built with
+    /// [`tokio::runtime::Builder::new_multi_thread`]. `run` waits on the
+    /// controller outside `block_on`, and a current-thread runtime runs no
+    /// spawned task then, so sink workers, the admin server and upkeep would
+    /// stall while records flow. `run` returns [`StartError::Config`] for a
+    /// current-thread runtime.
     #[must_use]
     pub fn with_io_runtime(mut self, io: tokio::runtime::Runtime) -> Self {
         self.io = Some(io);
@@ -181,6 +206,15 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         let threads = self.thread_count();
         if threads == 0 || self.config.pipeline.io_threads == 0 {
             return Err(StartError::Config("thread counts must be non-zero".into()));
+        }
+        if self.io.as_ref().is_some_and(|io| {
+            io.handle().runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+        }) {
+            return Err(StartError::Config(
+                "the I/O runtime must be multi-thread: a current-thread runtime runs no \
+                 spawned task while `run` waits on the controller"
+                    .into(),
+            ));
         }
         if let Some(section) = &self.config.coordination {
             tracing::warn!(
@@ -229,6 +263,10 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         // The owner of the budget gauge. One series per pipeline; the
         // drivers' `BackpressureMetrics` carry the pause series per thread.
         let budget_metrics = InflightBudgetMetrics::try_new(&runtime_labels)
+            .map_err(|e| StartError::Metrics(e.to_string()))?;
+        // The owner of the I/O busy gauge, which this thread samples while it
+        // waits on the controller below.
+        let io_busy_metrics = IoRuntimeMetrics::try_new(&runtime_labels)
             .map_err(|e| StartError::Metrics(e.to_string()))?;
         // The owner of the source series. It publishes active lanes, and its
         // clone goes to the source, which is the only thing that can measure
@@ -497,7 +535,27 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         let mut drain_fn = Some(sink_runtime.drain);
         drop(sink_runtime.queues);
 
+        // Sampled here, off the I/O runtime, so the reading is neither
+        // delayed by a saturated worker nor counted as its busy time. The
+        // drain's `block_on` pauses it.
+        let io_runtime_metrics = io.handle().metrics();
+        let mut io_busy = IoBusySampler::new(
+            self.io_busy_interval,
+            self.io_busy_window,
+            Instant::now(),
+            metrics::io_busy_reading(&io_runtime_metrics).0,
+        );
+
         let (mut state, final_watermarks) = loop {
+            let (busy, workers) = metrics::io_busy_reading(&io_runtime_metrics);
+            sample_io_busy(
+                &mut io_busy,
+                &io_busy_metrics,
+                Instant::now(),
+                busy,
+                workers,
+                &pipeline_name,
+            );
             match to_main_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(ControllerSignal::LanesDrained { sink_deadline }) => {
                     for (i, h) in driver_handles.drain(..).enumerate() {
@@ -590,6 +648,34 @@ impl<S: Source + 'static> PipelineRuntime<S> {
 /// controller and the source's own threads.
 pub(super) fn default_thread_count(cores: usize, io_threads: usize) -> usize {
     cores.saturating_sub(io_threads.div_ceil(2) + 1).max(1)
+}
+
+/// Publish an I/O busy sample when one is due, and warn on the sample that
+/// completes a saturated window.
+///
+/// `busy_total` is the I/O runtime's cumulative busy time over its
+/// `io_workers` async workers.
+pub(super) fn sample_io_busy(
+    sampler: &mut IoBusySampler,
+    gauge: &IoRuntimeMetrics,
+    now: Instant,
+    busy_total: Duration,
+    io_workers: usize,
+    pipeline: &str,
+) {
+    let Some(sample) = sampler.observe(now, busy_total, io_workers) else {
+        return;
+    };
+    gauge.set_busy_ratio(sample.ratio);
+    if sample.sustained {
+        tracing::warn!(
+            pipeline,
+            io_workers,
+            ratio = sample.ratio,
+            "the I/O runtime's workers have been saturated for five minutes; if the \
+             sink queues are filling, raise `pipeline.io_threads`"
+        );
+    }
 }
 
 /// Set the shutdown flag, tell every driver thread to stop within a bounded
@@ -694,5 +780,36 @@ async fn wait_for_signal() {
             tracing::error!(error = %e, "ctrl_c handler failed");
             std::future::pending::<()>().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::fakes::{FakeSource, test_config};
+
+    /// A runtime samples the I/O busy ratio every 5 s over the sampler's
+    /// 5-minute window unless a test overrides both.
+    #[test]
+    fn the_io_busy_sampling_defaults_to_five_seconds_over_five_minutes() {
+        let (source, _log, _script) = FakeSource::new();
+        let (queues, _receivers) = crate::sink::shard_queues(1, 1);
+        let sink = SinkRuntime {
+            queues: vec![queues],
+            drain: Box::new(|_budget| Box::pin(async { crate::sink::DrainReport::default() })),
+            probe: None,
+            failures: crate::sink::SinkFailures::new(),
+        };
+        let runtime = PipelineRuntime::new(
+            test_config(1),
+            source,
+            |_thread| unreachable!("the runtime is never run"),
+            sink,
+            Arc::new(InflightBudget::new()),
+        );
+
+        assert_eq!(runtime.io_busy_interval, Duration::from_secs(5));
+        assert_eq!(runtime.io_busy_window, IoBusySampler::WINDOW);
+        assert_eq!(IoBusySampler::WINDOW, Duration::from_secs(300));
     }
 }
