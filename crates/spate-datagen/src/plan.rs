@@ -547,6 +547,29 @@ mod tests {
         }
     }
 
+    /// An `epoch_ms` within a few events of `i64::MAX` saturates there, so the
+    /// fixed clock never steps backwards.
+    #[test]
+    fn the_fixed_clock_saturates_at_i64_max() {
+        let cfg = DatagenSourceConfig {
+            epoch_ms: i64::MAX - 2,
+            ..config(1, 1)
+        };
+        let mut plan = EventPlan::new(&cfg, 0);
+        let stamps: Vec<i64> = (0..6).map(|_| plan.next().1).collect();
+        assert_eq!(
+            stamps,
+            [
+                i64::MAX - 2,
+                i64::MAX - 1,
+                i64::MAX,
+                i64::MAX,
+                i64::MAX,
+                i64::MAX
+            ]
+        );
+    }
+
     #[test]
     fn the_wall_clock_stamps_a_plausible_present() {
         let cfg = DatagenSourceConfig {
