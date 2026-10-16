@@ -1398,7 +1398,9 @@ fn the_inflight_budget_reaches_the_exposition_as_one_series() {
     let series = |rendered: &str| -> Vec<String> {
         rendered
             .lines()
-            .filter(|l| l.starts_with(names::BACKPRESSURE_INFLIGHT_BYTES))
+            .filter(|l| l.starts_with(&format!("{}{{", names::BACKPRESSURE_INFLIGHT_BYTES)))
+            // Under `cargo test` other tests' pipelines record into this process-wide recorder.
+            .filter(|l| l.contains(&format!(r#"pipeline="{pipeline_name}""#)))
             .map(str::to_owned)
             .collect()
     };
