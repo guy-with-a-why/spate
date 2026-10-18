@@ -140,9 +140,11 @@ pub trait ShardWriter: Send + Sync + 'static {
 }
 ```
 
-A `SealedBatch` carries pre-encoded wire frames, row and byte counts, a
-deterministic deduplication token, and the acknowledgment handles. Rows are
-encoded on the **pipeline threads** by your `RowEncoder`, not here. See
+A `SealedBatch` carries pre-encoded wire frames, the total rows and bytes
+reported by the encoder, and a deterministic deduplication token. It contains
+no acknowledgment handles; the framework delivers those only after the writer
+returns `Ok`, and fails them if the batch is abandoned. Rows are encoded on the
+**pipeline threads** by your `RowEncoder`, not here. See
 [Writing a sink](custom-sink.mdx) for both halves and for the `Drop` obligation
 that comes with holding acknowledgment handles.
 

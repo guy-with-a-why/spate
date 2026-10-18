@@ -16,7 +16,8 @@ the offending YAML path). The `source`, `deserializer`, and `sink` sections are
 single-key mappings selecting a component type; their bodies are opaque to the
 framework and deserialized by the component's own factory. The optional
 [`coordination`](#coordination) section configures a coordinated source's
-store and coordinator.
+store and coordinator, and the optional [`feed`](#feed) section names the work
+feed a feed-reading source reads.
 
 ```yaml
 pipeline: { name: orders, threads: 4, io_threads: 2 }
@@ -139,14 +140,15 @@ it adds on top. See [Tuning](../05-deployment/tuning.mdx) for how to size them.
 | `retry.jitter` | float | `0.2` | Fraction of each delay randomized away. Must be finite and within `[0.0, 1.0]`, both ends allowed. Jitter only ever **shortens**: the sleep lands in `[(1 - jitter) × delay, delay]`, never above it and never at zero. |
 | `retry.max_attempts` | integer | `0` | Attempt cap; `0` = unbounded (retry until the drain deadline — the at-least-once default). |
 | `breaker.failure_threshold` | integer | `3` | Consecutive failures before a shard/replica endpoint is quarantined. |
-| `breaker.open_for` | duration | `5s` | Quarantine duration before a half-open probe. Doubles as the ceiling on how long a batch parked behind a fully-probing shard waits before re-checking of its own accord, clamped to `[100ms, 30s]` — a backstop against a signal that never arrives, never the thing recovery depends on. Values above a year are capped, because `open_for` is stamped into a deadline and a cadence that long already means "never probe again". |
+| `breaker.open_for` | duration | `5s` | Quarantine duration before a half-open probe. Also caps how long a batch parked behind a fully-probing shard waits before re-checking of its own accord, clamped to `[100ms, 30s]` — a backstop against a signal that never arrives, never the thing recovery depends on. Must be non-zero and at most one year. |
 | `breaker.half_open_probes` | integer | `1` | Concurrent probe writes allowed while half-open, per probe episode. Must be at least 1 — `0` fails startup, because taken literally it would mean the replica never recovers: the first probe is admitted regardless and nothing could ever re-admit the slot afterwards. |
 
 The `retry` and `breaker` bounds above are enforced at load by
 `RetryConfig::validate` and `BreakerConfig::validate`, which every sink calls,
-so a bad multiplier, a zero delay or a zero probe budget fails startup with the
-offending key rather than surfacing in the write loop. They rule out the
-nonsensical, not the aggressive; `initial: 1ns` passes. Both are
+so a bad multiplier, a zero retry delay, a zero or overlong `open_for`, or a
+zero probe budget fails startup with the offending key rather than surfacing in
+the write loop. They rule out the nonsensical, not the aggressive;
+`initial: 1ns` passes. Both are
 independently total at the point of use. The backoff saturates at `retry.max`
 and never yields a zero-delay retry, and the breaker floors `half_open_probes`
 at 1 and caps `open_for` at a year. A sink assembled in code rather than
@@ -298,6 +300,38 @@ Every instance of one job runs with the same source body, because the keys that
 shape the work form the job fingerprint and a mismatch is rejected at startup.
 The `coordination:` section may differ per instance, and `instance_id` must.
 Each coordinated source's page marks which of its keys are fingerprinted.
+
+## `feed:` {#feed}
+
+Optional. The [feed](glossary.mdx#feed) a feed-reading source reads its
+[work units](glossary.mdx#work-unit) from. One key names the backend, and its
+body holds that backend's own keys. `units_held` applies whatever the backend;
+`attempt_cap` applies to the in-process feed and the
+[Kafka feed](../04-connectors/feeds/kafka/README.mdx), and a backend that
+cannot honor it refuses it. Set on a source that reads no feed, the section fails startup, and a file
+that sets both `feed:` and [`coordination:`](#coordination) fails to load.
+The common keys and the backend count are checked when the file loads. The
+`memory` body is checked when the pipeline starts, before the source opens,
+unless code passes a feed to `Pipeline::feed`.
+
+```yaml
+feed:
+  memory: {}
+  units_held: 32
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `<backend>` | component | `required` | Exactly one key naming the backend. `memory` is the in-process feed, which takes no keys of its own. Built from the file alone it has no publisher, so the source reads nothing, and a startup WARN says so. To publish to it, code builds a `MemoryFeed`, keeps a handle, and passes it to `Pipeline::feed`. Units from another process need a durable backend. Any other name is a backend built in code; its page under [Feeds](../04-connectors/feeds/README.mdx) documents its body. |
+| `units_held` | integer | `none` | How many units the source holds and reads at once. Unset, the source's own default applies. At least 1. |
+| `attempt_cap` | integer | `10` | The delivery on which the in-process feed moves a failed unit to its dead-letter list, and the [Kafka feed](../04-connectors/feeds/kafka/README.mdx) moves it to its dead-letter destination. A backend that cannot honor the key refuses it. At least 1. |
+
+The runtime builds the in-process feed itself from `memory`. Any other backend
+is built in code from the section and passed to `Pipeline::feed`, and the
+runtime refuses a feed whose backend differs from the key the section names. The
+section's backend keys and its `attempt_cap` apply only when a feed is built
+from the section, so a feed passed to `Pipeline::feed` keeps the settings it was
+built with.
 
 ## Code-level knobs (not YAML) {#code-level-knobs-not-yaml}
 

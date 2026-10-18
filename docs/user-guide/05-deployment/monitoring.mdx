@@ -74,10 +74,11 @@ in your hands. See [Manual assembly](../03-guides/manual-assembly.mdx).
   get suffixes (`_seconds`, `_bytes`, `_rows`).
 - **Standard labels on every framework metric**:
   - `pipeline` — the `pipeline.name` from config;
-  - `component` — the instance id (e.g. `orders_source`, `main.deserializer`);
-  - `component_type` — the implementation, which for a connector is the system
-    it talks to and for an operator is its kind (`map`, `filter`); custom sinks
-    set it via `SinkParts::with_component_type`.
+  - `component` — the framework component identifier (source metrics use
+    `component="source"`; a deserializer stage may use `main.deserializer`);
+  - `component_type` — the implementation, such as a connector type or an
+    operator kind (`map`, `filter`); custom sinks set it via
+    `SinkParts::with_component_type`.
 - **Cardinality is mostly opt-in**: `partition`-labeled series appear only
   with `metrics.per_partition_detail: true` (default `false`), because their
   cardinality grows with the assignment. The one exception is

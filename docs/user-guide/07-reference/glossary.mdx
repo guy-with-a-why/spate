@@ -69,10 +69,10 @@ period. Workers merge chunks into
 ### Component / `component_type` labels
 
 Two of the three standard labels on every framework metric (with
-`pipeline`): `component` identifies the instance (e.g. `orders_source`,
-`main.deserializer`), `component_type` the implementation, which for a
-connector is the system it talks to and for an operator is its kind
-(`map`, `filter`). See
+`pipeline`): `component` identifies the framework component (for example,
+`source` for source metrics or `main.deserializer` for a deserializer stage);
+`component_type` identifies the implementation, such as a connector type or an
+operator kind (`map`, `filter`). See
 [Monitoring](../05-deployment/monitoring.mdx) and
 [Metrics](../../METRICS.md).
 
@@ -156,8 +156,8 @@ codec.
 The data-plane unit of a source (`SourceLane`): one pollable stream pinned
 to one pipeline thread, yielding borrowed payload batches. Lanes map m:n
 onto pipeline threads. In a coordinated source, lanes are purely local: the
-`CoordinationDriver` materializes one lane per in-flight [split](#split) and
-renumbers them per assignment cycle. `spate_source_lanes_active` counts them.
+`CoordinationDriver` materializes one lane per in-flight [split](#split), and
+lane ids are never reused. `spate_source_lanes_active` counts them.
 
 *Connector mapping:*
 [Kafka source](../04-connectors/sources/kafka/README.mdx#lanes-partitions-on-pipeline-threads)
@@ -269,11 +269,12 @@ next healthy replica.
 
 ### Sealed batch
 
-The sink's write, retry, and acknowledgment unit (`SealedBatch`):
-concatenated pre-encoded frames plus row/byte counts, the
-[dedup token](#dedup-token), and the covered acks. A shard worker seals
-when `batch.max_rows`, `batch.max_bytes`, or `batch.linger` trips, then
-writes it via the `ShardWriter`, whose `Ok` is the durable-ack point.
+The sink's write and retry unit (`SealedBatch`): concatenated pre-encoded
+frames plus row/byte counts and a [dedup token](#dedup-token). A shard worker
+seals when `batch.max_rows`, `batch.max_bytes`, or `batch.linger` trips, then
+writes it via the `ShardWriter`. The framework delivers the batch's
+acknowledgments only after the writer returns `Ok`, the durable-ack point, and
+fails them if the batch is abandoned.
 
 ### Shard
 

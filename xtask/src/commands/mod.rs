@@ -7,6 +7,7 @@ mod fault_report;
 mod fault_test;
 mod fuzz;
 mod hooks;
+mod issue_form;
 mod lint;
 
 use std::collections::BTreeSet;
@@ -131,6 +132,9 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: HooksCommand,
     },
+
+    /// Write an issue body laid out as the bug form
+    BugReport(issue_form::BugReport),
 
     /// Fuzz targets
     Fuzz {
@@ -333,6 +337,7 @@ pub(crate) fn dispatch(root: &Path, explain: bool, cmd: Command) -> Outcome {
         Command::Hooks { cmd } => match cmd {
             HooksCommand::Install => hooks::install(root, explain),
         },
+        Command::BugReport(args) => issue_form::bug_report(root, explain, &args),
         Command::Fuzz { cmd } => fuzz::dispatch(root, explain, cmd),
         Command::SiteCheck => crate::checks::site_check::check(root, explain),
         Command::Docs { serve } => docs::dispatch(root, explain, serve),

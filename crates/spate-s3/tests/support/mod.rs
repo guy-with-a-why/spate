@@ -4,6 +4,7 @@
 #![expect(deprecated, reason = "v0.4.0 removes this with spate-coordination")]
 
 pub(crate) mod rustfs;
+pub(crate) mod s3_stub;
 pub(crate) mod spy;
 
 use object_store::ObjectStoreExt as _;
@@ -11,16 +12,22 @@ use spate_coordination::store::memory::MemoryStore;
 use spate_coordination::{CoordinationConfig, StoreCoordinator};
 use spate_core::config::PipelineConfig;
 use spate_core::coordination::SplitSpec;
+use spate_core::feed::{Feed, Unit};
 use spate_core::framing::RecordFramer;
 use spate_core::ops::chain_owned;
-use spate_core::pipeline::{Pipeline, RuntimeOptions, ShutdownHandle};
+use spate_core::pipeline::{ExitState, Pipeline, RuntimeOptions, ShutdownHandle};
 use spate_core::sink::KeyHashRouter;
-use spate_s3::{S3Source, SplitDescriptor, SplitRange, split_id_for_range};
+use spate_s3::{DescriptorObject, S3Source, SplitDescriptor, SplitRange, split_id_for_range};
 use spate_test::{BytesPassthrough, PipelineRun, SinkScript, TestEncoder, capture_sink};
 use std::collections::VecDeque;
+use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// How long a helper here waits for a run to exit.
+const EXIT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Pipeline YAML for an S3 source feeding a capture sink, with the admin
 /// server and exporter off.
@@ -47,6 +54,17 @@ impl PipelineYaml {
     pub(crate) fn bucket(name: &str, gw: &rustfs::Gateway) -> Self {
         let url = format!("s3://{}/data/", gw.bucket);
         Self::over(name, url, Some(gw.store_options_yaml()))
+    }
+
+    /// Reads `data/` in bucket `b` of the plain-HTTP S3 endpoint `endpoint`,
+    /// with static test credentials.
+    pub(crate) fn endpoint(name: &str, endpoint: &str) -> Self {
+        let store = format!(
+            "      endpoint: \"{endpoint}\"\n      allow_http: \"true\"\n      \
+             access_key_id: \"AKIDTEST\"\n      secret_access_key: \"secret\"\n      \
+             region: \"us-east-1\""
+        );
+        Self::over(name, "s3://b/data/".to_owned(), Some(store))
     }
 
     fn over(name: &str, url: String, store: Option<String>) -> Self {
@@ -281,6 +299,28 @@ pub(crate) fn launch_customized(
     pre: impl FnOnce(&SinkScript),
     make_source: impl FnOnce(S3Source, tokio::runtime::Handle) -> S3Source,
 ) -> Launched {
+    launch_inner(yaml, options, pre, None, make_source)
+}
+
+/// [`launch_customized`] with `feed` passed to `Pipeline::feed`, for the
+/// config's `feed:` section to name.
+pub(crate) fn launch_with_feed(
+    yaml: &str,
+    options: RuntimeOptions,
+    pre: impl FnOnce(&SinkScript),
+    feed: Arc<dyn Feed>,
+    make_source: impl FnOnce(S3Source, tokio::runtime::Handle) -> S3Source,
+) -> Launched {
+    launch_inner(yaml, options, pre, Some(feed), make_source)
+}
+
+fn launch_inner(
+    yaml: &str,
+    options: RuntimeOptions,
+    pre: impl FnOnce(&SinkScript),
+    feed: Option<Arc<dyn Feed>>,
+    make_source: impl FnOnce(S3Source, tokio::runtime::Handle) -> S3Source,
+) -> Launched {
     let mut config = PipelineConfig::from_str(yaml).expect("config parses");
     // Every launch gets its own pipeline name. Metric gauge series have a
     // single live owner per process (`docs/METRICS.md`, "Series ownership")
@@ -290,7 +330,10 @@ pub(crate) fn launch_customized(
     // Coordination is unaffected: splits are namespaced by the store, not by
     // the pipeline name.
     config.pipeline.name = spate_test::unique_name(&config.pipeline.name);
-    let pipeline = Pipeline::from_config(config).expect("pipeline builds");
+    let mut pipeline = Pipeline::from_config(config).expect("pipeline builds");
+    if let Some(feed) = feed {
+        pipeline = pipeline.feed(feed);
+    }
     let io = pipeline.io_handle();
     let source = make_source(
         S3Source::from_component_config(&pipeline.config().source, io.clone())
@@ -324,6 +367,31 @@ pub(crate) fn launch_customized(
         script,
         shutdown,
     }
+}
+
+/// Trigger the shutdown of a run, wait for it to exit, and assert that it
+/// completed.
+pub(crate) fn stop(l: &Launched) {
+    l.shutdown.trigger();
+    let report = l
+        .run
+        .wait_exit(EXIT_DEADLINE)
+        .expect("the run exits")
+        .unwrap();
+    assert_eq!(report.state, ExitState::Completed);
+}
+
+/// A unit whose body is a one-member descriptor over `name` under `data`,
+/// with no ETag pin.
+pub(crate) fn unit_over(data: &Path, name: &str) -> Unit {
+    let object = DescriptorObject {
+        key: key_of(data, name),
+        size: fs::metadata(data.join(name)).map_or(10, |m| m.len()),
+        etag: None,
+        last_modified_ms: 1,
+    };
+    let body = SplitDescriptor::new(vec![object]).encode().unwrap();
+    Unit::new(name, body)
 }
 
 pub(crate) fn launch(yaml: &str, options: RuntimeOptions) -> Launched {

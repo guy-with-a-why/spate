@@ -1,7 +1,8 @@
 /**
  * The geometry of a grouped bar chart, in viewBox units on the figures' type and spacing scale.
  * `columns` stands the bars up over a value axis on the left; `rows` lays them along a value axis at
- * the foot, for a column too narrow to set a value label over each bar. Both scale from zero.
+ * the foot, for a column too narrow to set a value label over each bar or a group label under each
+ * group. Both scale from zero.
  */
 import {ASCENT, DESCENT, GAP, LINE_BOX, MID, S1, S2, centredBaseline, textW} from '../diagrams/scale.ts';
 
@@ -96,6 +97,26 @@ function largest(data: ChartData): number {
   return Math.max(...data.values.flat());
 }
 
+/** Where a column chart's value axis stands, and how wide its groups, bar pitch and bars are. */
+function columnGeometry(scale: Scale, data: ChartData, width: number): {left: number; groupW: number; pitch: number; barW: number} {
+  const tickW = Math.max(...scale.ticks.map((t) => textW(tickText(t))));
+  const left = M + tickW + S2;
+  const inner = width - M - GAP - (left + GAP);
+  const groupW = (inner - (data.groups.length - 1) * GROUP_GAP) / data.groups.length;
+  const pitch = groupW / data.series.length;
+  return {left, groupW, pitch, barW: pitch - S1};
+}
+
+/**
+ * Whether a column chart `width` units wide can set every value label over its bar and every group
+ * label under its group, by the same widths `columns` refuses.
+ */
+function columnsFit(data: ChartData, width: number): boolean {
+  const {groupW, barW} = columnGeometry(niceScale(largest(data)), data, width);
+  const values = data.values.flat().every((v) => textW(v.toFixed(data.decimals)) <= barW);
+  return values && data.groups.every((g) => textW(g) <= groupW);
+}
+
 /**
  * Bars standing over a value axis, `width` units wide. Each bar carries its value above it, and each
  * group its label under the base line.
@@ -105,18 +126,13 @@ function largest(data: ChartData): number {
  */
 export function columns(data: ChartData, width: number, axisLabel: string): Layout {
   const scale = niceScale(largest(data));
-  const tickW = Math.max(...scale.ticks.map((t) => textW(tickText(t))));
-  const left = M + tickW + S2;
+  const {left, groupW, pitch, barW} = columnGeometry(scale, data, width);
   const right = width - M;
   // Room above the top of the scale for the value label of a bar that reaches it.
   const top = M + LINE_BOX + GAP + LINE_BOX + S1;
   const base = top + PLOT_H;
   const at = (v: number) => base - (v / scale.top) * PLOT_H;
 
-  const inner = right - GAP - (left + GAP);
-  const groupW = (inner - (data.groups.length - 1) * GROUP_GAP) / data.groups.length;
-  const pitch = groupW / data.series.length;
-  const barW = pitch - S1;
 
   const bars: Bar[] = [];
   data.values.forEach((row, g) => {
@@ -204,4 +220,15 @@ export function rows(data: ChartData, width: number, axisLabel: string): Layout 
     axis: {x0, y0: axisY, x1: at(scale.top), y1: axisY},
     base: {x0, y0: firstBar - S1, x1: x0, y1: axisY},
   };
+}
+
+/**
+ * The drawing for a column `width` units wide: bars standing over the axis when each value label
+ * fits over its bar and each group label under its group, or bars laid along it when one does not.
+ *
+ * Throws when neither drawing can set its labels at `width`, as `rows` does.
+ */
+export function landscape(data: ChartData, width: number, axisLabel: string): {layout: Layout; vertical: boolean} {
+  if (columnsFit(data, width)) return {layout: columns(data, width, axisLabel), vertical: true};
+  return {layout: rows(data, width, axisLabel), vertical: false};
 }

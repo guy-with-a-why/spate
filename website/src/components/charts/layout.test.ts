@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
 import {S1} from '../diagrams/scale.ts';
-import {columns, labelBox, niceScale, rows, type ChartData, type Label, type Layout} from './layout.ts';
+import {columns, labelBox, landscape, niceScale, rows, type ChartData, type Label, type Layout} from './layout.ts';
 
 const DATA: ChartData = {
   groups: ['4 instances', '8 instances'],
@@ -170,4 +170,44 @@ test('the top tick is the max when the max sits on a tick, at any magnitude', ()
 
 test('columns refuse a group label wider than its group', () => {
   assert.throws(() => columns({...DATA, groups: ['4 instances on a very long group label', '8']}, 560, 'x'), /too narrow for the group 4 instances on a very long group label/);
+});
+
+/** Four groups of three bars, each value label wider than a 560-unit column chart's bars. */
+const SWEEP: ChartData = {
+  groups: ['2 I/O workers', '4', '8', '16'],
+  series: ['lz4', 'zstd:1', 'zstd:3'],
+  values: [
+    [31.78, 31.6, 32.09],
+    [32.69, 32.47, 32.26],
+    [32.51, 32.91, 32.65],
+    [32.76, 32.98, 32.47],
+  ],
+  decimals: 2,
+};
+
+test('the landscape drawing stands bars over the axis when every value label fits over its bar', () => {
+  const {layout, vertical} = landscape(DATA, 560, 'decoded, GB/s');
+  assert.equal(vertical, true);
+  assert.deepEqual(layout, columns(DATA, 560, 'decoded, GB/s'));
+});
+
+test('the landscape drawing lays bars along the axis when a value label is wider than its bar', () => {
+  assert.throws(() => columns(SWEEP, 560, 'insert throughput, M rows/s'), /too narrow for the value/);
+  const {layout, vertical} = landscape(SWEEP, 560, 'insert throughput, M rows/s');
+  assert.equal(vertical, false);
+  assert.deepEqual(layout, rows(SWEEP, 560, 'insert throughput, M rows/s'));
+  assert.equal(layout.bars.length, 12);
+  assert.deepEqual(faults(layout), []);
+});
+
+test('the landscape drawing refuses what neither drawing can set', () => {
+  assert.throws(() => landscape({...SWEEP, groups: ['a group label long enough to run past the end of a 560-unit drawing in either layout', '4', '8', '16']}, 560, 'x'), /too narrow for the group/);
+});
+
+test('the landscape drawing lays bars along the axis when a group label is wider than its group', () => {
+  const wideGroup: ChartData = {groups: ['2 I/O workers, default', '4', '8', '16'], series: ['a', 'b'], values: [[1, 2], [3, 4], [5, 6], [7, 8]], decimals: 0};
+  assert.throws(() => columns(wideGroup, 560, 'x'), /too narrow for the group/);
+  const {layout, vertical} = landscape(wideGroup, 560, 'x');
+  assert.equal(vertical, false);
+  assert.deepEqual(layout, rows(wideGroup, 560, 'x'));
 });

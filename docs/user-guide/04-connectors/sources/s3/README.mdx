@@ -71,7 +71,7 @@ source:
 | `refresh_listing` | bool | `false` | Re-list on the coordinator's replan interval, planning new objects as additional splits. `true` makes the job **open** (never self-terminates). Part of the job fingerprint. |
 | `prefetch_bytes` | bytes | `8MiB` | Target window size for ETag-pinned ranged GETs; see [read-ahead memory sizing](#read-parallelism-on-a-solo-run). Must be at least `chunk_bytes`; a smaller value fails at load. |
 | `chunk_bytes` | bytes | `512KiB` | Target size of one buffered chunk. Zero fails at load. |
-| `store` | string map | `{}` | Raw `object_store` options, applied on top of the environment — see [the `store` denylist](#the-store-passthrough-and-the-denylist). |
+| `store` | string map | `{}` | Raw `object_store` options, applied on top of the environment. Bucket keys fail at load, and so do keys `object_store` does not recognize under an S3 URL — see [the `store` denylist](#the-store-passthrough-and-the-denylist). |
 
 Mind the units on the fingerprinted keys: `MB` and `MiB` parse to
 different byte counts (`64MB` = 64,000,000; `64MiB` = 67,108,864), and
@@ -165,6 +165,19 @@ spelling in the file:
 ```text
 invalid configuration: source.s3.store."Bucket" cannot be overridden: owned by the typed `url` field
 ```
+
+For an S3 URL (`s3://`, `s3a://`, or an `https://` URL on an `amazonaws.com`
+or `r2.cloudflarestorage.com` host), a key that `object_store` does not
+recognize as an S3 option also fails at load. Every spelling and case `object_store` accepts is
+recognized. A misspelled `endpoint` would otherwise leave the client on the
+default AWS endpoint with the configured credentials:
+
+```text
+invalid configuration: source.s3.store."endpont" is not an object_store S3 option
+```
+
+The client for a `file://` URL reads no `store` options, and its keys are not
+checked.
 
 ## Security (credentials and region)
 
@@ -297,6 +310,33 @@ The estimate gives no total-process memory ceiling.
 
 The split count still sets how evenly the lanes divide over threads; see
 [Sizing splits against `pipeline.threads`](#sizing-splits-against-pipelinethreads).
+
+## Reading from a feed
+
+A [`feed:` section](../../../07-reference/configuration.mdx#feed) moves the
+source onto the feed path. It reads [work units](../../../07-reference/glossary.mdx#work-unit)
+from the feed the section names, and lists nothing itself. Each unit's body is
+an encoded `SplitDescriptor` naming one whole object, and a unit naming
+anything else is failed back to the feed. Every delivery is read from the
+object's first byte, and the unit is acknowledged once the sink has
+acknowledged every record in it.
+
+```yaml
+feed:
+  memory: {}
+  units_held: 32
+```
+
+`units_held` bounds the units the source holds at once, one lane each, and with
+them its read parallelism. The default is 96. The source publishes no units of
+its own and reads only the units published to the feed, and a startup WARN
+says so. An in-process feed built from the file alone has no publisher, so the
+run reads nothing. To publish to the in-process feed, code builds a
+`MemoryFeed`, keeps a handle, and passes it to `Pipeline::feed` with
+`feed: { memory: {} }` in the file. Units from another process need a durable
+[feed backend](../../feeds/README.mdx). A run on the feed path never reports its input finished, so it ends
+at a shutdown. Without a `feed:` section the
+source plans splits as described above.
 
 ## Split identity and drift
 
@@ -431,6 +471,15 @@ default, so `run()` returns `ExitState::Failed` rather than a silently partial
 `Completed`. `CoordinationDriver::stall_drains(true)` trades that for a drain
 with a WARN. Either way, alert on
 `spate_coordination_splits_quarantined > 0`.
+
+A key the S3 client cannot address poisons as well. The client rejects a key
+with an empty segment (`d//x.ndjson`), a `.` or `..` segment, or an ASCII
+control character, and reads a key that starts or ends with `/` under a
+different key. The listing still returns every other object. Each object with
+such a key is planned in a split of its own, which poisons on its first read
+and names the key, and the objects listed beside it are read. An object with
+such a key and no bytes, such as a folder marker `dir/`, holds no records and
+is not planned.
 
 There is no skip-an-object mode; the reasoning is in
 [ADR-0035](../../../../adr/0035-s3-poison-policy.md), which also covers why

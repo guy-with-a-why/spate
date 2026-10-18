@@ -7,6 +7,11 @@
 //! from the last committed position, so duplicates are possible and loss
 //! is not.
 //!
+//! A pipeline `feed:` section selects the feed path. The source reads work
+//! units from the feed the section names, each unit naming one whole object,
+//! and lists nothing itself. That job never self-terminates, so it ends at a
+//! shutdown, and the section's `units_held` bounds its read parallelism.
+//!
 //! # Shape
 //!
 //! - **Work is planned as splits.** The fleet's elected leader lists the
@@ -22,8 +27,9 @@
 //!   record's `i64` offset packs (member ordinal within the split, record
 //!   index within the object, or within the range for a split over a byte
 //!   range). `coordination.max_in_flight` bounds the working set and
-//!   therefore read parallelism.
-//! - **Progress lives in the coordination store, nowhere else.** Commits
+//!   therefore read parallelism, and `feed.units_held` bounds it on the
+//!   feed path.
+//! - **Split progress lives in the coordination store.** Commits
 //!   are fenced per-split writes; a lost or stolen split resumes on its
 //!   next owner from the acked watermark, drift-checked against the
 //!   descriptor's ETag pins. Point the pipeline's `coordination:` section
@@ -34,6 +40,8 @@
 //!   store with default tuning, and `store: { memory: {} }` runs that store
 //!   with the section's tuning: correct, but a restart replays the prefix (a
 //!   startup WARN says so). This crate names no concrete backend and has no store feature.
+//!   On the feed path the source acknowledges each finished unit to the
+//!   feed, and a redelivered unit is read again from its start.
 //! - **Bad objects poison their split, not the pipeline.** An object
 //!   deleted after planning, overwritten under its ETag pin, corrupt, or
 //!   unreadable past the retry budget hands its split back (surfaced in
@@ -85,6 +93,7 @@ mod framer;
 #[doc(hidden)]
 pub mod fuzz_seams;
 mod lane;
+mod listing;
 mod metrics;
 mod offset;
 mod planner;

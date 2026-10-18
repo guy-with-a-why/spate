@@ -9,9 +9,10 @@
 //!
 //! | Feature | Enables |
 //! |---|---|
-//! | `kafka` | [`kafka`] — Kafka source built on `rdkafka` (single consumer, partition-queue lanes) |
+//! | `kafka` | [`kafka`] — Kafka source built on `rdkafka` (single consumer, partition-queue lanes), producer sink, and the Kafka feed backend, built from a `feed: { kafka: … }` section and passed to `Pipeline::feed` |
 //! | `kafka-tls` | TLS, mTLS and SASL for [`kafka`]; librdkafka is built with a vendored OpenSSL. The [Kafka security section] lists the SASL mechanisms the feature supports. Without it a security property in the `rdkafka` passthrough fails config validation |
-//! | `s3` | [`s3`] — coordinated bounded object-storage (S3) backfill source: the fleet's leader plans the prefix into splits, workers lease them through the coordinator the `coordination:` section configures (solo in-process without one; progress is then ephemeral), and the job self-terminates once the plan is final and every split completes (`refresh_listing` keeps it open) |
+//! | `s3` | [`s3`] — coordinated bounded object-storage (S3) backfill source: the fleet's leader plans the prefix into splits, workers lease them through the coordinator the `coordination:` section configures (solo in-process without one; progress is then ephemeral), and the job self-terminates once the plan is final and every split completes (`refresh_listing` keeps it open). A `feed:` section reads units from the feed it names in place of a plan, and that job never self-terminates |
+//! | `sqs` | [`sqs`] — the Amazon SQS feed backend, built from a `feed: { sqs: … }` section and passed to `Pipeline::feed` |
 //! | `clickhouse` | [`clickhouse`] — ClickHouse sink (RowBinary, dedup tokens, replica rotation) |
 //! | `clickhouse-uuid` | `uuid::Uuid` fields for `UUID` columns (`clickhouse::serde::uuid`) |
 //! | `clickhouse-chrono` | `chrono` fields for `Date`/`DateTime`/`DateTime64`/`Time` columns |
@@ -163,7 +164,7 @@ pub use spate_avro as avro;
 #[cfg(feature = "json")]
 pub use spate_json as json;
 
-/// Kafka source and producer-sink connector.
+/// Kafka source, producer sink and feed backend.
 #[cfg(feature = "kafka")]
 pub use spate_kafka as kafka;
 
@@ -174,6 +175,10 @@ pub use spate_clickhouse as clickhouse;
 /// Bounded object-storage (S3) backfill source.
 #[cfg(feature = "s3")]
 pub use spate_s3 as s3;
+
+/// Amazon SQS work-feed backend.
+#[cfg(feature = "sqs")]
+pub use spate_sqs as sqs;
 
 /// Synthetic storefront-event source for a pipeline with no prerequisites.
 /// A demo and test source; it keeps no durable progress.

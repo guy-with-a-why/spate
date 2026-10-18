@@ -317,6 +317,11 @@ async fn stream_object(
     retries: Option<&spate_core::metrics::Counter>,
     bytes_read: Option<&spate_core::metrics::Counter>,
 ) -> Result<bool, SplitFailure> {
+    // A whole object with no bytes is read without a request, so its key
+    // need not be one the store can address.
+    if entry.size == 0 && range.is_none() {
+        return Ok(true);
+    }
     match pinned_etag {
         Some(etag) => {
             stream_object_ranged(
@@ -511,11 +516,7 @@ async fn stream_object_streaming(
     'attempts: loop {
         // In this fallback `delivered` is always 0: a mid-object stream error
         // is fatal below (no ETag to pin a resumed read), so a retry never
-        // resumes partway. The guard therefore only fires for a zero-length
-        // object, and every GET re-reads the whole object un-ranged.
-        if delivered >= entry.size {
-            return Ok(true);
-        }
+        // resumes partway, and every GET re-reads the whole object un-ranged.
         let options = GetOptions::default();
         let result = match store.get_opts(&path, options).await {
             Ok(r) => r,
@@ -604,15 +605,25 @@ async fn stream_object_streaming(
 ///
 /// `Path::from` would read the key as unencoded parts and percent-encode `%`,
 /// `#`, `[`, non-ASCII and other reserved bytes, addressing a different
-/// object. A listed key always parses; a key that does not cannot be read and
-/// poisons the split.
+/// object. A key that is not [`addressable`](crate::listing::addressable)
+/// cannot be read, or would be read under another key, and poisons the split.
 fn object_path(split: &SplitId, entry: &ObjectEntry) -> Result<Path, SplitFailure> {
-    Path::parse(&entry.key).map_err(|e| {
-        SplitFailure::Poison(
-            PoisonKind::NotFound,
-            format!("split {split}: \"{}\" is not an object key: {e}", entry.key),
-        )
-    })
+    match Path::parse(&entry.key) {
+        Ok(path) if path.as_ref() == entry.key => Ok(path),
+        parsed => {
+            let why = parsed.map_or_else(
+                |e| e.to_string(),
+                |path| format!("the object store would read \"{path}\" in its place"),
+            );
+            Err(SplitFailure::Poison(
+                PoisonKind::NotFound,
+                format!(
+                    "split {split}: \"{}\" is not an object key: {why}",
+                    entry.key
+                ),
+            ))
+        }
+    }
 }
 
 /// Back off and bump the attempt counter for a retryable error; escalate
@@ -1080,6 +1091,27 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+
+    /// A key that parses to a different key poisons the split rather than
+    /// reading the object the parsed key names. Regression for #1116.
+    #[tokio::test]
+    async fn a_key_the_store_would_rewrite_poisons_the_split() {
+        let store: Arc<dyn ObjectStore> = Arc::new(seeded(&[("p/a", b"other\n")]).await);
+        let msgs = collect_fetch(store, vec![entry("/p/a", 6, None)], 0, 4, 64).await;
+        assert!(
+            !msgs.iter().any(|m| matches!(m, ChunkMsg::Chunk(_))),
+            "no bytes of p/a are read for /p/a"
+        );
+        let reason = msgs.iter().find_map(|m| match m {
+            ChunkMsg::LaneFailed(SplitFailure::Poison(PoisonKind::NotFound, reason)) => {
+                Some(reason.clone())
+            }
+            _ => None,
+        });
+        let reason = reason.expect("a rewritten key is not_found split poison");
+        assert!(reason.contains("\"/p/a\" is not an object key"), "{reason}");
+        assert!(reason.contains("\"p/a\" in its place"), "{reason}");
     }
 
     #[tokio::test]

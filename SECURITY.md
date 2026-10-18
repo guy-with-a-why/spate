@@ -15,7 +15,7 @@ running the affected version, and there is no way to take it back.
 A report is easier to act on with:
 
 - the version or commit, and which features were enabled (`kafka`, `s3`,
-  `coordination-nats`, …);
+  `sqs`, `coordination-nats`, …);
 - what an attacker gains, and what they need in order to reach it;
 - the smallest reproduction you have. A failing test against `spate-test`'s mocks
   is ideal, but a description of the sequence is enough.
@@ -97,9 +97,11 @@ workflow that runs it, or in the script it calls:
 - Every GitHub Action is pinned to a full commit SHA, and `zizmor` fails CI if
   a pin, a token scope, or a checkout credential setting regresses.
 - `cargo deny check advisories` runs on every pull request **and** nightly, so
-  an advisory published against a crate already in the lockfile is caught within
-  a day. This covers the Rust tree; the documentation site's npm dependencies
-  are not gated in CI.
+  an advisory published against a crate the workspace compiles is caught within
+  a day.
+- `osv-scanner` runs nightly over every tracked manifest, including lockfile
+  entries no build compiles and the documentation site's npm dependencies. It
+  files an issue on a finding and does not gate pull requests.
 - Dependency updates arrive as reviewed pull requests after a soak period on the
   registry: 7 days, or 14 where a breaking change can hide. Security updates
   bypass the soak entirely.

@@ -960,7 +960,7 @@ fn smoke_manifest(version: Version) -> String {
          edition = \"2021\"\n\
          \n\
          [dependencies]\n\
-         spate = {{ version = \"={version}\", features = [\"kafka\", \"clickhouse\", \"avro\", \"s3\", \"json\", \"coordination-nats\"] }}\n\
+         spate = {{ version = \"={version}\", features = [\"kafka\", \"clickhouse\", \"avro\", \"s3\", \"sqs\", \"json\", \"coordination-nats\"] }}\n\
          \n\
          [dev-dependencies]\n\
          spate-test = \"={version}\"\n"
@@ -1010,20 +1010,29 @@ impl Git for DryGit<'_> {
     }
 }
 
-/// A forge whose writes are printed instead of made.
-pub(crate) struct DryForge<'a>(pub(crate) &'a dyn Forge);
+/// A forge whose writes are printed instead of made. A refused pull request
+/// listing reads as empty unless `.1` is set.
+pub(crate) struct DryForge<'a>(pub(crate) &'a dyn Forge, pub(crate) bool);
 
 impl Forge for DryForge<'_> {
     fn open_pulls(&self) -> Result<Vec<Pull>, Error> {
-        // A listing the forge refuses, as on a clone with no default
-        // repository, leaves nothing to sweep rather than failing the rehearsal.
+        // gh refuses the listing on a clone with no remote on a GitHub host,
+        // such as one whose only remote is a local path. Such a clone has no
+        // pull requests to sweep. `GH_REPO` removes that case, so with `.1`
+        // set a refusal is a real error.
         self.0.open_pulls().or_else(|e| {
+            if self.1 {
+                return Err(e);
+            }
             would(&format!("list the open pull requests ({})", e.message));
             Ok(Vec::new())
         })
     }
     fn pull_for_head(&self, head: &str) -> Result<Option<u64>, Error> {
         self.0.pull_for_head(head).or_else(|e| {
+            if self.1 {
+                return Err(e);
+            }
             would(&format!(
                 "look up the pull request from {head} ({})",
                 e.message

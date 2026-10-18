@@ -15,8 +15,9 @@
 //! progress commits; the coordination store is the source's **only**
 //! progress store.
 //!
-//! A source given a feed through the `testing`-gated `with_feed` reads work
-//! units through `unit_reader::UnitReader` in place of all of the above.
+//! A source given a feed, by the pipeline's `feed:` section or through the
+//! `testing`-gated `with_feed`, reads work units through
+//! `unit_reader::UnitReader` in place of all of the above.
 //!
 //! No coordination backend appears in this crate's public API or in its
 //! cargo features. The store comes from the `coordination:` section through
@@ -26,8 +27,9 @@
 
 #![expect(deprecated, reason = "v0.4.0 removes this with spate-coordination")]
 
-use crate::config::S3SourceConfig;
+use crate::config::{S3SourceConfig, s3_store_key};
 use crate::lane::S3Lane;
+use crate::listing::{UnaddressableConnector, UnaddressableKeys};
 use crate::metrics::S3Metrics;
 use crate::planner::{S3Planner, job_fingerprint};
 use crate::split::Packing;
@@ -37,7 +39,7 @@ use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::{ClientConfigKey, ObjectStore, ObjectStoreScheme};
 use spate_coordination::store::memory::MemoryStore;
 use spate_coordination::{CoordinationConfig, CoordinatorSpec, StoreCoordinator};
-use spate_core::config::{ComponentConfig, ConfigError, CoordinationSection};
+use spate_core::config::{ComponentConfig, ConfigError, CoordinationSection, FeedSection};
 use spate_core::coordination::driver::CoordinationDriver;
 use spate_core::coordination::{PlanFinality, SplitCoordinator};
 use spate_core::error::{ErrorClass, SourceError};
@@ -46,6 +48,7 @@ use spate_core::framing::{FramingContract, RecordFramer};
 use spate_core::metrics::CoordinationMetrics;
 use spate_core::record::PartitionId;
 use spate_core::source::{LaneId, Source, SourceCtx, SourceEvent};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
@@ -88,8 +91,11 @@ pub struct S3Source {
     spec: Option<CoordinatorSpec>,
     /// A data store injected via the `testing`-gated `with_store` seam.
     store: Option<Arc<dyn ObjectStore>>,
-    /// A feed injected via the `testing`-gated `with_feed` seam.
+    /// The feed to read units from: the one the `feed:` section names, or
+    /// one injected via the `testing`-gated `with_feed` seam.
     feed: Option<Arc<dyn Feed>>,
+    /// The `feed:` section's `units_held`.
+    units_held: Option<NonZeroUsize>,
     state: State,
 }
 
@@ -121,6 +127,7 @@ impl S3Source {
             spec: None,
             store: None,
             feed: None,
+            units_held: None,
             state: State::Created,
         }
     }
@@ -193,9 +200,9 @@ impl S3Source {
     /// Test seam: read one-object work units from `feed` in place of
     /// coordinated splits. Each unit's body is a [`SplitDescriptor`] naming
     /// one whole object; a unit naming anything else is failed back to the
-    /// feed. Conflicts with [`with_coordinator`](S3Source::with_coordinator)
-    /// and with a `coordination:` section, and never reports the input
-    /// drained, so the run ends at a shutdown.
+    /// feed. Conflicts with [`with_coordinator`](S3Source::with_coordinator),
+    /// with a `coordination:` section and with a `feed:` section, and never
+    /// reports the input drained, so the run ends at a shutdown.
     ///
     /// Behind the off-by-default `testing` feature, outside the semver
     /// surface.
@@ -244,6 +251,32 @@ impl Source for S3Source {
         Ok(())
     }
 
+    fn configure_feed(
+        &mut self,
+        section: &FeedSection,
+        feed: Arc<dyn Feed>,
+    ) -> Result<(), ConfigError> {
+        if self.feed.is_some() {
+            return Err(ConfigError::Component {
+                context: "feed".into(),
+                message: "the S3 source was also given a feed with `with_feed`; \
+                          remove the `feed:` section or drop `with_feed`"
+                    .into(),
+            });
+        }
+        if self.coordinator.is_some() {
+            return Err(ConfigError::Component {
+                context: "feed".into(),
+                message: "the S3 source was also given a coordinator with `with_coordinator`; \
+                          remove the `feed:` section or drop `with_coordinator`"
+                    .into(),
+            });
+        }
+        self.feed = Some(feed);
+        self.units_held = section.units_held;
+        Ok(())
+    }
+
     fn open(&mut self, ctx: SourceCtx) -> Result<(), SourceError> {
         if !matches!(self.state, State::Created) {
             return Err(SourceError::Client {
@@ -266,7 +299,7 @@ impl Source for S3Source {
         })?;
 
         let url = parse(&self.config.url)?;
-        let (store, prefix) = match self.store.take() {
+        let (store, prefix, unaddressable) = match self.store.take() {
             // Injected store: the URL still names the listing prefix.
             Some(store) => {
                 let (_, path) =
@@ -274,15 +307,15 @@ impl Source for S3Source {
                         class: ErrorClass::Fatal,
                         reason: format!("parsing {}: {e}", self.config.url),
                     })?;
-                (store, path)
+                (store, path, None)
             }
             None => {
-                let (store, path) =
+                let built =
                     build_store(&url, &self.config.store).map_err(|e| SourceError::Client {
                         class: ErrorClass::Fatal,
                         reason: format!("building the object store for {}: {e}", self.config.url),
                     })?;
-                (Arc::from(store), path)
+                (Arc::from(built.store), built.prefix, built.unaddressable)
             }
         };
 
@@ -307,7 +340,12 @@ impl Source for S3Source {
                 retry_base: RETRY_BASE,
                 metrics,
             };
-            self.state = State::Feed(Box::new(UnitReader::new(feed, parts)));
+            tracing::warn!(
+                feed = feed.backend(),
+                "the S3 source publishes no units of its own and reads only units published to \
+                 the feed"
+            );
+            self.state = State::Feed(Box::new(UnitReader::new(feed, parts, self.units_held)));
             return Ok(());
         }
         // Coordination metrics are constructor-injected (there is no later
@@ -359,7 +397,8 @@ impl Source for S3Source {
                 delimiter,
             ),
             metrics.clone(),
-        );
+        )
+        .with_unaddressable(unaddressable);
         let split_ctx = SplitCtx::new(
             store,
             self.handle.clone(),
@@ -534,7 +573,7 @@ fn opts(map: &std::collections::BTreeMap<String, String>) -> Vec<(String, String
 fn build_store(
     url: &Url,
     options: &std::collections::BTreeMap<String, String>,
-) -> Result<(Box<dyn ObjectStore>, object_store::path::Path), object_store::Error> {
+) -> Result<BuiltStore, object_store::Error> {
     // `ObjectStoreScheme::parse` returns the scheme and the in-store `Path` —
     // the very call `parse_url_opts` makes, so `path` is the exact listing
     // prefix it would return and every planned descriptor that depends on it
@@ -543,14 +582,36 @@ fn build_store(
     // Every non-S3 scheme (notably `file://` for infrastructure-free runs and
     // tests) keeps the stock, scheme-generic behavior.
     if !matches!(scheme, ObjectStoreScheme::AmazonS3) {
-        return object_store::parse_url_opts(url, opts(options));
+        let (store, prefix) = object_store::parse_url_opts(url, opts(options))?;
+        return Ok(BuiltStore {
+            store,
+            prefix,
+            unaddressable: None,
+        });
     }
     // Harden the HTTP client (idle-connection recycling, explicit timeouts)
     // before overlaying the operator's `store` options, so the passthrough
     // still wins; see `harden_client_defaults`.
     let builder = harden_client_defaults(AmazonS3Builder::from_env().with_url(url.as_str()));
-    let store = apply_options(builder, options).build()?;
-    Ok((Box::new(store), path))
+    let unaddressable = UnaddressableKeys::default();
+    let store = apply_options(builder, options)
+        .with_http_connector(UnaddressableConnector::new(unaddressable.clone()))
+        .build()?;
+    Ok(BuiltStore {
+        store: Box::new(store),
+        prefix: path,
+        unaddressable: Some(unaddressable),
+    })
+}
+
+/// What [`build_store`] returns.
+struct BuiltStore {
+    store: Box<dyn ObjectStore>,
+    /// The listing prefix within the store.
+    prefix: object_store::path::Path,
+    /// The objects the S3 client takes out of each listing; `None` for any
+    /// other scheme.
+    unaddressable: Option<UnaddressableKeys>,
 }
 
 /// Conservative HTTP-client defaults for the S3 backend, applied *before* the
@@ -585,16 +646,16 @@ fn harden_client_defaults(builder: AmazonS3Builder) -> AmazonS3Builder {
         )
 }
 
-/// Overlay the raw `store` passthrough options onto an S3 builder. Keys that
-/// are not recognized object_store configuration are ignored (matching
-/// `parse_url_opts`); a later key wins, so these override any environment
-/// value seeded by [`AmazonS3Builder::from_env`].
+/// Overlay the raw `store` passthrough options onto an S3 builder. A later
+/// key wins, so these override any environment value seeded by
+/// [`AmazonS3Builder::from_env`]. [`S3SourceConfig::validate`] rejects a key
+/// that is not an S3 option, so none is skipped here.
 fn apply_options(
     mut builder: AmazonS3Builder,
     options: &std::collections::BTreeMap<String, String>,
 ) -> AmazonS3Builder {
     for (k, v) in options {
-        if let Ok(key) = k.to_ascii_lowercase().parse::<AmazonS3ConfigKey>() {
+        if let Some(key) = s3_store_key(k) {
             builder = builder.with_config(key, v.clone());
         }
     }
@@ -633,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_options_sets_pod_identity_keys_and_ignores_unknown() {
+    fn apply_options_sets_pod_identity_keys() {
         const URI: &str = "http://169.254.170.23/v1/credentials";
         const TOKEN: &str =
             "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token";
@@ -642,8 +703,6 @@ mod tests {
             &map(&[
                 ("aws_container_credentials_full_uri", URI),
                 ("aws_container_authorization_token_file", TOKEN),
-                // Not an object_store key; must be ignored, not panic.
-                ("not_a_real_key", "whatever"),
             ]),
         );
         assert_eq!(
@@ -658,12 +717,25 @@ mod tests {
         );
     }
 
+    /// Every key `validate` accepts reaches the builder, in any case.
+    #[test]
+    fn apply_options_applies_upper_case_keys() {
+        let b = apply_options(
+            AmazonS3Builder::new(),
+            &map(&[("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")]),
+        );
+        assert_eq!(
+            b.get_config_value(&AmazonS3ConfigKey::Endpoint).as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+    }
+
     /// The S3 listing prefix must be byte-identical to what `parse_url_opts`
     /// produces; planned descriptors and their offsets depend on it.
     #[test]
     fn build_store_s3_prefix_matches_parse_url_opts() {
         let url = Url::parse("s3://bucket/exports/2026/").unwrap();
-        let (_, got) = build_store(&url, &BTreeMap::new()).unwrap();
+        let got = build_store(&url, &BTreeMap::new()).unwrap().prefix;
         let (_, want) =
             object_store::parse_url_opts(&url, std::iter::empty::<(String, String)>()).unwrap();
         assert_eq!(got, want);
@@ -695,7 +767,7 @@ mod tests {
     fn build_store_delegates_non_s3_schemes() {
         let dir = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(dir.path()).unwrap();
-        let (_, got) = build_store(&url, &BTreeMap::new()).unwrap();
+        let got = build_store(&url, &BTreeMap::new()).unwrap().prefix;
         let (_, want) =
             object_store::parse_url_opts(&url, std::iter::empty::<(String, String)>()).unwrap();
         assert_eq!(got, want, "file:// delegates to parse_url_opts unchanged");

@@ -135,13 +135,17 @@ cargo xtask release dry-run --version X.Y.Z
 
 `X.Y.Z` is the version the next release will take. The rehearsal assembles
 from the local `HEAD`, so a minor release's post has to be committed there
-first, as a draft. The dry run runs the same `assemble` and the publish up to
-staging in a throwaway git worktree. That covers the real release commit,
+first, as a draft. With `--stand-in-post`, when no post carries the release's
+slug yet, the rehearsal commits a draft stand-in in its worktree instead. The
+dry run runs the same `assemble` and the publish up to staging in a throwaway
+git worktree. That covers the real release commit,
 every pending crate packaged and verify-built, and the SBOMs and `SHA256SUMS`
 staged. `assemble` runs its pull request step against the real open pull
 requests and prints each push, close, open and auto-merge instead of making
-it. The run stops before attesting
-and prints what a real run would do next. It needs `gh`
+it. With `GH_REPO` set, a pull request listing that `gh` refuses fails the
+rehearsal. Without it, the listing reads as empty on a clone with no remote on
+a GitHub host, such as one whose only remote is a local path. The run stops
+before attesting and prints what a real run would do next. It needs `gh`
 authenticated, and `curl`, `cargo-about` and `cargo-cyclonedx` on the path;
 the preflight names anything missing. The generator versions in CI come from
 the `taiki-e/install-action` pin, so the inventory a local run produces can
@@ -157,10 +161,22 @@ that a previous release exercised; the last runs inside the real publish. It
 does not attest or verify; only a real release signs with
 `release-build.yml`'s identity.
 
-The same packaging proof also runs continuously: `ci.yml` runs
+The same proof also runs continuously. `ci.yml` runs
 `cargo xtask release package`, the packaging step `prepare` runs, at a
-simulated bump on pushes to `main` that reach a manifest, and `scheduled.yml`
-repeats it nightly, so a packaging problem surfaces before release day.
+simulated bump on pushes to `main` that reach a manifest. `scheduled.yml` runs
+`cargo xtask release dry-run --stand-in-post` nightly at the derived version,
+with `gh`, `cargo-about` and `cargo-cyclonedx` installed as a release gets
+them, so a packaging problem or a change in those tools surfaces before
+release day. `ci.yml` runs the same rehearsal on a pull request that changes
+the release workflows, `.github/actions/setup-rust/`, `xtask/src/release/`,
+`ci.yml` or `xtask/src/ci/`. While a release is in flight, after its
+`release: vX.Y.Z` commit lands and before the publish tags it, that run fails
+in `derive`; a re-run after the tag lands passes. A re-run keeps the run's
+merge commit, so a run made before the release commit landed needs a push, or
+the pull request closed and reopened. The nightly skips the night after a
+release when nothing has merged since the tag. When the derived version is a
+minor with no post yet, the flag commits a stand-in draft post in the
+rehearsal's worktree.
 `scheduled.yml` also generates `THIRD-PARTY.md` nightly, so a generator
 failure surfaces the same way.
 
@@ -181,7 +197,9 @@ attested and carries every asset. GitHub's attestation of an immutable release
 binds the tag to its git object and to every asset's digest. It needs `gh`
 2.102.0 or later, authenticated, and a clean checkout of the tag, whose
 members are the crates it checks. It fails for 0.2.0 and earlier, which predate
-attestations. To check by hand:
+attestations. `scheduled.yml` runs it nightly against the newest `v*` tag from
+a checkout of that tag, so a `gh`, crates.io or API change that breaks a call
+`finish` also makes surfaces there first. To check by hand:
 
 ```sh
 # Every crate at the new version.

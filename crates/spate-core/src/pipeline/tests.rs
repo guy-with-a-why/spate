@@ -1283,6 +1283,132 @@ fn coordination_section_on_an_uncoordinated_source_fails_startup() {
     assert!(!h.shared.lock().unwrap().opened, "the source must not open");
 }
 
+/// The text of the `StartError::Config` a run returns before its source
+/// opens. Waits for the run under a deadline, so a run that opens the source
+/// and keeps going fails the test there.
+fn config_error_before_open(h: Harness) -> String {
+    wait_for("run() to return", Duration::from_secs(10), || {
+        h.join.is_finished()
+    });
+    let result = h.join.join().unwrap();
+    let Err(err @ StartError::Config(_)) = result else {
+        panic!("expected StartError::Config, got {result:?}");
+    };
+    assert!(!h.shared.lock().unwrap().opened, "the source must not open");
+    err.to_string()
+}
+
+fn ok_chain(shared: Arc<ChainShared>, log: Arc<Mutex<SourceLog>>) -> FakeChain {
+    FakeChain {
+        shared,
+        log,
+        mode: ChainMode::Ok,
+        batches_seen: 0,
+    }
+}
+
+fn feed_section(yaml: &str) -> Option<crate::config::FeedSection> {
+    Some(serde_yaml::from_str(yaml).expect("section"))
+}
+
+/// Pins that the runtime hands a `feed:` section to the source, whose default
+/// `configure_feed` refuses it before the source opens.
+#[test]
+fn a_source_without_a_feed_rejects_the_feed_section() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}");
+    let h = start_with_config(cfg, ok_chain);
+    let err = config_error_before_open(h);
+    assert!(err.contains("reads no feed"), "{err}");
+}
+
+/// Pins that `run` refuses a `feed:` section beside a `coordination:`
+/// section, which a programmatic config reaches without validation.
+#[test]
+fn a_feed_section_beside_coordination_fails_startup() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}");
+    cfg.coordination = Some(serde_yaml::from_str("store: { memory: {} }").expect("section"));
+    let h = start_with_config(cfg, ok_chain);
+    let err = config_error_before_open(h);
+    assert!(err.contains("keep one"), "{err}");
+}
+
+/// Pins that a section naming a backend other than `memory`, with no feed
+/// passed in, fails startup with the instruction to build it in code.
+#[test]
+fn a_backend_built_in_code_without_a_feed_fails_startup() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("sqs: {}");
+    let h = start_with_config(cfg, ok_chain);
+    let err = config_error_before_open(h);
+    assert!(err.contains("pass it to `Pipeline::feed`"), "{err}");
+}
+
+/// Pins that a feed passed in with no `feed:` section fails startup.
+#[test]
+fn a_feed_given_without_a_feed_section_fails_startup() {
+    let h = start_with(
+        test_config(1),
+        test_options(),
+        |runtime| runtime.with_feed(Arc::new(crate::feed::memory::MemoryFeed::new())),
+        ok_chain,
+    );
+    let err = config_error_before_open(h);
+    assert!(err.contains("no `feed:` section"), "{err}");
+}
+
+/// Pins that a feed passed in whose backend differs from the section's key
+/// fails startup, naming both.
+#[test]
+fn a_feed_whose_backend_differs_from_the_section_fails_startup() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("sqs: {}");
+    let h = start_with(
+        cfg,
+        test_options(),
+        |runtime| runtime.with_feed(Arc::new(crate::feed::memory::MemoryFeed::new())),
+        ok_chain,
+    );
+    let err = config_error_before_open(h);
+    assert!(err.contains("`memory`") && err.contains("`sqs`"), "{err}");
+}
+
+/// Pins that the runtime builds the in-process feed from the section, so a
+/// key in the `memory` body fails startup naming its path.
+#[test]
+fn a_key_in_the_memory_body_fails_startup() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: { depth: 4 }");
+    let h = start_with_config(cfg, ok_chain);
+    let err = config_error_before_open(h);
+    assert!(
+        err.contains("feed.memory") && err.contains("depth"),
+        "{err}"
+    );
+}
+
+/// Pins that the runtime offers the `feed:` section before any pipeline
+/// thread is built, so a refused section starts no driver.
+#[test]
+fn a_refused_feed_section_builds_no_pipeline_thread() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}");
+    let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&built);
+    let h = start_with_config(cfg, move |shared, log| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ok_chain(shared, log)
+    });
+    let err = config_error_before_open(h);
+    assert!(err.contains("reads no feed"), "{err}");
+    assert_eq!(
+        built.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no chain may be built before the section is accepted"
+    );
+}
+
 /// `admin.listen: none` runs and drains with no admin server. With no
 /// listener there is no stop channel to signal, and the run has to reach its
 /// drain and its controller join anyway.
@@ -1398,7 +1524,9 @@ fn the_inflight_budget_reaches_the_exposition_as_one_series() {
     let series = |rendered: &str| -> Vec<String> {
         rendered
             .lines()
-            .filter(|l| l.starts_with(names::BACKPRESSURE_INFLIGHT_BYTES))
+            .filter(|l| l.starts_with(&format!("{}{{", names::BACKPRESSURE_INFLIGHT_BYTES)))
+            // Under `cargo test` other tests' pipelines record into this process-wide recorder.
+            .filter(|l| l.contains(&format!(r#"pipeline="{pipeline_name}""#)))
             .map(str::to_owned)
             .collect()
     };
@@ -1543,6 +1671,8 @@ fn a_busy_io_runtime_reaches_the_exposition() {
 /// holding one of two workers reads about half in the exposition.
 #[test]
 fn one_busy_worker_of_two_reads_half_in_the_exposition() {
+    const WINDOW: Duration = Duration::from_secs(2);
+
     let mut cfg = test_config(1);
     cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
     let pipeline_name = cfg.pipeline.name.clone();
@@ -1571,7 +1701,7 @@ fn one_busy_worker_of_two_reads_half_in_the_exposition() {
         |runtime| {
             runtime
                 .with_io_runtime(io)
-                .with_io_busy_sampling(Duration::from_millis(50), Duration::from_secs(2))
+                .with_io_busy_sampling(Duration::from_millis(50), WINDOW)
         },
         |shared, log| FakeChain {
             shared,
@@ -1581,16 +1711,20 @@ fn one_busy_worker_of_two_reads_half_in_the_exposition() {
         },
     );
     // A reading counted against one worker sits near 1 once the window
-    // fills; against two it stays near half for many samples in a row.
-    let in_band = std::cell::Cell::new(0u32);
+    // fills; against two it stays near half for a whole window. The hold is
+    // timed because one render of a shared process's exposition can take
+    // tens of milliseconds, so a count of polls has no fixed duration.
+    let in_band_since = std::cell::Cell::new(None::<Instant>);
     wait_for(
         "the gauge to hold near half",
         Duration::from_secs(15),
         || {
             let half = io_busy_ratio(&handle.render(), &pipeline_name)
                 .is_some_and(|r| (0.3..0.7).contains(&r));
-            in_band.set(if half { in_band.get() + 1 } else { 0 });
-            in_band.get() >= 500
+            in_band_since.set(half.then(|| in_band_since.get().unwrap_or_else(Instant::now)));
+            in_band_since
+                .get()
+                .is_some_and(|since| since.elapsed() >= WINDOW)
         },
     );
 

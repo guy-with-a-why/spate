@@ -1,0 +1,331 @@
+//! The Kafka feed against a real broker, for what the MockCluster does not
+//! model: a member that dies is evicted at the session timeout, where the
+//! mock evicts an unpolled member on a timer of its own, and a topic's
+//! configuration, which the mock does not describe.
+//!
+//! Every test needs Docker and is `#[ignore]`d. Run them with:
+//!
+//! ```sh
+//! cargo nextest run --profile docker -p spate-kafka --all-features --locked \
+//!   --run-ignored ignored-only --test feed_kafka
+//! ```
+
+mod support;
+
+use rdkafka::ClientConfig;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
+use spate_core::pipeline::ExitState;
+use spate_kafka::feed::{KafkaFeed, KafkaFeedError};
+use spate_test::{WriteOutcome, wait_until};
+use spate_test_support::ChildTest;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use support::broker;
+use support::feed::{
+    DEAD, DEADLINE, RETRY, WORK, committed, data_dir, exists, feed_yaml, launch_with, produce_raw,
+    recs, sorted, stage, written,
+};
+use testcontainers::runners::SyncRunner;
+use testcontainers_modules::kafka::apache::KAFKA_PORT;
+
+/// The members' session timeout. A member that dies holds its partitions
+/// for this long after its last heartbeat.
+const SESSION: Duration = Duration::from_secs(6);
+
+/// The members' heartbeat interval, as the harness's section sets it. A
+/// member's last heartbeat comes at most this long before it dies.
+const HEARTBEAT: Duration = Duration::from_secs(2);
+
+/// The variables the parent hands the killed worker.
+const CHILD_BROKERS: &str = "SPATE_FEED_CHILD_BROKERS";
+const CHILD_GROUP: &str = "SPATE_FEED_CHILD_GROUP";
+const CHILD_DATA: &str = "SPATE_FEED_CHILD_DATA";
+const CHILD_MARKER: &str = "SPATE_FEED_CHILD_MARKER";
+
+/// The `feed:` section both workers run, at the session timeout above.
+fn section(brokers: &str, group: &str) -> String {
+    feed_yaml(brokers, group, "", "").replace(
+        "session.timeout.ms: \"6000\"",
+        &format!("session.timeout.ms: \"{}\"", SESSION.as_millis()),
+    )
+}
+
+/// Create the work, retry and dead-letter topics, one partition each. The
+/// feed never creates a topic.
+fn create_topics(brokers: &str) {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("admin client");
+    let topics: Vec<NewTopic<'_>> = [WORK, RETRY, DEAD]
+        .iter()
+        .map(|t| NewTopic::new(t, 1, TopicReplication::Fixed(1)))
+        .collect();
+    let io = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for created in io
+        .block_on(admin.create_topics(&topics, &AdminOptions::new()))
+        .expect("create topics")
+    {
+        created.expect("topic created");
+    }
+}
+
+/// The child half of `a_unit_whose_worker_is_killed_mid_read_is_delivered_again`:
+/// worker A reads the unit, holds its first write, writes the marker file and
+/// waits to be killed. Without the parent's variables it does nothing.
+#[test]
+#[ignore = "requires Docker"]
+fn worker_a_holds_a_unit_until_it_is_killed() {
+    let Ok(brokers) = std::env::var(CHILD_BROKERS) else {
+        return;
+    };
+    let group = std::env::var(CHILD_GROUP).unwrap();
+    let data = PathBuf::from(std::env::var_os(CHILD_DATA).unwrap());
+    let marker = PathBuf::from(std::env::var_os(CHILD_MARKER).unwrap());
+    let a = launch_with(
+        KafkaFeed::connect,
+        &data,
+        &section(&brokers, &group),
+        |sink| {
+            sink.enqueue_global(WriteOutcome::ok().held());
+        },
+    );
+    wait_until(DEADLINE, "A holds the unit's write", || {
+        a.script.held_writes() == 1
+    });
+    std::fs::write(&marker, b"held").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Pins that a unit whose worker dies mid-read returns after the session
+/// timeout: worker A, a child process, is killed with SIGKILL while it holds
+/// the unit's write, and worker B, which joins after the kill, reads the
+/// unit from its start, writes every row and commits its offset. The kill
+/// reports nothing, so B reads the unit as its first counted delivery.
+#[test]
+#[ignore = "requires Docker"]
+fn a_unit_whose_worker_is_killed_mid_read_is_delivered_again() {
+    let container = broker().start().expect("start kafka container");
+    let port = container.get_host_port_ipv4(KAFKA_PORT).expect("port");
+    let brokers = format!("127.0.0.1:{port}");
+    create_topics(&brokers);
+    let group = spate_test::unique_name("killed");
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    let marker = dir.path().join("held");
+    let rows = recs("k", 3);
+    let unit = stage(&data, "k.ndjson", &rows);
+    // As a publish writes it: the id as the key, the body as the value.
+    produce_raw(&brokers, WORK, &[(Some(unit.id.as_bytes()), &unit.body)]);
+
+    let a = ChildTest::spawn("worker_a_holds_a_unit_until_it_is_killed", |child| {
+        child
+            .arg("--ignored")
+            .env(CHILD_BROKERS, &brokers)
+            .env(CHILD_GROUP, &group)
+            .env(CHILD_DATA, &data)
+            .env(CHILD_MARKER, &marker)
+    });
+    wait_until(DEADLINE, "A holds the unit's write", || marker.exists());
+    let status = a.kill();
+    let killed = Instant::now();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9), "{status:?}");
+    }
+
+    // B's join waits for A's session to lapse, and B is then assigned the
+    // partition at the offset A never committed past.
+    let b = launch_with(
+        KafkaFeed::connect,
+        &data,
+        &section(&brokers, &group),
+        |_| {},
+    );
+    wait_until(SESSION * 5, "B reads the unit", || {
+        !b.recording.seen.lock().unwrap().is_empty()
+    });
+    let waited = killed.elapsed();
+    assert_eq!(b.recording.seen.lock().unwrap()[0], 1);
+    assert!(
+        waited >= SESSION - HEARTBEAT,
+        "B read the unit {waited:?} after A was killed, inside A's session"
+    );
+    wait_until(
+        DEADLINE,
+        "B writes every row and commits the unit's offset",
+        || {
+            written(&b.script) == sorted(rows.clone())
+                && committed(&brokers, &group, WORK) == Some(1)
+        },
+    );
+    assert_eq!(b.stop(), ExitState::Completed);
+}
+
+/// Create each topic of `topics`, one partition each, with its
+/// configuration entries.
+fn create_configured(brokers: &str, topics: &[(String, Vec<(&str, &str)>)]) {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("admin client");
+    let new: Vec<NewTopic<'_>> = topics
+        .iter()
+        .map(|(name, entries)| {
+            entries.iter().fold(
+                NewTopic::new(name, 1, TopicReplication::Fixed(1)),
+                |topic, (k, v)| topic.set(k, v),
+            )
+        })
+        .collect();
+    let io = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for created in io
+        .block_on(admin.create_topics(&new, &AdminOptions::new()))
+        .expect("create topics")
+    {
+        created.expect("topic created");
+    }
+}
+
+/// The retry and dead-letter topics' names for the work topic `work`.
+fn retry_of(work: &str) -> String {
+    format!("{work}-retry")
+}
+
+fn dead_of(work: &str) -> String {
+    format!("{work}-dead")
+}
+
+/// Connect a feed on the work topic `work` and its retry and dead-letter
+/// topics, on a runtime like the pipeline's.
+fn connect_on(brokers: &str, work: &str) -> Result<KafkaFeed, KafkaFeedError> {
+    let section: spate_core::config::FeedSection = serde_yaml::from_str(&format!(
+        "kafka:\n  brokers: \"{brokers}\"\n  group_id: {group}\n  topic: {work}\n  \
+         retry_topic: {retry}\n  dead_letter_topic: {dead}\n  statistics_interval: 0s\n",
+        group = spate_test::unique_name("checked"),
+        retry = retry_of(work),
+        dead = dead_of(work),
+    ))
+    .unwrap();
+    let io = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    KafkaFeed::connect(&section, io.handle())
+}
+
+fn refusal(connected: Result<KafkaFeed, KafkaFeedError>) -> String {
+    match connected {
+        Err(KafkaFeedError::Refused(message)) => message,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Pins that connecting refuses a missing work, retry or dead-letter topic
+/// by its role, on a broker that creates a topic on first use, and leaves
+/// the topic missing.
+#[test]
+#[ignore = "requires Docker"]
+fn startup_refuses_a_missing_retry_or_dead_letter_topic() {
+    let container = broker().start().expect("start kafka container");
+    let port = container.get_host_port_ipv4(KAFKA_PORT).expect("port");
+    let brokers = format!("127.0.0.1:{port}");
+    for (work, role, missing) in [
+        ("no-retry", "retry", retry_of("no-retry")),
+        ("no-dead", "dead-letter", dead_of("no-dead")),
+        ("no-work", "work", "no-work".to_owned()),
+    ] {
+        let present: Vec<(String, Vec<(&str, &str)>)> =
+            [work.to_owned(), retry_of(work), dead_of(work)]
+                .into_iter()
+                .filter(|t| *t != missing)
+                .map(|t| (t, vec![]))
+                .collect();
+        create_configured(&brokers, &present);
+        let message = refusal(connect_on(&brokers, work));
+        assert!(
+            message.contains(&format!("the {role} topic `{missing}` does not exist")),
+            "{message}"
+        );
+        assert!(
+            !exists(&brokers, &missing),
+            "connecting created `{missing}`"
+        );
+    }
+}
+
+/// Pins that connecting refuses a work, retry or dead-letter topic whose
+/// `cleanup.policy` includes `compact`, by its role, and that topics at
+/// `delete` pass, with each topic's policy in the line logged at connect.
+#[test]
+#[ignore = "requires Docker"]
+fn startup_refuses_a_compacted_work_retry_or_dead_letter_topic() {
+    let container = broker().start().expect("start kafka container");
+    let port = container.get_host_port_ipv4(KAFKA_PORT).expect("port");
+    let brokers = format!("127.0.0.1:{port}");
+    for (work, role, policy) in [
+        ("compacted-work", "work", "compact"),
+        ("compacted-retry", "retry", "compact,delete"),
+        ("compacted-dead", "dead-letter", "compact"),
+    ] {
+        let compacted = match role {
+            "work" => work.to_owned(),
+            "retry" => retry_of(work),
+            _ => dead_of(work),
+        };
+        let topics: Vec<(String, Vec<(&str, &str)>)> =
+            [work.to_owned(), retry_of(work), dead_of(work)]
+                .into_iter()
+                .map(|t| {
+                    let mut entries = vec![];
+                    if t == compacted {
+                        entries.push(("cleanup.policy", policy));
+                    }
+                    (t, entries)
+                })
+                .collect();
+        create_configured(&brokers, &topics);
+        let message = refusal(connect_on(&brokers, work));
+        assert!(
+            message.contains(&format!("the {role} topic `{compacted}` is compacted")),
+            "{message}"
+        );
+    }
+
+    let work = "deleting";
+    create_configured(
+        &brokers,
+        &[
+            (work.to_owned(), vec![]),
+            (retry_of(work), vec![]),
+            (dead_of(work), vec![("cleanup.policy", "delete")]),
+        ],
+    );
+    let mut connected = None;
+    let lines = spate_test::capture_logs(tracing::Level::INFO, || {
+        connected = Some(connect_on(&brokers, work));
+    });
+    connected.unwrap().unwrap();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("the Kafka feed started"))
+        .unwrap_or_else(|| panic!("no connect line: {lines:#?}"));
+    for field in [
+        " cleanup_policy=delete",
+        " retry_cleanup_policy=delete",
+        " dead_letter_cleanup_policy=delete",
+    ] {
+        assert!(line.contains(field), "{field}: {line}");
+    }
+}
