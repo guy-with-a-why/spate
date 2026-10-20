@@ -39,7 +39,8 @@ faster than a large change that does several things.
 
 In practice:
 
-- Tie it to a need, ideally an open issue.
+- Tie it to an issue. `CONTRIBUTING.md` says when that issue has to be assigned
+  to you.
 - Run `cargo xtask ci` and check it by exit code.
 - A diff past roughly 400 lines is worth splitting, or at least flagging.
 - Skip the drive-by cleanup. A formatting sweep bundled with a fix makes the fix
