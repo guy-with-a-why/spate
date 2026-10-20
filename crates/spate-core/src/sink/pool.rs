@@ -5,7 +5,7 @@ use super::worker::{ShardWorker, WorkerReport};
 use super::{EncodedChunk, ShardWriter, SinkFailures};
 use crate::backpressure::InflightBudget;
 use crate::error::SinkError;
-use crate::metrics::SinkShardMetrics;
+use crate::metrics::{QueueMetrics, SinkShardMetrics};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -83,6 +83,40 @@ impl<W: ShardWriter> SinkPool<W> {
         failures: SinkFailures,
         runtime: &tokio::runtime::Handle,
     ) -> Self {
+        Self::spawn_with_queue_metrics(
+            writer,
+            shard_endpoints,
+            receivers,
+            config,
+            budget,
+            metrics,
+            pipeline_name,
+            sink_name,
+            failures,
+            runtime,
+            None,
+        )
+    }
+
+    /// [`spawn`](Self::spawn), with the queues' own handles passed to the
+    /// workers so each samples its queue's depth as it drains it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "construction-time wiring call, used once by the pipeline builder"
+    )]
+    pub(crate) fn spawn_with_queue_metrics(
+        writer: Arc<W>,
+        shard_endpoints: Vec<Vec<W::Endpoint>>,
+        receivers: Vec<mpsc::Receiver<EncodedChunk>>,
+        config: SinkPoolConfig,
+        budget: Arc<InflightBudget>,
+        metrics: Vec<SinkShardMetrics>,
+        pipeline_name: &str,
+        sink_name: &str,
+        failures: SinkFailures,
+        runtime: &tokio::runtime::Handle,
+        queue_metrics: Option<Arc<Vec<QueueMetrics>>>,
+    ) -> Self {
         assert_eq!(
             shard_endpoints.len(),
             receivers.len(),
@@ -93,6 +127,13 @@ impl<W: ShardWriter> SinkPool<W> {
             metrics.len(),
             "one metrics set per shard"
         );
+        if let Some(q) = &queue_metrics {
+            assert_eq!(
+                shard_endpoints.len(),
+                q.len(),
+                "one queue metrics set per shard"
+            );
+        }
         assert!(
             shard_endpoints.iter().all(|r| !r.is_empty()),
             "every shard needs at least one replica"
@@ -144,6 +185,7 @@ impl<W: ShardWriter> SinkPool<W> {
                     cfg: config,
                     budget: Arc::clone(&budget),
                     metrics: shard_metrics,
+                    queue_metrics: queue_metrics.clone(),
                     drain_deadline: drain_rx.clone(),
                     token_prefix: format!("{pipeline_name}-{nonce}-{shard}-"),
                 };

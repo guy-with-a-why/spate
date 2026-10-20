@@ -656,7 +656,7 @@ impl Pipeline {
             .collect::<Result<_, _>>()?;
         let mut writer = parts.writer;
         writer.attach_metrics(sink_meter);
-        let pool = SinkPool::spawn(
+        let pool = SinkPool::spawn_with_queue_metrics(
             Arc::new(writer),
             parts.shard_endpoints,
             receivers,
@@ -667,6 +667,7 @@ impl Pipeline {
             &sink_name,
             self.sink_failures.clone(),
             self.io.handle(),
+            queues.metrics(),
         );
         self.sinks.push((
             sink_name,

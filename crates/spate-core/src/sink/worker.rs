@@ -17,7 +17,7 @@ use super::{EncodedChunk, SealedBatch, ShardWriter, SinkFailures};
 use crate::backpressure::InflightBudget;
 use crate::checkpoint::AckSet;
 use crate::error::{ErrorClass, SinkError};
-use crate::metrics::{AttemptOutcome, FlushReason, SinkShardMetrics};
+use crate::metrics::{AttemptOutcome, FlushReason, QueueMetrics, SinkShardMetrics};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -177,6 +177,9 @@ pub(crate) struct ShardWorker<W: ShardWriter> {
     pub(crate) cfg: SinkPoolConfig,
     pub(crate) budget: Arc<InflightBudget>,
     pub(crate) metrics: Arc<SinkShardMetrics>,
+    /// The senders' `spate_queue_*` handles, indexed by shard. `None` when
+    /// the queues carry no metrics.
+    pub(crate) queue_metrics: Option<Arc<Vec<QueueMetrics>>>,
     pub(crate) drain_deadline: watch::Receiver<Option<Instant>>,
     /// Deduplication tokens are `"{prefix}{seq}"`; the prefix carries the
     /// pipeline name and shard index.
@@ -274,6 +277,7 @@ impl<W: ShardWriter> ShardWorker<W> {
                             self.dispatch(&mut acc, reason, &mut seq, &mut ledger, &mut tasks, &semaphore, &breakers, &mut waiting);
                         }
                     }
+                    self.sample_depth();
                 }
 
                 // Below `recv_many` so chunks already queued at shutdown are
@@ -369,6 +373,15 @@ impl<W: ShardWriter> ShardWorker<W> {
             }
         }
         ledger.report
+    }
+
+    /// Publish the queue's depth after an intake pass, mirroring the senders'
+    /// sample in `ShardQueues::try_send`.
+    fn sample_depth(&self) {
+        // A closed queue is shutdown rather than flow, as for the senders.
+        if let Some(m) = self.queue_metrics.as_ref().filter(|_| !self.rx.is_closed()) {
+            m[self.shard as usize].set_depth(self.rx.max_capacity() - self.rx.capacity());
+        }
     }
 
     /// Which seal threshold, if any, the accumulated batch has crossed.

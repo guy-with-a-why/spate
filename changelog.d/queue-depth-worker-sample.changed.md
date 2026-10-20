@@ -1,0 +1,3 @@
+**`spate_queue_depth` falls as the sink drains its queue** (`spate-core`)
+
+The shard worker samples `spate_queue_depth` after each read from its queue, as well as the senders after each send. Previously only the senders sampled it, so while the source was paused or the pipeline was quiet it held its last send-time reading, typically the queue's capacity, even after the worker had emptied the queue. A dashboard or alert that reads a depth stuck at capacity as a sign of backpressure sees it drop once the queue drains. The reading still holds at capacity while the sink cannot take another batch, and a queue closed at shutdown keeps its last reading.
