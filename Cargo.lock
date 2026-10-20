@@ -4617,6 +4617,7 @@ dependencies = [
  "flate2",
  "libfuzzer-sys",
  "serde",
+ "serde_json",
  "spate-avro",
  "spate-clickhouse",
  "spate-coordination",

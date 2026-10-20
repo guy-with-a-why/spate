@@ -1,14 +1,17 @@
 //! Entry points into code that reads bytes this process did not write: the
-//! composite offset codec, the object framer, and the trim of a ranged read.
+//! composite offset codec, the object framer, the trim of a ranged read, and
+//! the decoder of a feed unit's body.
 //!
 //! Follows the rules [`bench_seams`](crate::bench_seams) states.
 
 use crate::config::Compression;
 use crate::framer::{Codec, ObjectFramer};
 use crate::offset::{self, Position};
-use crate::split::SplitRange;
+use crate::split::{Packing, SplitRange};
 use crate::trim::RangeTrim;
+use crate::unit::{Decoded, Scope};
 use bytes::Bytes;
+use object_store::path::Path;
 use spate_core::framing::RecordFramer;
 use std::io;
 use std::sync::Arc;
@@ -111,4 +114,44 @@ pub fn read_range(
         pos = window_end;
     }
     Some(owned)
+}
+
+/// Decode a feed unit's `body` for a source reading `bucket` under `prefix`,
+/// as the reader does. Returns the `(key, etag)` of each object it reads, in
+/// the body's order, empty when the delivery is acknowledged with nothing to
+/// read, or the reason it fails.
+///
+/// Every object is read whole, so each yields exactly one entry.
+pub fn decode_unit(
+    body: &[u8],
+    bucket: Option<&str>,
+    prefix: &str,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let scope = Scope {
+        bucket: bucket.map(str::to_owned),
+        prefix: Path::from(prefix),
+    };
+    let packing = Packing {
+        target_bytes: 1,
+        compression: Compression::Auto,
+        delimiter: None,
+    };
+    match crate::unit::decode(body, &scope, packing) {
+        Decoded::Read(cursors) => Ok(cursors
+            .into_iter()
+            .map(|cursor| {
+                let entry = &cursor.object[0];
+                (entry.key.clone(), entry.etag.clone())
+            })
+            .collect()),
+        Decoded::Acknowledge(_) => Ok(Vec::new()),
+        Decoded::Fail(reason) => Err(reason),
+    }
+}
+
+/// Whether the source can read `key` under its own name through
+/// `object_store`.
+#[must_use]
+pub fn addressable(key: &str) -> bool {
+    crate::listing::addressable(key)
 }
