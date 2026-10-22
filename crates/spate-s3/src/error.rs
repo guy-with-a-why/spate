@@ -23,7 +23,10 @@ use spate_core::error::ErrorClass;
 pub(crate) fn classify(e: &object_store::Error) -> ErrorClass {
     use object_store::Error as E;
     match e {
-        _ if list_rejected(e) || spate_core::tls_rejection!(rustls, e).is_some() => {
+        _ if list_rejected(e)
+            || delete_rejected(e)
+            || spate_core::tls_rejection!(rustls, e).is_some() =>
+        {
             ErrorClass::Fatal
         }
         E::NotFound { .. }
@@ -88,6 +91,19 @@ fn list_rejected(e: &object_store::Error) -> bool {
             })
 }
 
+/// Whether `e` is a `DeleteObjects` entry the store refused with
+/// `AccessDenied`. The request itself answers 200, and `object_store` reports
+/// the entry as `Generic` with a private error type, so this matches its
+/// message.
+fn delete_rejected(e: &object_store::Error) -> bool {
+    let object_store::Error::Generic { source, .. } = e else {
+        return false;
+    };
+    let text = source.to_string();
+    text.starts_with("DeleteObjects request failed for key ")
+        && text.ends_with("(code: AccessDenied)")
+}
+
 /// `e`'s message, with the TLS rejection behind it appended.
 pub(crate) fn reason(e: &object_store::Error) -> String {
     match spate_core::tls_rejection!(rustls, e) {
@@ -114,6 +130,35 @@ pub(crate) fn poison_kind(e: &object_store::Error) -> crate::split_ctx::PoisonKi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins that only a `DeleteObjects` entry refused with `AccessDenied` is
+    /// fatal: another code on a delete, or `AccessDenied` on another request,
+    /// stays retryable.
+    #[test]
+    fn only_a_delete_entry_refused_with_access_denied_is_fatal() {
+        let generic = |text: &str| object_store::Error::Generic {
+            store: "S3",
+            source: text.to_owned().into(),
+        };
+        let cases = [
+            (
+                "DeleteObjects request failed for key k: Access Denied (code: AccessDenied)",
+                ErrorClass::Fatal,
+            ),
+            (
+                "DeleteObjects request failed for key k: We encountered an internal error \
+                 (code: InternalError)",
+                ErrorClass::Retryable,
+            ),
+            (
+                "Error performing put request k: Access Denied (code: AccessDenied)",
+                ErrorClass::Retryable,
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(classify(&generic(text)), want, "{text}");
+        }
+    }
 
     #[test]
     fn object_level_failures_classify_as_poison_not_pipeline_fatal() {
