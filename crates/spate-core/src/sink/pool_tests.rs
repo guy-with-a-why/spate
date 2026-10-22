@@ -1384,7 +1384,7 @@ fn sink_records_metric_matches_rows_written_exactly() {
 fn queue_depth_reads_zero_once_the_worker_drains_the_queue() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
-    let depth = || queue_depth(&handle.render());
+    let depth = || queue_depth(&handle.render(), 0);
     metrics::with_local_recorder(&recorder, || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1448,15 +1448,55 @@ fn a_closed_queue_keeps_its_last_depth_reading() {
             assert_eq!(report.flushed, 1, "both chunks were read and written");
         });
     });
-    assert_eq!(queue_depth(&handle.render()), 2);
+    assert_eq!(queue_depth(&handle.render(), 0), 2);
 }
 
-/// `spate_queue_depth` for a one-shard fixture's queue.
-fn queue_depth(rendered: &str) -> u64 {
+/// Each shard worker samples its own queue's depth: draining shard 1 moves
+/// shard 1's series to 0 and leaves shard 0's series alone.
+#[test]
+fn each_shard_worker_samples_its_own_queue_depth() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let depth = |shard| queue_depth(&handle.render(), shard);
+    metrics::with_local_recorder(&recorder, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let fx = fixture(2, 1, SinkPoolConfig::default(), 2);
+            let (ack, _rx) = AckRef::test_pair();
+            fx.queues
+                .try_send(1, chunk(1, 4, &ack))
+                .expect("first send fits");
+            fx.queues
+                .try_send(1, chunk(1, 4, &ack))
+                .expect("second send fills");
+            assert_eq!(depth(1), 2, "the senders sample shard 1's full queue");
+            assert_eq!(depth(0), 0, "shard 0's queue was never sent to");
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while depth(1) != 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("shard 1's worker must sample the queue it drained");
+            assert_eq!(depth(0), 0, "shard 1's worker leaves shard 0's series");
+
+            drop(ack);
+            drop(fx.queues);
+            fx.pool.drain(Duration::from_secs(5)).await;
+        });
+    });
+}
+
+/// `spate_queue_depth` for one shard of a fixture's queues.
+fn queue_depth(rendered: &str, shard: usize) -> u64 {
     let value = metric_value(
         rendered,
         "spate_queue_depth",
-        "queue=\"chain->sink/shard-0\"",
+        &format!("queue=\"chain->sink/shard-{shard}\""),
     );
     assert!(
         value >= 0.0 && value.fract() == 0.0,
