@@ -205,9 +205,10 @@ fn fixture(shards: usize, replicas: usize, cfg: SinkPoolConfig, queue_cap: usize
                 &replica_names,
                 E2eBasis::Ingest,
             )
+            .with_queue(queues.metrics(), s)
         })
         .collect();
-    let pool = SinkPool::spawn_with_queue_metrics(
+    let pool = SinkPool::spawn(
         Arc::clone(&writer),
         endpoints,
         receivers,
@@ -218,7 +219,6 @@ fn fixture(shards: usize, replicas: usize, cfg: SinkPoolConfig, queue_cap: usize
         "test",
         SinkFailures::new(),
         &tokio::runtime::Handle::current(),
-        queues.metrics(),
     );
     Fixture {
         writer,

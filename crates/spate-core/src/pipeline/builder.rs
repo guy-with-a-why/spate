@@ -651,12 +651,13 @@ impl Pipeline {
                     replicas,
                     e2e_basis,
                 )
+                .map(|m| m.with_queue(queues.metrics(), shard))
                 .map_err(|e| BuildError::DuplicateSeries(e.to_string()))
             })
             .collect::<Result<_, _>>()?;
         let mut writer = parts.writer;
         writer.attach_metrics(sink_meter);
-        let pool = SinkPool::spawn_with_queue_metrics(
+        let pool = SinkPool::spawn(
             Arc::new(writer),
             parts.shard_endpoints,
             receivers,
@@ -667,7 +668,6 @@ impl Pipeline {
             &sink_name,
             self.sink_failures.clone(),
             self.io.handle(),
-            queues.metrics(),
         );
         self.sinks.push((
             sink_name,
