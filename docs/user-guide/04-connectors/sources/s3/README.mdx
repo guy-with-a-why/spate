@@ -223,10 +223,26 @@ from the environment):
       aws_container_authorization_token_file: "${AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE}"
 ```
 
-A listing, an object read, or a read or write at the
-[job location](#bounded-jobs-and-the-job-location) the store answers with
+A listing, an object read, the HEAD after an overwrite, or a read or write at
+the [job location](#bounded-jobs-and-the-job-location) the store answers with
 `401` or `403`, and a client-configuration error, fail the pipeline
 immediately, because no peer would fare better. The error names the status.
+
+A worker that reads [storage notifications](#storage-notifications) needs
+these permissions besides `s3:GetObject`:
+
+- `s3:ListBucket` on the bucket, so that an object deleted before its read
+  answers `404`. Without it AWS S3 answers `403`, which fails the pipeline.
+- `s3:GetObjectVersion` on a versioned bucket, since a notification from one
+  names a version and the read sends it. Without it every such unit fails the
+  pipeline. It can be scoped to the source's prefix, and it lets anyone who
+  can write to the feed have a past version of an object there read.
+- The feed's send permission, for the unit it re-enqueues after an
+  overwrite. The [SQS feed](../../feeds/sqs/README.mdx#security-credentials-permissions-and-tls)
+  and [Kafka feed](../../feeds/kafka/README.mdx#startup-checks) pages name it.
+
+RustFS and Ceph RGW have not been tested with a role that lacks list
+permission.
 
 A TLS rejection by the store or by the credential endpoint fails the pipeline
 the same way. That covers a certificate that fails verification, including one
@@ -320,9 +336,16 @@ The split count still sets how evenly the lanes divide over threads; see
 
 A [`feed:` section](../../../07-reference/configuration.mdx#feed) moves the
 source onto the feed path. It reads [work units](../../../07-reference/glossary.mdx#work-unit)
-from the feed the section names, and lists nothing itself. Every delivery is
+from the feed the section names. On a durable feed it lists nothing itself:
+a bounded job's units come from a [lister run](#the-lister-run), and a
+continuous job's from [storage notifications](#storage-notifications) or
+code. On the
+in-process feed the run lists the prefix itself; see
+[A solo run on the in-process feed](#a-solo-run-on-the-in-process-feed). Every delivery is
 read in full, resuming from no earlier delivery, and the unit is acknowledged
-once the sink has acknowledged every record in it.
+once the sink has acknowledged every record in it. A notification unit whose
+object is overwritten while it is read is the exception, as
+[Reading a notification's object](#reading-a-notifications-object) describes.
 
 ```yaml
 feed:
@@ -344,7 +367,14 @@ whole on one lane. A unit naming a byte range is failed back when its range is
 cut on a delimiter other than the framer's, or when `compression` decodes its
 object. The unit is acknowledged once, after every part and range has been read
 and committed. An object failure on one range fails the whole unit back, and its
-other parts and ranges stop.
+other parts and ranges stop. An overwrite of a notification unit's object
+stops that object's ranges and re-enqueues the object once, as
+[Reading a notification's object](#reading-a-notifications-object) describes.
+
+The lister publishes no unit for an object of size 0, which holds no records.
+An object whose key the S3 client cannot address is one whole unit, which
+poisons on its first read and names the key; one with no bytes, such as a
+folder marker `dir/`, gets none.
 
 Each range in progress takes one slot of `units_held`. Deliveries received
 alongside a large object wait until all of its ranges have opened, and the
@@ -355,15 +385,42 @@ waiting then goes back to the queue unread, one receive closer to
 partition's commit point.
 
 `units_held` bounds the lanes the source reads at once, one per whole object or
-range, and with them its read parallelism. The default is 96. The source
-publishes no units of its own and reads only the units and storage
-notifications published to the feed, and a startup WARN says so. An in-process feed built from the file alone has no publisher, so the
-run reads nothing. To publish to the in-process feed, code builds a
-`MemoryFeed`, keeps a handle, and passes it to `Pipeline::feed` with
-`feed: { memory: {} }` in the file. Units from another process need a durable
-[feed backend](../../feeds/README.mdx). A run on the feed path never reports its input finished, so it ends
-at a shutdown. Without a `feed:` section the
-source plans splits as described above.
+range, and with them its read parallelism. The default is 96. On a durable
+feed the source lists nothing. It reads the units and storage notifications
+published to the feed, and publishes only the notification unit it
+re-enqueues after an overwrite; a startup WARN says so. On
+the in-process feed the run lists the prefix into that feed, and code may also
+publish to a `MemoryFeed` it keeps a handle to and passes to `Pipeline::feed`
+with `feed: { memory: {} }` in the file. Units from another process need a
+durable [feed backend](../../feeds/README.mdx). A bounded job ends on its own,
+as [How a bounded job ends](#how-a-bounded-job-ends) describes, and so does a
+solo run on the in-process feed the runtime built, once its listing is read. A
+run given a `MemoryFeed` in code, and any job on a durable feed with no
+`location`, ends at a shutdown. A lister run ends once it has published the
+listing. Without a `feed:` section the source plans
+splits as described above.
+
+### A solo run on the in-process feed
+
+A run whose `feed:` section names `memory` lists its own prefix into the
+in-process feed when it opens, and reads units while the listing runs. A
+listing that fails fails the run, whatever the store error.
+
+:::warning A solo run lists from the beginning after a restart
+The in-process feed keeps nothing across a restart, and a solo run keeps no
+checkpoint, so a restarted run lists and reads the whole prefix again, and a
+startup WARN says so. A solo run on the in-process feed the runtime built ends
+by itself once its listing is published and every unit is read, with no
+settling window; when the in-process dead-letter list then holds a unit it
+fails as a [stalled job](#how-a-bounded-job-ends). A run given a `MemoryFeed`
+in code ends at a shutdown, since code may publish to it after the listing.
+Two solo instances, on one host or several, each list
+and read the whole prefix. The listing publishes as fast as the store lists,
+and the in-process feed holds one unit for each listed part not yet read, in
+memory and outside `units_held`. A single instance that must resume reads a
+durable feed with a `location`, filled by a separate
+[lister run](#the-lister-run).
+:::
 
 ### Storage notifications
 
@@ -415,7 +472,9 @@ with its other records. A source whose `url` names the whole bucket
 once, after every part of it has been read and committed.
 
 The records read for a notification take its `eventTime` as their event time,
-and those read for a listed object take the listing's `LastModified`. A
+and those read for a listed object take the listing's `LastModified`. The
+records of a unit the source re-enqueued take the `LastModified` its HEAD
+reported. A
 notification with no `eventTime`, or one that does not parse, gives its records
 event time 0, which under `metrics.e2e_basis: event` counts their end-to-end
 latency from 1970.
@@ -423,11 +482,13 @@ latency from 1970.
 A notification names an object, and its read pins the ETag the notification
 carries. An object deleted before it is read fails that read on every delivery,
 so the feed dead-letters its message at the cap. An object overwritten before
-it is read fails the same way when its notification carries an ETag, and is
-read in its new contents when the notification carries none. A
+or during its read is re-enqueued at its current ETag when its notification
+carries an ETag, and is read in its new contents when the notification carries
+none. A
 notification's unit is a unit of its own, with the feed message's id (the SQS
 `MessageId`, or the Kafka message key), so an object that both a listing and a
-notification announce is read twice. A store
+notification announce is read twice. A unit the source re-enqueues keeps the
+id of the unit it replaces. A store
 sends no notification for an object written before the bucket's notification
 configuration takes effect; on AWS S3 that window lasted at least 181 seconds
 after the configuration was written, in one measured run ([ADR-0072](../../../../adr/0072-missed-storage-notifications-are-not-reconciled-by-re-listing.md)).
@@ -457,6 +518,56 @@ Each store needs its own settings for its notifications to arrive:
   RGW also writes a record's key unencoded, and the source decodes every key,
   so a key holding `+` or `%` decodes to another key.
 
+#### Reading a notification's object
+
+A notification unit's object may have changed since the store sent the event.
+Its read handles each case as the
+[notification-read record](../../../../adr/0077-a-notification-units-read-classifies-a-deleted-or-overwritten-object.md)
+decides:
+
+- A `404` fails the unit back, and the feed dead-letters it at its cap.
+- A `401` or `403` fails the pipeline, as for any object read.
+- A record whose `versionId` is a string other than `""` and `"null"` names a
+  version, and the read sends that version with the ETag pin. An absent or
+  JSON null `versionId`, `""` and `"null"` read the key. A `versionId` longer
+  than 1,024 bytes, or holding a space or a control byte, fails the message.
+  A failed precondition on a read that names a version fails the unit back.
+- A failed precondition (`412`) on a read that names no version means the
+  object was overwritten. So does a `416` on such a read, which RustFS sends
+  for a range past the end of a smaller new object before it checks the
+  precondition. The read stops, and the source sends a HEAD for the
+  key. It publishes a notification unit for the key at the ETag and size the
+  HEAD reports, under the old unit's id, with a re-enqueue count one higher
+  than the old unit's. On SQS the new unit goes to the queue, and on Kafka to
+  the work topic. The old unit is acknowledged once the feed has stored the
+  new one and the sink has acknowledged every record read from the old one.
+- A HEAD that answers `404` is handled as a `404` on the read, and one that
+  answers `401` or `403` as a `403`. A HEAD that reports the ETag the read was
+  pinned to fails the unit back. A HEAD that reports size 0 acknowledges the
+  unit with nothing published.
+- A publish the feed refuses, or cannot confirm, fails the old unit back, and
+  its next delivery reads the object again. A publish the feed answers as
+  fatal, such as a send its permissions deny, fails the pipeline.
+
+An object overwritten while it is read delivers the records read before the
+overwrite, and the rest of that version is never read. Each range read under
+the old ETag costs one HEAD, and the key costs one feed message per delivery. A key overwritten faster than it is read is
+re-enqueued on every overwrite up to the cap, and its last version is read once
+for each unit still in the chain. Two notifications for one overwritten key
+start two chains.
+
+:::danger An overwrite can be dropped at the re-enqueue cap
+A unit whose re-enqueue count has reached the cap is acknowledged on a `412`
+without a re-enqueue, and counted in `spate_s3_source_overwrites_dropped_total`.
+The cap is the `feed:` section's `attempt_cap`, 10 when the section sets none;
+the SQS feed refuses `attempt_cap`, so a job on SQS caps at 10. The key's later
+versions arrive through their own notifications, but a version written by an
+overwrite that sent no notification is lost.
+:::
+
+Units from a lister keep the classification in
+[Object errors poison the split](#object-errors-poison-the-split).
+
 ### Bounded jobs and the job location
 
 A job on a durable feed is bounded when its `feed:` section names a
@@ -476,14 +587,55 @@ feed:
 The location is a prefix, and `…/events-backfill-0042` names the same one.
 The job fingerprint is the object named `fingerprint` there, which the job's
 lister creates before it publishes a unit. A lister run also deletes an object
-named `end` there before its first publish. A new job takes a new location.
+named `end` there before its first publish, and writes `end` once the feed has
+confirmed every unit of the run and the last checkpoint is written. `end`
+holds `run=` and an id fresh to that run. A run that fails writes none, except
+when its write of `end` reached the store and the reply was lost; the next run
+deletes that one before it publishes. Every worker reads `end` to end the job,
+as [How a bounded job ends](#how-a-bounded-job-ends) describes. A new job
+takes a new location.
+
+The lister's checkpoint is the object named `checkpoint` there. It holds the
+last listed key for which the feed has confirmed every unit of it and of every
+key listed before it; the [SQS](../../feeds/sqs/README.mdx#message-mapping)
+and [Kafka](../../feeds/kafka/README.mdx#message-mapping) feed pages say when
+a publish is confirmed. The lister rewrites it at most once every 1,000 listed
+keys and once when its listing ends. A run whose location holds `checkpoint`
+beside its own fingerprint lists only the keys after it, through
+`ListObjectsV2`'s `StartAfter`, and logs the key at INFO. A run that finds no
+fingerprint deletes a `checkpoint` it finds, logs that at INFO, creates the
+fingerprint and lists the whole prefix. A run that stops publishes the units
+after the last checkpoint again. A lister on a `file://` source, or on an S3 directory bucket
+(`aws_s3_express`, or `AWS_S3_EXPRESS` in the environment), keeps no
+checkpoint and logs a WARN: every run lists the prefix from the start.
+
+Resume finds every key while the store lists keys in the same order in the run
+that wrote `checkpoint` and in the run that resumes from it. AWS S3
+general-purpose buckets list in UTF-8 byte order; the CI suite checks resume on
+RustFS only. Resume is unsupported on SeaweedFS, where it skips keys: SeaweedFS
+lists in directory-tree order, so a resume after a key that is also a
+directory prefix (`q/r` beside `q/r/s`) skips that directory. Its listings can
+also end early; see [Testing](#testing).
+
+:::danger
+A run at a location that holds the job's fingerprint and a `checkpoint` never
+reads the keys up to the checkpoint. A re-run of a finished job publishes the
+keys that list after the checkpoint, and again each object the S3 client cannot
+address that lists after it; a key added since that lists before the checkpoint
+is never read. A job whose feed lost its units, such as a purged queue or a new
+queue or topic at the same location, never reads its keys up to the checkpoint.
+If the store's list order may have changed since `checkpoint` was written, such
+as across a store upgrade, stop the lister, delete `checkpoint`, and start it
+again. To start a job over, delete the whole location prefix.
+:::
 
 The fingerprint covers the unit format version, `url`, `compression`,
 `split_target_bytes` and the framer's resync delimiter. At startup a worker of
 a bounded job reads `fingerprint` every five seconds until it appears, and
 compares it with its own before it receives a unit. A worker whose fingerprint
 differs fails startup, and the error prints both. A worker that finds none
-within five minutes exits non-zero. A read the store fails retryably is logged
+within one settling window, five minutes unless the `feed:` section's
+`settling_window` sets another, exits non-zero. A read the store fails retryably is logged
 at WARN and tried again at the next step. The exit error names the last
 failed read's error, says "none appeared" when the reads found nothing, and
 says the store answered no read when it answered none within the window. While it waits a worker holds no unit and reports not ready on
@@ -526,15 +678,105 @@ source dead-letters; nothing checks that.
 Workers need read access to the location. The lister needs to read, write and
 delete there. On AWS S3 that read access includes `s3:ListBucket` on the
 location's bucket: without it a read of an absent object answers `403`, so a
-worker started before its lister fails at once and a lister fails on the absent
-end marker. The error says so. The lister creates `fingerprint` only when
+worker started before its lister fails at once and a lister at a new location
+fails on the absent fingerprint. The error says so. Write access at the location
+decides where a lister run resumes. The lister creates `fingerprint` only when
 absent, so a lister whose `store` sets `aws_conditional_put: disabled` fails.
-Run one lister per location: the conditional create refuses a second lister
-with another fingerprint on a store that honors `If-None-Match`, and the CI
-suite checks that on RustFS only. The location needs read-after-write and
+Run one lister per location: a second lister with another fingerprint is
+refused when it reads the first's fingerprint, and, when both read before
+either wrote one, by the conditional create on a store that honors
+`If-None-Match`, which the CI suite checks on RustFS only. The location needs read-after-write and
 read-after-delete consistency, which means `consistency_mode = "consistent"`
 on Garage and one zone on Ceph RGW. A `file://` location serves the processes
 of one host.
+
+### How a bounded job ends
+
+A worker of a bounded job ends the job once all three hold:
+
+- the object `end` names the same lister run at the start and at the end of a
+  settling window, five minutes unless the `feed:` section's
+  [`settling_window`](../../../07-reference/configuration.mdx#feed) sets
+  another;
+- every read of the feed's depth over the window, at most 20 seconds apart,
+  finds no unit ready, delayed or held by any worker, and the worker holds
+  none and has no acknowledgement in flight;
+- the feed's dead-letter destination is empty, read once after the window.
+
+Each worker decides on its own reads and exits zero. A read that finds a unit, a
+read that fails retryably or comes late, a unit the worker takes, or an `end`
+that changes or disappears starts the window again from a new read of `end`. A
+read of the feed or of `end` that fails for good, such as for a missing
+permission, and an `end` that does not hold a lister run's marker fail the run
+with exit code 1. The worker reads `end` only at the start and the end of a
+window, and its feed every 15 seconds within one, so that no two reads fall more
+than 20 seconds apart. A feed that cannot report its depth fails a bounded job
+at startup. The
+[work feed](../../../02-concepts/09-work-feed.mdx#how-a-bounded-job-ends) page
+states the rule, and each [feed's page](../../feeds/README.mdx) how it reads its
+depth.
+
+When the dead-letter destination holds units, the job ends **stalled**: the
+run fails with an error that includes `bounded feed job stalled:` and names the
+destination and its count, and the process exits non-zero. To re-run a stalled
+job, fix what made its units fail, then start a new job at the same location on
+a fresh queue or topics, with its own dead-letter destination. Copy the dead
+letters into the new job's feed by hand before you start its lister. The
+lister resumes after the checkpoint and publishes only the keys listed after
+it, and the workers read both. A copied unit that arrives after the new job's
+workers have seen its `end` over a settling window of empty reads is left
+unread. A re-run whose fix changes the fingerprint, such as a new
+`compression`, `split_target_bytes` or framer, takes a new location, lists the
+whole prefix and needs no copied units.
+
+A bounded job cannot share its feed with storage notifications, and nothing
+checks that. Notifications keep the window from closing until they stop for a
+whole window, and an object both the lister and a notification announce is
+read twice. A unit the feed deletes at the end of its retention, before any
+worker reads it, leaves no trace, and the job can end over it.
+
+### The lister run
+
+A bounded job's units come from one lister run per job: the same binary,
+started once in place of a worker, that lists the prefix, publishes its units,
+writes `end` and exits. `main()` starts it with
+[`S3Source::list_once`](https://docs.rs/spate-s3/latest/spate_s3/struct.S3Source.html#method.list_once),
+whose rustdoc example is a binary that runs the lister when its first argument
+is `list`. The run reads the source and `feed:` sections of the workers' own
+pipeline file and builds no sink. Build its feed with the backend's
+publish-only handle where it has one, such as the Kafka feed's
+[publish-only handle](../../feeds/kafka/README.mdx#a-publish-only-handle),
+which joins no group the workers read. It refuses the in-process feed, a section
+with no `location`, a feed other than the one the section names, a source
+given a coordinator, and a call from a thread in a Tokio runtime context,
+such as async code or a `spawn_blocking` closure.
+
+A unit the feed rejects as retryable is published again, up to five attempts,
+after waits of 200 ms, 400 ms, 800 ms and 1.6 s. A unit the feed refuses, or
+still rejects after the fifth attempt, fails the run, and the error names its
+object. A failed run returns its error, so a binary that returns it from
+`main()` exits non-zero, and the next run resumes after the checkpoint.
+
+The lister adds no timeout of its own. Each request to the store is bounded by
+`object_store`'s retries, about three minutes. A publish waits as long as its
+[feed backend](../../feeds/README.mdx) keeps trying it, which has no bound on
+a backend that retries a transient failure until it stops. Bound the run as a
+whole where it is deployed, such as a Kubernetes Job's
+`activeDeadlineSeconds`.
+
+Two lister runs over one prefix:
+
+- at two locations publish every unit twice, and nothing detects it;
+- at one location with one fingerprint, the later run resumes after the
+  checkpoint the earlier wrote, or lists the whole prefix when both start
+  before either writes one, and the first to finish writes `end` while the
+  other may still hold units the feed has not confirmed, so the workers can
+  end the job while those units are still on their way to the feed, where
+  they stay unread;
+- at one location with two fingerprints, the later run is refused when it
+  reads the earlier's fingerprint, on any store; when both read before either
+  wrote one, the conditional create refuses the later run only on a store
+  that honors `If-None-Match`.
 
 ## Split identity and drift
 
@@ -682,7 +924,9 @@ is not planned.
 There is no skip-an-object mode; the reasoning is in
 [ADR-0035](../../../../adr/0035-s3-poison-policy.md), which also covers why
 credential and configuration failures fail the pipeline instead. Quarantine
-lets the rest of the backfill finish first.
+lets the rest of the backfill finish first. An overwrite of a notification
+unit's object is re-enqueued instead, as
+[Reading a notification's object](#reading-a-notifications-object) describes.
 
 ## Testing
 
@@ -719,8 +963,10 @@ noted per family.
 | `spate_s3_source_objects_remaining` | gauge | | Objects not yet completed across **this worker's currently-held splits** (rises on split gain, falls per completed object, settles on split close). A cut object counts once per range. Fleet totals come from the `spate_coordination_*` split gauges, not from summing this. |
 | `spate_s3_source_bytes_read_total` | counter | | Bytes read from the store, as stored (pre-decompression), including the bytes a byte-range split reads around its range and drops. |
 | `spate_s3_source_bytes_decoded_total` | counter | | Bytes after decompression; for a byte-range split, the bytes of the records it owns. Equals `bytes_read` for uncompressed objects read whole; the ratio is the effective compression. |
-| `spate_s3_source_get_retries_total` | counter | | Object GET attempts beyond the first (transient failures, resumed with ranged reads). A rising rate means a flaky store or network; an exhausted attempt budget poisons the split rather than failing the pipeline. |
-| `spate_s3_source_objects_failed_total` | counter | `reason` | Objects, or byte ranges of one, that poisoned their split: `not_found` (deleted after planning, or a key that is not a valid object path), `etag_drift` (overwritten under the `If-Match` pin, or content shorter than committed progress), `undecodable` (corrupt/truncated content, over the per-object record limit, or unverifiable without an ETag), `retries_exhausted`. Each report hands the split back; quarantine at the attempt cap shows up in `spate_coordination_splits_quarantined`. |
+| `spate_s3_source_get_retries_total` | counter | | Object GET and HEAD attempts beyond the first (transient failures, resumed with ranged reads). A rising rate means a flaky store or network; an exhausted attempt budget poisons the split rather than failing the pipeline. |
+| `spate_s3_source_objects_failed_total` | counter | `reason` | Objects, or byte ranges of one, that poisoned their split: `not_found` (deleted after planning, or a key that is not a valid object path), `etag_drift` (overwritten under the `If-Match` pin, or content shorter than committed progress; a notification unit's re-enqueued overwrite is counted in `objects_overwritten_total` instead), `undecodable` (corrupt/truncated content, over the per-object record limit, or unverifiable without an ETag), `retries_exhausted`. Each report hands the split back; quarantine at the attempt cap shows up in `spate_coordination_splits_quarantined`. |
+| `spate_s3_source_objects_overwritten_total` | counter | | Objects a notification unit's read found overwritten under its ETag pin, once per object and delivery, whether re-enqueued or not. See [Reading a notification's object](#reading-a-notifications-object). |
+| `spate_s3_source_overwrites_dropped_total` | counter | | Of those, the objects whose unit was at the re-enqueue cap and was acknowledged without a re-enqueue. A non-zero value means an overwrite may have been dropped. |
 
 A coordinated run adds the framework's `spate_coordination_*` families. See
 [Metrics](../../../../METRICS.md).

@@ -84,6 +84,12 @@ impl ShardQueues {
         result
     }
 
+    /// The per-shard queue handles, if `attach_metrics` has run, for the shard
+    /// workers to sample depth as they drain.
+    pub(crate) fn metrics(&self) -> Option<Arc<Vec<QueueMetrics>>> {
+        self.metrics.clone()
+    }
+
     /// Pre-register one `QueueMetrics` per shard, resolved through `labels` so
     /// the `spate_queue_*` series inherit the standard component labels. Call
     /// once, before this handle is cloned into pipeline terminals, so every

@@ -127,6 +127,10 @@ const config: Config = {
     },
   },
 
+  // Loads the page-view beacon on the deployed hostname, unless the browser
+  // opts out; /privacy states what it sends.
+  clientModules: ['./src/analytics/clientModule.ts'],
+
   plugins: [
     // CI-only, as a standing precaution rather than for any entry currently
     // in the set (see clientRedirects above).
@@ -257,7 +261,9 @@ const config: Config = {
           // A post without a truncation marker lists in full; the list page
           // should show openings.
           onUntruncatedBlogPosts: 'throw',
-          editUrl: `${githubUrl}/edit/${SOURCE_REF}/website/blog/`,
+          // The plugin appends the blog's path from the site directory, so the
+          // base stops at website/.
+          editUrl: `${githubUrl}/edit/${SOURCE_REF}/website/`,
         },
         sitemap: {
           // Docusaurus reads the date from git for docs pages; the rest carry

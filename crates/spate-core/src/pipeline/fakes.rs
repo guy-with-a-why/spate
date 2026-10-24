@@ -48,6 +48,11 @@ pub(crate) struct SourceLog {
     pub(crate) stopped_commits: Vec<Vec<(PartitionId, i64)>>,
     /// Whether the stop signal read set when `commit_final` ran.
     pub(crate) final_saw_stop: Option<bool>,
+    /// When set, `configure_feed` accepts the section, as a feed-reading
+    /// source does; otherwise it refuses it as the trait default does.
+    pub(crate) accept_feed: bool,
+    /// The origin `configure_feed` was handed.
+    pub(crate) feed_origin: Option<crate::feed::FeedOrigin>,
 }
 
 pub(crate) enum Script {
@@ -255,6 +260,26 @@ impl Source for FakeSource {
     fn resume(&mut self, lanes: &[LaneId]) -> Result<(), SourceError> {
         self.shared.lock().unwrap().resumes.push(lanes.to_vec());
         Ok(())
+    }
+
+    fn configure_feed(
+        &mut self,
+        section: &crate::config::FeedSection,
+        feed: Arc<dyn crate::feed::Feed>,
+        origin: crate::feed::FeedOrigin,
+    ) -> Result<(), crate::config::ConfigError> {
+        let _ = (section, feed);
+        self.shared.lock().unwrap().feed_origin = Some(origin);
+        if self.shared.lock().unwrap().accept_feed {
+            return Ok(());
+        }
+        Err(crate::config::ConfigError::Component {
+            context: "feed".into(),
+            message: format!(
+                "the source (`{}`) reads no feed; remove the `feed:` section",
+                self.component_type()
+            ),
+        })
     }
 }
 

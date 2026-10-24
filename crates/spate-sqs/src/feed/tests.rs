@@ -5,10 +5,12 @@ use spate_core::feed::{FeedPark, wake_channel};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const MINUTE: Duration = Duration::from_secs(60);
+const QUEUE_URL: &str = "https://sqs.eu-west-2.amazonaws.com/111122223333/jobs";
+const DEAD_URL: &str = "https://sqs.eu-west-2.amazonaws.com/111122223333/jobs-dlq";
 
 fn config(visibility: Duration) -> SqsFeedConfig {
     SqsFeedConfig {
-        queue_url: "https://sqs.eu-west-2.amazonaws.com/111122223333/jobs".to_owned(),
+        queue_url: QUEUE_URL.to_owned(),
         visibility,
         region: None,
         endpoint: None,
@@ -19,6 +21,8 @@ fn start(visibility: Duration) -> (SqsFeed, Arc<ScriptedQueue>) {
     let queue = Arc::new(ScriptedQueue::default());
     let feed = SqsFeed::start(
         Arc::clone(&queue) as Arc<dyn Queue>,
+        Arc::clone(&queue) as Arc<dyn startup::QueueAttributes>,
+        DEAD_URL.to_owned(),
         &config(visibility),
         &tokio::runtime::Handle::current(),
     );
@@ -509,6 +513,8 @@ fn start_gated(visibility: Duration) -> (SqsFeed, Arc<Gated>) {
     let queue = Arc::new(Gated::default());
     let feed = SqsFeed::start(
         Arc::clone(&queue) as Arc<dyn Queue>,
+        Arc::new(ScriptedQueue::default()),
+        DEAD_URL.to_owned(),
         &config(visibility),
         &tokio::runtime::Handle::current(),
     );
@@ -1078,8 +1084,11 @@ async fn a_send_timed_out_then_denied_reads_retryable() {
     // Paused only now: building the client reads the trust store on a
     // blocking thread.
     tokio::time::pause();
+    let queue = Arc::new(queue);
     let feed = SqsFeed::start(
-        Arc::new(queue) as Arc<dyn Queue>,
+        Arc::clone(&queue) as Arc<dyn Queue>,
+        queue,
+        DEAD_URL.to_owned(),
         &cfg,
         &tokio::runtime::Handle::current(),
     );
@@ -1108,6 +1117,7 @@ async fn a_batch_shape_failure_after_a_retried_send_reads_refused() {
 
 /// Answers every read of a queue with a redrive policy, except a read of the
 /// queue at `url`, which never answers.
+#[derive(Debug)]
 struct Hangs {
     url: &'static str,
 }
@@ -1327,4 +1337,230 @@ async fn a_receive_answered_with_a_receive_failure_keeps_buffered_units() {
         1,
         "the buffered unit lapsed while the reader polled"
     );
+}
+
+/// Read `of` through the feed and wait for the answer.
+async fn depth(feed: &SqsFeed, of: DepthOf) -> Result<Depth, FeedError> {
+    let mut reading = feed.read_depth(of).expect("the SQS feed reports depth");
+    let mut outcome = None;
+    until("the depth read settles", || {
+        outcome = reading.try_outcome();
+        outcome.is_some()
+    })
+    .await;
+    outcome.unwrap()
+}
+
+/// Pins how each count maps: the queue's ready, delayed and not-visible
+/// messages report as visible, delayed and in flight, each alone making the
+/// depth non-empty, approximate, and named after the queue read.
+#[tokio::test(start_paused = true)]
+async fn each_count_alone_reads_as_not_empty() {
+    let (feed, queue) = start(MINUTE);
+    for (url, of) in [(QUEUE_URL, DepthOf::Feed), (DEAD_URL, DepthOf::DeadLetters)] {
+        for (counts, field) in [
+            ([3, 0, 0], "visible"),
+            ([0, 4, 0], "delayed"),
+            ([0, 0, 5], "in_flight"),
+        ] {
+            queue.set_counts(url, counts[0], counts[1], counts[2]);
+            let d = depth(&feed, of).await.unwrap();
+            assert!(!d.is_empty(), "{of:?} {field}");
+            assert_eq!(
+                (d.visible, d.delayed, d.in_flight),
+                (counts[0], counts[1], counts[2])
+            );
+            assert!(d.approximate);
+            assert!(d.what.contains(url), "{}", d.what);
+        }
+        queue.set_counts(url, 0, 0, 0);
+    }
+}
+
+/// Pins that zero counts on both queues read as empty, and that the
+/// dead-letter read asks the dead-letter queue's URL the feed was given at
+/// connect, and the feed read the queue's own.
+#[tokio::test(start_paused = true)]
+async fn zero_counts_read_as_empty_from_each_queue() {
+    let (feed, queue) = start(MINUTE);
+    assert!(depth(&feed, DepthOf::Feed).await.unwrap().is_empty());
+    assert!(depth(&feed, DepthOf::DeadLetters).await.unwrap().is_empty());
+    assert_eq!(queue.attribute_reads(), vec![QUEUE_URL, DEAD_URL]);
+}
+
+/// Pins that a settled depth reading wakes the reader, so its park ends on
+/// the answer.
+#[tokio::test(start_paused = true)]
+async fn a_settled_depth_read_wakes_the_reader() {
+    let (feed, _queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    assert!(depth(&feed, DepthOf::Feed).await.unwrap().is_empty());
+    assert!(
+        park.park(Duration::ZERO),
+        "the answer did not wake the reader"
+    );
+}
+
+/// Pins that a depth reading and its error name the queues with the URL's
+/// userinfo redacted.
+#[tokio::test(start_paused = true)]
+async fn depth_text_carries_no_queue_url_userinfo() {
+    const SECRET_URL: &str = "https://ops:hunter2@sqs.eu-west-2.amazonaws.com/111122223333/jobs";
+    let section: FeedSection =
+        serde_yaml::from_str(&format!("sqs: {{ queue_url: \"{SECRET_URL}\" }}")).unwrap();
+    let config = SqsFeedConfig::from_section(&section).expect("the section is accepted");
+    let source = url::Url::parse(&config.queue_url).unwrap();
+    let dead = startup::dead_letter_url(&source, "arn:aws:sqs:eu-west-2:111122223333:jobs-dlq")
+        .unwrap()
+        .to_string();
+    let queue = Arc::new(ScriptedQueue::default());
+    let feed = SqsFeed::start(
+        Arc::clone(&queue) as Arc<dyn Queue>,
+        Arc::clone(&queue) as Arc<dyn startup::QueueAttributes>,
+        dead.clone(),
+        &config,
+        &tokio::runtime::Handle::current(),
+    );
+    let feed_depth = depth(&feed, DepthOf::Feed).await.unwrap();
+    let dead_depth = depth(&feed, DepthOf::DeadLetters).await.unwrap();
+    queue.fail_attributes(&dead, CallError::fatal("AccessDenied"));
+    let e = depth(&feed, DepthOf::DeadLetters).await.unwrap_err();
+    for text in [
+        feed_depth.to_string(),
+        dead_depth.to_string(),
+        e.to_string(),
+    ] {
+        assert!(
+            !text.contains("hunter2"),
+            "credential in depth text: {text}"
+        );
+        assert!(text.contains("sqs.eu-west-2.amazonaws.com"), "{text}");
+    }
+}
+
+/// Pins how a failed read of the counts maps: a fatal class reads as Fatal,
+/// a retryable one as Retryable, each naming the queue.
+#[tokio::test(start_paused = true)]
+async fn a_failed_count_read_keeps_its_class() {
+    let (feed, queue) = start(MINUTE);
+    queue.fail_attributes(DEAD_URL, CallError::fatal("AccessDenied"));
+    let e = depth(&feed, DepthOf::DeadLetters).await.unwrap_err();
+    assert_eq!(e.kind, FeedErrorKind::Fatal);
+    assert!(
+        e.reason.contains("AccessDenied") && e.reason.contains(DEAD_URL),
+        "{e}"
+    );
+    queue.fail_attributes(QUEUE_URL, CallError::retryable("throttled"));
+    let e = depth(&feed, DepthOf::Feed).await.unwrap_err();
+    assert_eq!(e.kind, FeedErrorKind::Retryable);
+    assert!(
+        e.reason.contains("throttled") && e.reason.contains(QUEUE_URL),
+        "{e}"
+    );
+}
+
+/// Pins that an acknowledge and a fail the feed accepted and has not yet
+/// sent count in `unsent`, queued and while the delete is retried, and leave
+/// it once sent; the dead-letter read counts none.
+#[tokio::test(start_paused = true)]
+async fn an_unsent_delete_reports_in_unsent() {
+    let (feed, queue) = start_gated(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.inner.ready(Message::new("a"));
+    queue.inner.ready(Message::new("b"));
+    let got = receive_n(&feed, &park, 2).await;
+    queue.delete_down.store(true, Ordering::SeqCst);
+    feed.acknowledge(got[0].receipt).unwrap();
+    feed.fail(got[1].receipt, "unreadable").unwrap();
+    assert_eq!(
+        depth(&feed, DepthOf::Feed).await.unwrap().unsent,
+        2,
+        "queued"
+    );
+    settle_tasks().await;
+    assert_eq!(
+        depth(&feed, DepthOf::Feed).await.unwrap().unsent,
+        2,
+        "being sent"
+    );
+    assert_eq!(depth(&feed, DepthOf::DeadLetters).await.unwrap().unsent, 0);
+    queue.delete_down.store(false, Ordering::SeqCst);
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle_tasks().await;
+    }
+    assert_eq!(
+        queue.inner.deletes().len(),
+        1,
+        "the delete reached the queue"
+    );
+    assert_eq!(depth(&feed, DepthOf::Feed).await.unwrap().unsent, 0);
+}
+
+/// Pins that the settle task's batch counts in `unsent` while a fail in it
+/// is retried, after the delete taken beside it has been sent.
+#[tokio::test(start_paused = true)]
+async fn a_fail_being_retried_reports_in_unsent() {
+    let (feed, queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("a"));
+    queue.ready(Message::new("b"));
+    let got = receive_n(&feed, &park, 2).await;
+    queue.fail_next_visibility_call(CallError::retryable("InternalError"));
+    feed.acknowledge(got[0].receipt).unwrap();
+    feed.fail(got[1].receipt, "unreadable").unwrap();
+    settle_tasks().await;
+    assert_eq!(queue.deletes().len(), 1, "the delete was sent");
+    assert_eq!(queue.visibility().len(), 1, "the fail was tried once");
+    assert_eq!(
+        depth(&feed, DepthOf::Feed).await.unwrap().unsent,
+        2,
+        "the batch holding the fail"
+    );
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle_tasks().await;
+    }
+    assert_eq!(queue.visibility().len(), 2, "the fail was sent again");
+    assert_eq!(depth(&feed, DepthOf::Feed).await.unwrap().unsent, 0);
+}
+
+/// Answers every attribute read without the message counts.
+#[derive(Debug)]
+struct Uncounted;
+
+impl startup::QueueAttributes for Uncounted {
+    fn attributes<'a>(
+        &'a self,
+        _queue_url: &'a str,
+        _names: &'static [&'static str],
+    ) -> BoxFuture<'a, Result<HashMap<String, String>, CallError>> {
+        Box::pin(async { Ok(HashMap::new()) })
+    }
+}
+
+/// Pins that a depth read whose reply lacks a count reads as Fatal, naming
+/// the count and the queue.
+#[tokio::test(start_paused = true)]
+async fn a_reply_without_the_counts_reads_as_fatal() {
+    let feed = SqsFeed::start(
+        Arc::new(ScriptedQueue::default()) as Arc<dyn Queue>,
+        Arc::new(Uncounted),
+        DEAD_URL.to_owned(),
+        &config(MINUTE),
+        &tokio::runtime::Handle::current(),
+    );
+    for (of, url) in [(DepthOf::Feed, QUEUE_URL), (DepthOf::DeadLetters, DEAD_URL)] {
+        let e = depth(&feed, of).await.unwrap_err();
+        assert_eq!(e.kind, FeedErrorKind::Fatal, "{of:?}");
+        assert!(
+            e.reason
+                .contains("reported no `ApproximateNumberOfMessages`")
+                && e.reason.contains(url),
+            "{e}"
+        );
+    }
 }

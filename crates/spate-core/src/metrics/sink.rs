@@ -4,11 +4,12 @@
 use super::labels::{ComponentLabels, OwnedGauge};
 use super::names;
 use super::ownership::{SeriesClaim, series_key};
+use super::queue::QueueMetrics;
 use super::{E2eBasis, MetricsError};
 use crate::error::ErrorClass;
 use metrics::{Counter, Histogram, SharedString};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Why a sink batch was sealed and flushed.
@@ -92,6 +93,9 @@ pub struct SinkShardMetrics {
     e2e: Histogram,
     e2e_basis: E2eBasis,
     replicas: Vec<ReplicaMetrics>,
+    /// The queues' handles and this shard's index into them, for the worker to
+    /// sample its queue's depth. `None` when the queues carry no metrics.
+    queue: Option<(Arc<Vec<QueueMetrics>>, usize)>,
     _claim: Option<SeriesClaim>,
 }
 
@@ -303,6 +307,7 @@ impl SinkShardMetrics {
             e2e: labels.histogram(names::E2E_LATENCY_SECONDS),
             e2e_basis,
             replicas,
+            queue: None,
             _claim: claim,
         }
     }
@@ -536,6 +541,25 @@ impl SinkShardMetrics {
     /// gone stale corrects itself within one probe cycle.
     pub fn set_shard_healthy(&self, up: bool) {
         self.shard_healthy.set(if up { 1.0 } else { 0.0 });
+    }
+
+    /// Attach the queues' handles, so [`set_queue_depth`](Self::set_queue_depth)
+    /// writes shard `shard`'s `spate_queue_depth`. `None` leaves it a no-op.
+    pub(crate) fn with_queue(
+        mut self,
+        queue: Option<Arc<Vec<QueueMetrics>>>,
+        shard: usize,
+    ) -> Self {
+        self.queue = queue.map(|q| (q, shard));
+        self
+    }
+
+    /// Set this shard's queue depth, when [`with_queue`](Self::with_queue)
+    /// attached the queues' handles.
+    pub(crate) fn set_queue_depth(&self, depth: usize) {
+        if let Some((q, shard)) = &self.queue {
+            q[*shard].set_depth(depth);
+        }
     }
 
     /// Count batches abandoned at the drain deadline.

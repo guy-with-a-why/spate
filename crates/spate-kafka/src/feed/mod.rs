@@ -1,10 +1,11 @@
 //! [`KafkaFeed`]: the work feed over a work topic, a retry topic, a
 //! dead-letter topic and a compacted attempt topic.
 //!
-//! The feed runs three threads. The consumer thread reads the work and
+//! The feed runs four threads. The consumer thread reads the work and
 //! retry topics as a member of the feed's group. The follower thread reads
 //! the attempt topic into memory. The gate thread records each delivered
-//! unit's attempt before the unit reaches the reader. One producer writes
+//! unit's attempt before the unit reaches the reader. The depth thread
+//! answers a bounded job's depth reads. One producer writes
 //! publishes, attempt records and their tombstones, retries and dead
 //! letters. The [`Feed`] methods lock the shared state, change it, and hand
 //! any write to the producer, so none of them waits on I/O (INV-2).
@@ -39,17 +40,20 @@
 mod attempt;
 mod config;
 mod consumer;
+mod depth;
 mod error;
 mod events;
 mod gate;
 mod inflight;
 mod producer;
+mod publisher;
 mod startup;
 #[cfg(test)]
 mod tests;
 mod write;
 
 pub use error::KafkaFeedError;
+pub use publisher::KafkaFeedPublisher;
 
 use crate::context::SourceContext;
 use crate::error::redacted_client_error;
@@ -64,7 +68,8 @@ use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::producer::ThreadedProducer;
 use spate_core::config::FeedSection;
 use spate_core::feed::{
-    Confirmation, Delivery, Feed, FeedError, FeedErrorKind, FeedWaker, Receipt, Unit, confirmation,
+    Confirmation, Delivery, DepthOf, DepthReading, DepthReporter, Feed, FeedError, FeedErrorKind,
+    FeedWaker, Receipt, Unit, confirmation, depth_reading,
 };
 use startup::TopicAdmin as _;
 use std::collections::{HashMap, VecDeque};
@@ -336,11 +341,16 @@ impl Core {
 
     fn failed(&self, mut write: Write, failure: Failure) {
         if let Write::Publish { confirmer, .. } = write {
-            let error = match write::classify(failure.code) {
-                WriteClass::Refused => FeedError::new(FeedErrorKind::Refused, failure.reason),
-                WriteClass::Fatal => self.latch(&failure.reason),
-                WriteClass::Retryable => FeedError::new(FeedErrorKind::Retryable, failure.reason),
-            };
+            let error =
+                match write::classify(failure.code) {
+                    WriteClass::Refused => FeedError::new(FeedErrorKind::Refused, failure.reason),
+                    WriteClass::Fatal => self.latch(&failure.reason),
+                    // A fatal producer error latches before librdkafka purges
+                    // the queue, so a publish purged by it reports the cause.
+                    WriteClass::Retryable => self.lock().fatal.clone().unwrap_or_else(|| {
+                        FeedError::new(FeedErrorKind::Retryable, failure.reason)
+                    }),
+                };
             confirmer.reject(error);
             return;
         }
@@ -412,12 +422,21 @@ impl Drop for LatchOnPanic {
 /// finished are delivered again to the next owner of their partition. A
 /// feed that stopped on a Fatal error commits nothing more, so every unit
 /// since its last commit is delivered again.
+///
+/// [`read_depth`](Feed::read_depth) reports the group's lag on the work and
+/// retry topics, or the sum of the dead-letter topic's end offsets, read on
+/// a thread of the feed's own through a consumer that never joins the group.
+///
+/// A process that only publishes, such as a lister run, builds a
+/// [`KafkaFeedPublisher`], which joins no group and reports no depth.
 pub struct KafkaFeed {
     core: Arc<Core>,
     producer: Producer,
     thread: Option<std::thread::JoinHandle<()>>,
     gate: Option<std::thread::JoinHandle<()>>,
     follower: Option<std::thread::JoinHandle<()>>,
+    /// Hands depth reads to the depth thread, which ends once this drops.
+    depth: Option<Mutex<std::sync::mpsc::Sender<(DepthOf, DepthReporter)>>>,
 }
 
 impl std::fmt::Debug for KafkaFeed {
@@ -459,8 +478,9 @@ impl KafkaFeed {
     /// [`KafkaFeedError::Unavailable`] when a read of the topics fails
     /// otherwise or the checks take longer than 30 seconds, as they do when
     /// no broker accepts a connection, and when one of the feed's consumer,
-    /// gate and follower threads cannot be started. A failed gate or consumer
-    /// start stops and joins the threads already started before it returns.
+    /// gate, follower and depth threads cannot be started. A failed gate,
+    /// consumer or depth start stops and joins the threads already started
+    /// before it returns.
     ///
     /// # Panics
     ///
@@ -512,36 +532,7 @@ impl KafkaFeed {
         bound: Duration,
     ) -> Result<KafkaFeed, KafkaFeedError> {
         let config = KafkaFeedConfig::from_section(section)?;
-        let openssl_env = crate::security::openssl_env_overrides();
-        let admin_config = config.admin_config(openssl_env);
-        let admin = AdminClient::from_config(&admin_config).map_err(|e| {
-            KafkaFeedError::Refused(format!(
-                "creating the admin client: {}",
-                redacted_client_error(&e)
-            ))
-        })?;
-        let reader = ThreadedProducer::from_config_and_context(
-            &admin_config,
-            crate::sink::SinkContext::detached(),
-        )
-        .map_err(|e| {
-            KafkaFeedError::Refused(format!(
-                "creating the metadata client: {}",
-                redacted_client_error(&e)
-            ))
-        })?;
-        let topics = Topics::new(&config);
-        let step = Mutex::new("starting".to_owned());
-        let checked = {
-            let admin = Arc::new(startup::Brokers::new(admin, reader));
-            let watched = Arc::clone(&admin);
-            io.block_on(startup::bounded(
-                &step,
-                bound,
-                move || watched.rejection(),
-                startup::check(&*admin, &topics, scope, &step),
-            ))?
-        };
+        let checked = check_topics(&config, io, scope, bound)?;
         let (core, producer, driver) = parts(&config, checked.attempt_partitions)?;
         let follower = Follower::new(&config, Arc::clone(&core))?
             .spawn()
@@ -556,6 +547,7 @@ impl KafkaFeed {
             thread: None,
             gate: None,
             follower: Some(follower),
+            depth: None,
         };
         let gate = gate::Gate::new(
             Arc::clone(&feed.core),
@@ -573,6 +565,7 @@ impl KafkaFeed {
                     KafkaFeedError::Unavailable(format!("starting the feed's consumer thread: {e}"))
                 })?,
         );
+        feed.depth = Some(Mutex::new(start_depth(&config, &feed.core)?));
         log_started(&config, &checked);
         Ok(feed)
     }
@@ -580,6 +573,39 @@ impl KafkaFeed {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.core.lock()
     }
+}
+
+/// Start the depth thread, detached: it ends once the feed drops the
+/// returned sender, after any read in flight.
+fn start_depth(
+    config: &KafkaFeedConfig,
+    core: &Arc<Core>,
+) -> Result<std::sync::mpsc::Sender<(DepthOf, DepthReporter)>, KafkaFeedError> {
+    let openssl_env = crate::security::openssl_env_overrides();
+    // The feed's group, never subscribed: it reads the group's committed
+    // offsets without joining the group.
+    let consumer = BaseConsumer::from_config_and_context(
+        &config.depth_config(openssl_env),
+        SourceContext::default(),
+    )
+    .map_err(|e| {
+        KafkaFeedError::Refused(format!(
+            "creating the depth reader: {}",
+            redacted_client_error(&e)
+        ))
+    })?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let core = Arc::clone(core);
+    std::thread::Builder::new()
+        .name("spate-kafka-feed-depth".to_owned())
+        .spawn(move || {
+            let brokers = depth::Brokers { consumer };
+            depth::run(&core, &brokers, &rx);
+        })
+        .map_err(|e| {
+            KafkaFeedError::Unavailable(format!("starting the feed's depth thread: {e}"))
+        })?;
+    Ok(tx)
 }
 
 /// Log the INFO line a feed that connected writes: its section and what the
@@ -603,13 +629,51 @@ fn log_started(config: &KafkaFeedConfig, checked: &startup::Checked) {
     );
 }
 
-/// The feed's shared state, its producer, and its consumer thread's state
-/// with the consumer subscribed, before the thread starts.
-/// `attempt_partitions` is the attempt topic's partition count.
-fn parts(
+/// Run the startup checks over the topics `config` names, on the runtime
+/// `io`, under `bound`, with the rejection watch over the checking clients,
+/// which are dropped when it returns.
+fn check_topics(
+    config: &KafkaFeedConfig,
+    io: &tokio::runtime::Handle,
+    scope: startup::Scope,
+    bound: Duration,
+) -> Result<startup::Checked, KafkaFeedError> {
+    let openssl_env = crate::security::openssl_env_overrides();
+    let admin_config = config.admin_config(openssl_env);
+    let admin = AdminClient::from_config(&admin_config).map_err(|e| {
+        KafkaFeedError::Refused(format!(
+            "creating the admin client: {}",
+            redacted_client_error(&e)
+        ))
+    })?;
+    let reader = ThreadedProducer::from_config_and_context(
+        &admin_config,
+        crate::sink::SinkContext::detached(),
+    )
+    .map_err(|e| {
+        KafkaFeedError::Refused(format!(
+            "creating the metadata client: {}",
+            redacted_client_error(&e)
+        ))
+    })?;
+    let topics = Topics::new(config);
+    let step = Mutex::new("starting".to_owned());
+    let admin = Arc::new(startup::Brokers::new(admin, reader));
+    let watched = Arc::clone(&admin);
+    io.block_on(startup::bounded(
+        &step,
+        bound,
+        move || watched.rejection(),
+        startup::check(&*admin, &topics, scope, &step),
+    ))
+}
+
+/// The feed's shared state and its producer, built with the settings the
+/// feed owns. `attempt_partitions` is the attempt topic's partition count.
+fn producer_parts(
     config: &KafkaFeedConfig,
     attempt_partitions: NonZeroU32,
-) -> Result<(Arc<Core>, Producer, Driver), KafkaFeedError> {
+) -> Result<(Arc<Core>, Producer), KafkaFeedError> {
     let openssl_env = crate::security::openssl_env_overrides();
     let core = Arc::new(Core::new(config, attempt_partitions));
     let producer = Producer::from_config_and_context(
@@ -622,6 +686,18 @@ fn parts(
             redacted_client_error(&e)
         ))
     })?;
+    Ok((core, producer))
+}
+
+/// The feed's shared state, its producer, and its consumer thread's state
+/// with the consumer subscribed, before the thread starts.
+/// `attempt_partitions` is the attempt topic's partition count.
+fn parts(
+    config: &KafkaFeedConfig,
+    attempt_partitions: NonZeroU32,
+) -> Result<(Arc<Core>, Producer, Driver), KafkaFeedError> {
+    let openssl_env = crate::security::openssl_env_overrides();
+    let (core, producer) = producer_parts(config, attempt_partitions)?;
     let consumer_config = config.consumer_config(openssl_env);
     let lookup_timeout = consumer::committed_lookup_timeout(&consumer_config);
     let consumer =
@@ -819,17 +895,38 @@ impl Feed for KafkaFeed {
     }
 
     fn publish(&self, unit: Unit) -> Confirmation {
-        let (confirmer, confirmation) = confirmation();
-        if let Some(fatal) = &self.lock().fatal {
-            confirmer.reject(fatal.clone());
-            return confirmation;
-        }
-        let message = Outgoing::unit(Arc::clone(&self.core.topics.work), &unit, 0, None);
-        write::send(
-            &self.core,
-            &self.producer,
-            Box::new(Write::Publish { message, confirmer }),
-        );
-        confirmation
+        publish_unit(&self.core, &self.producer, &unit)
     }
+
+    fn read_depth(&self, of: DepthOf) -> Option<DepthReading> {
+        let (reporter, reading) = depth_reading();
+        if let Some(depth) = &self.depth {
+            // A depth thread that has ended drops the reporter, and the
+            // reading settles Retryable.
+            let _ = depth
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .send((of, reporter));
+        }
+        Some(reading)
+    }
+}
+
+/// Write `unit` to the work topic. The confirmation settles on the write's
+/// delivery report, or at once with the latched error of a feed that
+/// stopped. The state lock is released before the send, since a refused
+/// enqueue settles inline and settling takes it.
+fn publish_unit(core: &Core, producer: &Producer, unit: &Unit) -> Confirmation {
+    let (confirmer, confirmation) = confirmation();
+    if let Some(fatal) = &core.lock().fatal {
+        confirmer.reject(fatal.clone());
+        return confirmation;
+    }
+    let message = Outgoing::unit(Arc::clone(&core.topics.work), unit, 0, None);
+    write::send(
+        core,
+        producer,
+        Box::new(Write::Publish { message, confirmer }),
+    );
+    confirmation
 }

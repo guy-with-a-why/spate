@@ -1371,6 +1371,109 @@ fn a_memory_feed_passed_in_with_a_location_is_refused() {
     );
 }
 
+/// Pins that `run` refuses a `settling_window` on an in-process feed passed
+/// in through `Pipeline::feed`, which skips building the feed from the
+/// section.
+#[test]
+fn a_memory_feed_passed_in_with_a_settling_window_is_refused() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}\nsettling_window: 1m");
+    let h = start_with(
+        cfg,
+        test_options(),
+        |runtime| runtime.with_feed(Arc::new(crate::feed::memory::MemoryFeed::new())),
+        ok_chain,
+    );
+    let err = config_error_before_open(h);
+    assert!(
+        err.contains("`feed.settling_window`") && err.contains("`memory`"),
+        "{err}"
+    );
+}
+
+/// Pins that `run` refuses a settling window below the floor set on a
+/// section built in code, which skips the load-time check.
+#[test]
+fn a_zero_settling_window_passed_in_is_refused() {
+    let mut cfg = test_config(1);
+    let mut section = feed_section("sqs: {}\nlocation: s3://ops/jobs/backfill-1/").unwrap();
+    section.settling_window = Some(Duration::ZERO);
+    cfg.feed = Some(section);
+    let h = start_with_config(cfg, ok_chain);
+    let err = config_error_before_open(h);
+    assert!(err.contains("`feed.settling_window`"), "{err}");
+}
+
+/// Pins that `Source::configure_feed`'s default refuses the section, naming
+/// the source, so a source that reads no feed fails at startup.
+#[test]
+fn the_default_configure_feed_refuses_the_section() {
+    struct NoFeed(FakeSource);
+    impl Source for NoFeed {
+        type Lane = FakeLane;
+        fn open(&mut self, ctx: SourceCtx) -> Result<(), SourceError> {
+            self.0.open(ctx)
+        }
+        fn poll_events(&mut self, timeout: Duration) -> Result<SourceEvent<FakeLane>, SourceError> {
+            self.0.poll_events(timeout)
+        }
+        fn commit(&mut self, watermarks: &[(PartitionId, i64)]) -> Result<(), SourceError> {
+            self.0.commit(watermarks)
+        }
+    }
+    let (inner, _shared, _script) = FakeSource::new();
+    let mut source = NoFeed(inner);
+    let section = feed_section("memory: {}").unwrap();
+    let err = source
+        .configure_feed(
+            &section,
+            Arc::new(crate::feed::memory::MemoryFeed::new()),
+            crate::feed::FeedOrigin::Section,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("reads no feed"), "{err}");
+}
+
+/// Pins the origin `run` hands `configure_feed`: `Section` for the in-process
+/// feed it builds from the section, `Given` for a feed passed to
+/// `Pipeline::feed`.
+#[test]
+fn the_source_learns_where_its_feed_came_from() {
+    use crate::feed::FeedOrigin;
+    for (given, origin) in [(false, FeedOrigin::Section), (true, FeedOrigin::Given)] {
+        let mut cfg = test_config(1);
+        cfg.feed = feed_section("memory: {}");
+        let (source, shared, script) = FakeSource::new();
+        shared.lock().unwrap().accept_feed = true;
+        script.lock().unwrap().push_back(Script::Drained);
+        let chain_shared = Arc::new(ChainShared::default());
+        let (sink, _drained) = test_sink();
+        let log = Arc::clone(&shared);
+        let mut runtime = PipelineRuntime::new(
+            cfg,
+            source,
+            move |_thread| {
+                Box::new(ok_chain(Arc::clone(&chain_shared), Arc::clone(&log)))
+                    as Box<dyn RunnableChain>
+            },
+            sink,
+            Arc::new(crate::backpressure::InflightBudget::new()),
+        )
+        .with_options(test_options());
+        if given {
+            runtime = runtime.with_feed(Arc::new(crate::feed::memory::MemoryFeed::new()));
+        }
+        let report = runtime.run().expect("the source accepts the section");
+        assert_eq!(report.state, ExitState::Completed);
+        assert_eq!(
+            shared.lock().unwrap().feed_origin,
+            Some(origin),
+            "given: {given}"
+        );
+    }
+}
+
 /// Pins that `run` passes a `location` beside a backend other than the
 /// in-process feed on to the feed checks that follow.
 #[test]
@@ -1455,6 +1558,86 @@ fn a_refused_feed_section_builds_no_pipeline_thread() {
         0,
         "no chain may be built before the section is accepted"
     );
+}
+
+/// A second registered dispatcher. With one live dispatcher, tracing-core
+/// caches a callsite's interest from whichever thread reaches it first, and
+/// other tests reach the feed arm on threads with no subscriber.
+static BYSTANDER: std::sync::LazyLock<tracing::Dispatch> = std::sync::LazyLock::new(|| {
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing::Dispatch::new(
+        tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::OFF),
+    )
+});
+
+/// Pins that a `feed: { memory: {} }` section the source refuses fails
+/// startup with the error alone and logs no WARN.
+#[test]
+fn a_refused_feed_section_fails_startup_without_a_warning() {
+    use tracing_subscriber::layer::SubscriberExt;
+    std::sync::LazyLock::force(&BYSTANDER);
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}");
+    let (source, shared, _script) = FakeSource::new();
+    let chain_shared = Arc::new(ChainShared::default());
+    let (sink, _drained) = test_sink();
+    let log = Arc::clone(&shared);
+    let runtime = PipelineRuntime::new(
+        cfg,
+        source,
+        move |_thread| {
+            Box::new(ok_chain(Arc::clone(&chain_shared), Arc::clone(&log)))
+                as Box<dyn RunnableChain>
+        },
+        sink,
+        Arc::new(crate::backpressure::InflightBudget::new()),
+    )
+    .with_options(test_options());
+    let warnings = Warnings::default();
+    let subscriber = tracing_subscriber::registry().with(warnings.clone());
+    let result = tracing::subscriber::with_default(subscriber, || runtime.run());
+    let Err(err @ StartError::Config(_)) = result else {
+        panic!("expected StartError::Config, got {result:?}");
+    };
+    assert!(err.to_string().contains("reads no feed"), "{err}");
+    assert!(!shared.lock().unwrap().opened, "the source must not open");
+    let warnings = warnings.0.lock().unwrap().clone();
+    assert!(warnings.is_empty(), "{warnings:#?}");
+}
+
+/// Pins that a `feed: { memory: {} }` section the source accepts starts and
+/// completes the run with no WARN from the runtime.
+#[test]
+fn an_accepted_in_process_feed_section_starts_without_a_warning() {
+    use tracing_subscriber::layer::SubscriberExt;
+    std::sync::LazyLock::force(&BYSTANDER);
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}");
+    let (source, shared, script) = FakeSource::new();
+    shared.lock().unwrap().accept_feed = true;
+    script.lock().unwrap().push_back(Script::Drained);
+    let chain_shared = Arc::new(ChainShared::default());
+    let (sink, _drained) = test_sink();
+    let log = Arc::clone(&shared);
+    let runtime = PipelineRuntime::new(
+        cfg,
+        source,
+        move |_thread| {
+            Box::new(ok_chain(Arc::clone(&chain_shared), Arc::clone(&log)))
+                as Box<dyn RunnableChain>
+        },
+        sink,
+        Arc::new(crate::backpressure::InflightBudget::new()),
+    )
+    .with_options(test_options());
+    let warnings = Warnings::default();
+    let subscriber = tracing_subscriber::registry().with(warnings.clone());
+    let report = tracing::subscriber::with_default(subscriber, || runtime.run())
+        .expect("the source accepts the section");
+    assert_eq!(report.state, ExitState::Completed);
+    assert!(shared.lock().unwrap().opened, "the source opens");
+    let warnings = warnings.0.lock().unwrap().clone();
+    assert!(warnings.is_empty(), "{warnings:#?}");
 }
 
 /// `admin.listen: none` runs and drains with no admin server. With no

@@ -1,5 +1,6 @@
 //! Mapping `object_store` failures into the framework's error taxonomy.
 
+use crate::unit::Origin;
 use spate_core::error::ErrorClass;
 
 /// Classify an `object_store` error for a **data** operation (list / GET).
@@ -12,7 +13,8 @@ use spate_core::error::ErrorClass;
 ///   under the backfill (a deleted key, an overwritten object failing its
 ///   `if_match`). Retrying the same read cannot help, but the fact is about
 ///   **one object**, so it becomes split poison rather than a fleet-wide
-///   failure.
+///   failure. A failed precondition on a notification unit that names no
+///   version is an overwrite instead, which [`is_overwrite`] decides.
 /// - Authentication, permission, and configuration errors hold for every
 ///   object on every instance: non-retryable *and* pipeline-fatal. A listing
 ///   the store answers 401 or 403 is non-retryable, and the planner fails the
@@ -23,7 +25,10 @@ use spate_core::error::ErrorClass;
 pub(crate) fn classify(e: &object_store::Error) -> ErrorClass {
     use object_store::Error as E;
     match e {
-        _ if list_rejected(e) || spate_core::tls_rejection!(rustls, e).is_some() => {
+        _ if list_rejected(e)
+            || delete_rejected(e)
+            || spate_core::tls_rejection!(rustls, e).is_some() =>
+        {
             ErrorClass::Fatal
         }
         E::NotFound { .. }
@@ -88,12 +93,57 @@ fn list_rejected(e: &object_store::Error) -> bool {
             })
 }
 
+/// Whether `e` is a `DeleteObjects` entry the store refused with
+/// `AccessDenied`. The request itself answers 200, and `object_store` reports
+/// the entry as `Generic` with a private error type, so this matches its
+/// message.
+fn delete_rejected(e: &object_store::Error) -> bool {
+    let object_store::Error::Generic { source, .. } = e else {
+        return false;
+    };
+    let text = source.to_string();
+    text.starts_with("DeleteObjects request failed for key ")
+        && text.ends_with("(code: AccessDenied)")
+}
+
 /// `e`'s message, with the TLS rejection behind it appended.
 pub(crate) fn reason(e: &object_store::Error) -> String {
     match spate_core::tls_rejection!(rustls, e) {
         Some(tls) => format!("{e}: {tls}"),
         None => e.to_string(),
     }
+}
+
+/// Whether `e`, failing a read of a part from `origin`, means the key was
+/// overwritten under its ETag pin: a failed precondition, or a range the
+/// store cannot satisfy, on a notification unit that names no version.
+///
+/// RustFS answers a ranged GET that starts past the end of a smaller new
+/// object with 416 before it checks `If-Match`. The read then re-enqueues
+/// the key at its current ETag. A version-named read and a lister's unit keep
+/// [`classify`]'s and [`poison_kind`]'s classification.
+pub(crate) fn is_overwrite(e: &object_store::Error, origin: &Origin) -> bool {
+    (matches!(e, object_store::Error::Precondition { .. }) || range_not_satisfiable(e))
+        && matches!(origin, Origin::Notification { version: None, .. })
+}
+
+/// Whether `e` is a request the store answered with 416.
+///
+/// object_store reports it as `Generic` and keeps the error type that holds
+/// the status private, so this matches a link in the chain by its message.
+/// The tests against a local server fail if that text changes.
+fn range_not_satisfiable(e: &object_store::Error) -> bool {
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(error) = link {
+        if error
+            .to_string()
+            .contains("Server returned non-2xx status code: 416 ")
+        {
+            return true;
+        }
+        link = error.source();
+    }
+    false
 }
 
 /// Classify an object-level (non-pipeline-fatal, non-retryable) failure
@@ -114,6 +164,35 @@ pub(crate) fn poison_kind(e: &object_store::Error) -> crate::split_ctx::PoisonKi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins that only a `DeleteObjects` entry refused with `AccessDenied` is
+    /// fatal: another code on a delete, or `AccessDenied` on another request,
+    /// stays retryable.
+    #[test]
+    fn only_a_delete_entry_refused_with_access_denied_is_fatal() {
+        let generic = |text: &str| object_store::Error::Generic {
+            store: "S3",
+            source: text.to_owned().into(),
+        };
+        let cases = [
+            (
+                "DeleteObjects request failed for key k: Access Denied (code: AccessDenied)",
+                ErrorClass::Fatal,
+            ),
+            (
+                "DeleteObjects request failed for key k: We encountered an internal error \
+                 (code: InternalError)",
+                ErrorClass::Retryable,
+            ),
+            (
+                "Error performing put request k: Access Denied (code: AccessDenied)",
+                ErrorClass::Retryable,
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(classify(&generic(text)), want, "{text}");
+        }
+    }
 
     #[test]
     fn object_level_failures_classify_as_poison_not_pipeline_fatal() {
@@ -369,5 +448,104 @@ mod tests {
         let e = list_error(&crate::test_servers::tls_store_at(&url, &server)).await;
         assert_eq!(classify(&e), ErrorClass::Fatal, "{e:?}");
         assert!(reason(&e).contains("CertificateRequired"), "{}", reason(&e));
+    }
+
+    fn notification(version: Option<&str>) -> Origin {
+        Origin::Notification {
+            version: version.map(str::to_owned),
+            re_enqueues: 0,
+        }
+    }
+
+    fn not_found() -> object_store::Error {
+        object_store::Error::NotFound {
+            path: "k".into(),
+            source: "missing".into(),
+        }
+    }
+
+    fn denied() -> object_store::Error {
+        object_store::Error::PermissionDenied {
+            path: "k".into(),
+            source: "denied".into(),
+        }
+    }
+
+    fn precondition() -> object_store::Error {
+        object_store::Error::Precondition {
+            path: "k".into(),
+            source: "moved".into(),
+        }
+    }
+
+    /// Pins that a 404 on a notification unit's read poisons the unit, as it
+    /// does a lister's: it is no overwrite and no pipeline failure.
+    #[test]
+    fn a_404_on_a_notification_unit_poisons_it() {
+        let e = not_found();
+        assert_eq!(classify(&e), ErrorClass::Fatal);
+        assert!(!is_pipeline_fatal(&e));
+        assert!(!is_overwrite(&e, &notification(None)));
+        assert_eq!(poison_kind(&e), crate::split_ctx::PoisonKind::NotFound);
+    }
+
+    /// Pins that a 403 on a notification unit's read fails the pipeline, as
+    /// it does a lister's.
+    #[test]
+    fn a_403_on_a_notification_unit_fails_the_pipeline() {
+        let e = denied();
+        assert_eq!(classify(&e), ErrorClass::Fatal);
+        assert!(is_pipeline_fatal(&e));
+        assert!(!is_overwrite(&e, &notification(None)));
+    }
+
+    /// Pins that only a failed precondition on a notification unit naming no
+    /// version is an overwrite; a lister's unit and a version-named read keep
+    /// the poison classification, and a 404 or 403 is never one.
+    #[test]
+    fn only_a_412_on_a_notification_without_a_version_is_an_overwrite() {
+        let origins = [
+            (Origin::Lister, false),
+            (notification(None), true),
+            (notification(Some("v1")), false),
+        ];
+        for (origin, overwrite) in origins {
+            assert_eq!(
+                is_overwrite(&precondition(), &origin),
+                overwrite,
+                "{origin:?}"
+            );
+            assert!(!is_overwrite(&not_found(), &origin), "{origin:?}");
+            assert!(!is_overwrite(&denied(), &origin), "{origin:?}");
+        }
+    }
+
+    /// Pins that a GET the store answers with 416, as RustFS does for a range
+    /// past the end of a smaller new object, is an overwrite on a
+    /// notification unit naming no version, and stays a retryable read
+    /// failure for a lister's unit or a version-named read.
+    #[tokio::test]
+    async fn a_416_on_a_notification_read_is_an_overwrite() {
+        use object_store::ObjectStore as _;
+        let store = crate::test_servers::store_at(&crate::test_servers::status_server(
+            "416 Range Not Satisfiable",
+        ));
+        let e = store
+            .get_opts(&"k".into(), object_store::GetOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(e, object_store::Error::Generic { .. }), "{e:?}");
+        assert_eq!(classify(&e), ErrorClass::Retryable, "{e}");
+        assert!(is_overwrite(&e, &notification(None)), "{e}");
+        assert!(!is_overwrite(&e, &notification(Some("v1"))), "{e}");
+        assert!(!is_overwrite(&e, &Origin::Lister), "{e}");
+        let other = crate::test_servers::store_at(&crate::test_servers::status_server(
+            "500 Internal Server Error",
+        ));
+        let e = other
+            .get_opts(&"k".into(), object_store::GetOptions::default())
+            .await
+            .unwrap_err();
+        assert!(!is_overwrite(&e, &notification(None)), "{e}");
     }
 }

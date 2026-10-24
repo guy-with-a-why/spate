@@ -1,5 +1,5 @@
 ---
-description: "Object-storage failures are classified by scope, so an unreadable object poisons its split while a credential or configuration failure fails the pipeline."
+description: "Object-storage failures are classified by scope: an unreadable object poisons its split, a credential failure fails the pipeline. ADR-0077 narrows it."
 ---
 
 # ADR-0035 — Object-level failures poison the split; credential and configuration failures are fatal
@@ -7,7 +7,7 @@ description: "Object-storage failures are classified by scope, so an unreadable 
 - **Status:** accepted
 - **Date:** 2026-07-18 (recorded 2026-08-06 from the decision log)
 - **Supersedes:** —
-- **Superseded by:** —
+- **Superseded by:** [ADR-0077](0077-a-notification-units-read-classifies-a-deleted-or-overwritten-object.md), for a precondition failure on a notification unit
 
 ## Context and problem statement
 

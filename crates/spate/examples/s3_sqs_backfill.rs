@@ -7,8 +7,8 @@
 //! up is the queue. A unit is deleted from the queue only once every record
 //! in its object is written, and a unit whose worker dies returns to the
 //! queue after the visibility period, for this process or another to read.
-//! The feed path never ends on its own, so this demo stops itself once every
-//! row is written.
+//! A job with no `location` never ends on its own, so this demo stops itself
+//! once every row is written.
 //!
 //! # Run it
 //!
@@ -119,7 +119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pipeline = pipeline.feed(Arc::clone(&feed) as Arc<dyn Feed>);
     // ANCHOR_END: connect
 
-    // A lister would publish these; here `main()` does.
+    // This job names no `location`, so no lister run publishes its units;
+    // `main()` publishes them by hand.
     for o in 0..OBJECTS {
         let confirmation = feed.publish(unit_over(&data, &format!("obj-{o:02}.ndjson"))?);
         pipeline.block_on(confirmation)?;

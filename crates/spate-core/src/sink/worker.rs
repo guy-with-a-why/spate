@@ -274,6 +274,7 @@ impl<W: ShardWriter> ShardWorker<W> {
                             self.dispatch(&mut acc, reason, &mut seq, &mut ledger, &mut tasks, &semaphore, &breakers, &mut waiting);
                         }
                     }
+                    self.sample_depth();
                 }
 
                 // Below `recv_many` so chunks already queued at shutdown are
@@ -369,6 +370,16 @@ impl<W: ShardWriter> ShardWorker<W> {
             }
         }
         ledger.report
+    }
+
+    /// Publish the queue's depth after an intake pass, mirroring the senders'
+    /// sample in `ShardQueues::try_send`.
+    fn sample_depth(&self) {
+        // A closed queue is shutdown rather than flow, as for the senders.
+        if !self.rx.is_closed() {
+            self.metrics
+                .set_queue_depth(self.rx.max_capacity() - self.rx.capacity());
+        }
     }
 
     /// Which seal threshold, if any, the accumulated batch has crossed.

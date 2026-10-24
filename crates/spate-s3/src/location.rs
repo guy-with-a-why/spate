@@ -1,10 +1,13 @@
 //! The job location of a bounded feed job: an object-store prefix holding
-//! the job fingerprint, which the lister writes and every worker reads, and
-//! the name of the end marker a lister run deletes before it publishes.
+//! the job fingerprint, which the lister writes and every worker reads, the
+//! lister's checkpoint, and the end marker a lister run deletes before it
+//! publishes and writes once the feed confirmed every unit of the run.
 //!
 //! [`Location::parse`] checks the `feed:` section's `location` against the
 //! source URL. [`feed_fingerprint`] is the identity a worker and the lister
 //! compare, and [`await_fingerprint`] is a worker's startup wait for it.
+//! [`read_end`] is a worker's read of the end marker, which its end check
+//! compares at the start and the end of a settling window.
 
 use crate::config::Compression;
 use crate::error::{classify, reason};
@@ -22,14 +25,12 @@ use std::fmt;
 use std::time::Duration;
 use url::Url;
 
-/// How long a worker waits for the lister's fingerprint before it exits.
-pub(crate) const SETTLING_WINDOW: Duration = Duration::from_secs(5 * 60);
-
 /// The step between a waiting worker's reads of the fingerprint.
 pub(crate) const FINGERPRINT_POLL: Duration = Duration::from_secs(5);
 
-/// The largest object a location read accepts. Every object here is a few
-/// hundred bytes, so a larger one is not this job's.
+/// The largest object a location read accepts. Every object here is a
+/// fingerprint, one object key or an end marker, at most a few kilobytes, so
+/// a larger one is not this job's.
 pub(crate) const LOCATION_OBJECT_MAX_BYTES: u64 = 4096;
 
 /// What every feed fingerprint starts with, so a foreign object at the
@@ -142,16 +143,17 @@ impl Location {
         self.prefix.clone().join("fingerprint")
     }
 
-    /// The end marker, which a lister run deletes before its first publish.
-    #[cfg_attr(
-        not(feature = "testing"),
-        expect(
-            dead_code,
-            reason = "only the `testing`-gated `S3Source::list_once` lists for the feed"
-        )
-    )]
+    /// The end marker, which a lister run deletes before its first publish
+    /// and writes after the feed confirmed every unit of the run and the
+    /// last checkpoint. Every worker reads it to end the job.
     pub(crate) fn end(&self) -> Path {
         self.prefix.clone().join("end")
+    }
+
+    /// The lister's checkpoint: the last listed key whose units, and those of
+    /// every key listed before it, the feed has confirmed.
+    pub(crate) fn checkpoint(&self) -> Path {
+        self.prefix.clone().join("checkpoint")
     }
 
     /// The location for messages, without userinfo or query.
@@ -196,7 +198,7 @@ fn root(url: &Url) -> Option<Root> {
 }
 
 /// Whether `path`'s segments begin with every segment of `prefix`.
-fn starts_with(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn starts_with(path: &Path, prefix: &Path) -> bool {
     let mut parts = path.parts();
     prefix.parts().all(|want| parts.next() == Some(want))
 }
@@ -309,6 +311,44 @@ pub(crate) async fn read_object(
         body.extend_from_slice(&chunk);
     }
     Ok(Some(Bytes::from(body)))
+}
+
+/// Read the end marker and return the run it names, or `None` when there is
+/// none.
+///
+/// # Errors
+///
+/// Fatal for a body that is not `run=`, 32 lowercase hex digits and a
+/// newline, printing it escaped. Otherwise as [`read_object`].
+pub(crate) async fn read_end(
+    store: &dyn ObjectStore,
+    location: &Location,
+) -> Result<Option<String>, SourceError> {
+    let object = location.end();
+    let Some(body) = read_object(store, location, &object).await? else {
+        return Ok(None);
+    };
+    let run = std::str::from_utf8(&body)
+        .ok()
+        .and_then(|body| body.strip_prefix("run="))
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .filter(|run| {
+            run.len() == 32
+                && run
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    match run {
+        Some(run) => Ok(Some(run.to_owned())),
+        None => Err(location.fatal(
+            &object,
+            format_args!(
+                "it holds {:?}, which is not a lister run's end marker; another system or an \
+                 incompatible build shares this location",
+                String::from_utf8_lossy(&body)
+            ),
+        )),
+    }
 }
 
 /// The most of a store's error text a location error carries. A store can
@@ -650,8 +690,10 @@ mod tests {
         let without = accepted("s3://ops/jobs/a");
         assert_eq!(with.fingerprint(), without.fingerprint());
         assert_eq!(with.end(), without.end());
+        assert_eq!(with.checkpoint(), without.checkpoint());
         assert_eq!(with.fingerprint().as_ref(), "jobs/a/fingerprint");
         assert_eq!(with.end().as_ref(), "jobs/a/end");
+        assert_eq!(with.checkpoint().as_ref(), "jobs/a/checkpoint");
     }
 
     /// Pins that an object above the cap is refused from its size, before
@@ -893,6 +935,66 @@ mod tests {
         assert!(matches!(read, Ok(None)), "{read:?}");
     }
 
+    /// Pins that an end marker parses as the run it names, and that a
+    /// missing marker reads as `None`.
+    #[tokio::test]
+    async fn an_end_marker_parses_as_its_run_id() {
+        use object_store::ObjectStoreExt as _;
+        let store = HookStore::default();
+        let location = accepted("s3://ops/jobs/a/");
+        assert_eq!(read_end(&store, &location).await.unwrap(), None);
+        let run = "0123456789abcdef0123456789abcdef";
+        store
+            .inner
+            .put(&location.end(), format!("run={run}\n").into())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_end(&store, &location).await.unwrap().as_deref(),
+            Some(run)
+        );
+    }
+
+    /// Pins that a body that is not a lister run's end marker ends the
+    /// worker, naming the object and the location and printing the body
+    /// escaped: an upper-case or short run, a missing or extra newline, bytes
+    /// after it, an empty body, and one over the location object cap.
+    #[tokio::test]
+    async fn a_foreign_end_body_ends_the_worker() {
+        use object_store::ObjectStoreExt as _;
+        let run = "0123456789abcdef0123456789abcdef";
+        let bodies: Vec<Vec<u8>> = vec![
+            b"run=ABC\n".to_vec(),
+            format!("run={}\n", run.to_uppercase()).into_bytes(),
+            format!("run={run}").into_bytes(),
+            format!("run={run}\n\n").into_bytes(),
+            format!("run={run}\nrest").into_bytes(),
+            format!("run={run}0\n").into_bytes(),
+            format!("run={}\n", &run[1..]).into_bytes(),
+            format!("run={}g\n", &run[1..]).into_bytes(),
+            Vec::new(),
+            b"\xff\xfe".to_vec(),
+            vec![b'r'; 5000],
+        ];
+        for body in bodies {
+            let store = HookStore::default();
+            let location = accepted("s3://ops/jobs/a/");
+            store
+                .inner
+                .put(&location.end(), body.clone().into())
+                .await
+                .unwrap();
+            let err = read_end(&store, &location).await.unwrap_err();
+            assert!(!is_retryable(&err), "{body:?}: {err}");
+            let shown = err.to_string();
+            assert!(
+                shown.contains("end") && shown.contains("s3://ops/jobs/a/"),
+                "{shown}"
+            );
+            assert!(!shown.contains('\n'), "the body prints escaped: {shown}");
+        }
+    }
+
     /// Pins that an object exactly at the cap is read.
     #[tokio::test]
     async fn a_location_object_at_the_cap_is_read() {
@@ -933,7 +1035,7 @@ mod tests {
             "mine",
             clock.as_ref(),
             &StopSignal::default(),
-            SETTLING_WINDOW,
+            spate_core::feed::DEFAULT_SETTLING_WINDOW,
         )
         .now_or_never()
         .expect("a fatal error ends the wait without waiting on the clock");

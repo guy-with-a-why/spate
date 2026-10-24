@@ -19,7 +19,10 @@
 //! `testing`-gated `with_feed`, reads work units through
 //! `unit_reader::UnitReader` in place of all of the above. When the section
 //! names a `location`, `open` first waits for the lister's job fingerprint
-//! there and refuses a mismatch.
+//! there and refuses a mismatch, and the job ends on the lister's end marker
+//! once the feed reads empty over a settling window. A solo run on the
+//! in-process feed the runtime built ends once its lister has finished and
+//! the feed reads empty.
 //!
 //! No coordination backend appears in this crate's public API or in its
 //! cargo features. The store comes from the `coordination:` section through
@@ -30,15 +33,17 @@
 #![expect(deprecated, reason = "v0.4.0 removes this with spate-coordination")]
 
 use crate::config::{S3SourceConfig, s3_store_key};
+use crate::job_end::{Finish, JobEnd, no_depth};
 use crate::lane::S3Lane;
 use crate::listing::{UnaddressableConnector, UnaddressableKeys};
-use crate::location::{Location, SETTLING_WINDOW, await_fingerprint, feed_fingerprint};
+use crate::location::{Location, await_fingerprint, feed_fingerprint};
 use crate::metrics::S3Metrics;
 use crate::planner::{S3Planner, job_fingerprint};
 use crate::split::Packing;
 use crate::split_ctx::SplitCtx;
 use crate::unit::Scope;
 use crate::unit_reader::{LaneParts, UnitReader};
+use futures_util::FutureExt as _;
 use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::{ClientConfigKey, ObjectStore, ObjectStoreScheme};
 use spate_coordination::store::memory::MemoryStore;
@@ -48,18 +53,23 @@ use spate_core::config::{ComponentConfig, ConfigError, CoordinationSection, Feed
 use spate_core::coordination::driver::CoordinationDriver;
 use spate_core::coordination::{PlanFinality, SplitCoordinator};
 use spate_core::error::{ErrorClass, SourceError};
-use spate_core::feed::Feed;
+use spate_core::feed::{DepthOf, Feed, FeedOrigin};
 use spate_core::framing::{FramingContract, RecordFramer};
 use spate_core::metrics::CoordinationMetrics;
 use spate_core::record::PartitionId;
 use spate_core::source::{LaneId, Source, SourceCtx, SourceEvent};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
 /// First backoff step for fetcher-internal GET retries.
 const RETRY_BASE: Duration = Duration::from_millis(200);
+
+/// Re-enqueues of an overwritten key a notification unit carries before the
+/// unit is acknowledged without one, when the `feed:` section sets no
+/// `attempt_cap`. The SQS feed refuses that key, so it always uses this.
+pub(crate) const DEFAULT_RE_ENQUEUE_CAP: u32 = 10;
 
 /// Where the source is in its lifecycle.
 enum State {
@@ -101,13 +111,28 @@ pub struct S3Source {
     feed: Option<Arc<dyn Feed>>,
     /// The `feed:` section's `units_held`.
     units_held: Option<NonZeroUsize>,
+    /// How many times a notification unit's key is re-enqueued after an
+    /// overwrite before the unit is acknowledged without one: the `feed:`
+    /// section's `attempt_cap`, or [`DEFAULT_RE_ENQUEUE_CAP`].
+    re_enqueue_cap: u32,
     /// The `feed:` section's `location`, for a bounded job.
     location: Option<Location>,
     /// A location store injected via the `testing`-gated
     /// `with_location_store` seam.
     location_store: Option<Arc<dyn ObjectStore>>,
-    /// Times the wait for the job fingerprint.
+    /// Times the wait for the job fingerprint and the end check.
     clock: Arc<dyn Clock>,
+    /// The `feed:` section's settling window, or its default.
+    settling_window: Duration,
+    /// Whether `open` runs a lister into the feed: set by a `feed:` section
+    /// naming the in-process feed, which no other process can publish to.
+    solo_lister: bool,
+    /// Whether the solo run ends once its lister has finished: only on the
+    /// in-process feed the runtime built, since code holding a `MemoryFeed`
+    /// it passed in may publish into it after the listing.
+    solo_ends: bool,
+    /// The solo run's lister, while it runs.
+    lister_task: Option<tokio::task::JoinHandle<Result<(), SourceError>>>,
     state: State,
 }
 
@@ -140,9 +165,14 @@ impl S3Source {
             store: None,
             feed: None,
             units_held: None,
+            re_enqueue_cap: DEFAULT_RE_ENQUEUE_CAP,
             location: None,
             location_store: None,
             clock: Arc::new(SystemClock),
+            settling_window: spate_core::feed::DEFAULT_SETTLING_WINDOW,
+            solo_lister: false,
+            solo_ends: false,
+            lister_task: None,
             state: State::Created,
         }
     }
@@ -201,7 +231,12 @@ impl S3Source {
     /// still supplies the listing prefix). Lets tests wrap the store with
     /// failure- or call-counting decorators. On the feed path a source given
     /// its store reads storage notifications only under an `s3://` or
-    /// `s3a://` URL, whose host is the bucket their records must name.
+    /// `s3a://` URL, whose host is the bucket their records must name. A
+    /// lister over a store given here resumes from its checkpoint as over the
+    /// S3 client, except under a `file://` URL, where it keeps none. Under any
+    /// other URL the store must list the keys after an offset in its own
+    /// listing order, as `InMemory` and the S3 client do and
+    /// `LocalFileSystem` does not.
     ///
     /// Behind the off-by-default `testing` feature because it exposes an
     /// `object_store` type, which this crate's public API otherwise avoids
@@ -250,7 +285,8 @@ impl S3Source {
         self
     }
 
-    /// Test seam: time the wait for the job fingerprint on `clock`.
+    /// Test seam: time the wait for the job fingerprint and the end check on
+    /// `clock`.
     ///
     /// Behind the off-by-default `testing` feature, outside the semver
     /// surface.
@@ -262,25 +298,92 @@ impl S3Source {
         self
     }
 
-    /// Test seam: list the prefix once and publish one unit per object or
-    /// byte range to `feed`, blocking the calling thread on the I/O handle.
+    /// Run the lister once: list the prefix and publish one unit per object
+    /// or byte range to `feed`, then write the end marker at the job
+    /// location. This is a lister run, which `main()` starts once per job in
+    /// place of a worker. It reads the source and the `feed:` section of the
+    /// workers' own pipeline file and builds no sink.
     ///
-    /// With a `location` in `section` it first creates the job fingerprint
-    /// there, or compares the one already there, and deletes an earlier end
-    /// marker. It writes no end marker. The lister run's entry point
-    /// replaces it.
+    /// With a `location` in `section` it first compares the job fingerprint
+    /// there, or, when there is none, deletes a checkpoint it finds and
+    /// creates the fingerprint, then deletes an earlier end marker. Beside a
+    /// fingerprint it compared, it reads the lister's checkpoint and lists
+    /// only the keys after it. It rewrites the checkpoint at most once per
+    /// 1,000 listed keys and once at the end, each time after
+    /// the feed confirmed every unit published before it. Over a `file://`
+    /// store or an S3 directory bucket it keeps no checkpoint.
     ///
-    /// Behind the off-by-default `testing` feature, outside the semver
-    /// surface.
+    /// It writes the end marker, holding an id fresh to this run, only after
+    /// the feed has confirmed every unit and the last checkpoint is written.
+    /// A run that fails writes none, except when the marker's write reached
+    /// the store and its reply was lost. A unit the feed rejects as retryable
+    /// is published again, up to five attempts, after a wait from 200 ms that
+    /// doubles each attempt.
+    ///
+    /// Blocks the calling thread on the I/O handle until the run ends, so it
+    /// is called from a plain thread outside any Tokio runtime context, such
+    /// as `main`'s. A process stopped
+    /// mid-run leaves no marker unless its write was sent, and the next run
+    /// at the location resumes after the checkpoint.
     ///
     /// # Errors
     ///
-    /// Fatal for a durable feed with no `location`, a source with no framer,
-    /// another fingerprint at the location, and a store that cannot create
-    /// an object conditionally. A publish the feed refuses keeps the class
-    /// the feed gave it.
-    #[cfg(feature = "testing")]
-    #[doc(hidden)]
+    /// Fatal, before any store request, for a `location` that does not
+    /// parse, the in-process feed, a durable feed with no `location`, a
+    /// `feed` other than the one `section` names, a source given a
+    /// coordinator, and a call from a thread in a Tokio runtime context:
+    /// async code, a `spawn_blocking` closure, or a thread holding a
+    /// `Handle::enter` guard. Fatal too for a source with no framer, a source
+    /// configuration that fails validation, a store the source or its
+    /// location cannot build from its URL and `store` options, another
+    /// fingerprint at the location, a checkpoint that is not a key under the
+    /// listing prefix, and a store that cannot create an object
+    /// conditionally. A publish the feed refuses, or still rejects as
+    /// retryable after the last attempt, keeps the class the feed gave it,
+    /// and a failed listing of the prefix or a failed location read or write
+    /// the class of its store error.
+    ///
+    /// # Examples
+    ///
+    /// A binary that runs as a worker, or as the lister when its first
+    /// argument is `list`. `connect_feed` builds the durable feed the
+    /// `feed:` section names, as the feed backends' pages show.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use spate_core::config::FeedSection;
+    /// # use spate_core::feed::Feed;
+    /// # fn connect_feed(
+    /// #     _: &FeedSection,
+    /// #     _: &tokio::runtime::Handle,
+    /// # ) -> Result<Arc<dyn Feed>, Box<dyn std::error::Error>> {
+    /// #     unimplemented!()
+    /// # }
+    /// # fn framer() -> Box<dyn spate_core::framing::RecordFramer> {
+    /// #     unimplemented!()
+    /// # }
+    /// use spate_core::config::PipelineConfig;
+    /// use spate_core::pipeline::Pipeline;
+    /// use spate_s3::S3Source;
+    ///
+    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let file = std::fs::read_to_string("pipeline.yaml")?;
+    ///     let pipeline = Pipeline::from_config(PipelineConfig::from_str(&file)?)?;
+    ///     let section = pipeline.config().feed.clone().ok_or("the file names no feed")?;
+    ///     let feed = connect_feed(&section, &pipeline.io_handle())?;
+    ///     let source =
+    ///         S3Source::from_component_config(&pipeline.config().source, pipeline.io_handle())?
+    ///             .with_framer(framer);
+    ///     if std::env::args().nth(1).as_deref() == Some("list") {
+    ///         // A failed run returns its error, so the process exits 1.
+    ///         source.list_once(&section, feed)?;
+    ///         return Ok(());
+    ///     }
+    ///     // Otherwise run as a worker: hand `feed` to `pipeline.feed(...)`,
+    ///     // install the sink and run the pipeline.
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn list_once(
         mut self,
         section: &FeedSection,
@@ -290,24 +393,58 @@ impl S3Source {
             class: ErrorClass::Fatal,
             reason,
         };
+        let backend = section.backend().type_tag();
         let location = section
             .location
             .as_deref()
             .map(|location| self.parse_location(location))
             .transpose()
             .map_err(|e| fatal(e.to_string()))?;
-        if location.is_none() && section.backend().type_tag() != "memory" {
+        if location.is_some() && backend == "memory" {
+            return Err(fatal(
+                "the in-process feed keeps no job location; remove `feed.location`".into(),
+            ));
+        }
+        if backend == "memory" {
+            return Err(fatal(
+                "a lister run publishes to a durable feed; the in-process feed lives in one \
+                 process, whose own source lists for it"
+                    .into(),
+            ));
+        }
+        if location.is_none() {
             return Err(fatal(format!(
-                "a lister on the `{}` feed runs a bounded job, which keeps its fingerprint at \
-                 a job location; set `feed.location`",
-                section.backend().type_tag()
+                "a lister on the `{backend}` feed runs a bounded job, which keeps its \
+                 fingerprint at a job location; set `feed.location`"
             )));
+        }
+        if feed.backend() != backend {
+            return Err(fatal(format!(
+                "the `feed:` section names the `{backend}` feed, and the lister run was given \
+                 the `{}` feed; build the feed the section names",
+                feed.backend()
+            )));
+        }
+        if self.coordinator.is_some() {
+            return Err(fatal(
+                "the S3 source was given a coordinator with `with_coordinator`, and a lister \
+                 run publishes to a feed; drop `with_coordinator`"
+                    .into(),
+            ));
+        }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(fatal(
+                "a lister run blocks its thread until it ends, so it is called from a plain \
+                 thread such as `main`'s, outside any Tokio runtime context: no async code, \
+                 `spawn_blocking` closure or `Handle::enter` guard"
+                    .into(),
+            ));
         }
         let make_framer = self.framer.clone().ok_or_else(|| {
             fatal("S3Source has no record framer; supply one with `with_framer(...)`".into())
         })?;
         self.config.validate().map_err(|e| fatal(e.to_string()))?;
-        let (store, prefix, _, _) = self.data_store()?;
+        let (store, prefix, unaddressable, _, resume) = self.data_store()?;
         let delimiter = make_framer().resync_delimiter();
         let location = match location {
             Some(location) => Some((self.location_store(&location)?, location)),
@@ -323,12 +460,16 @@ impl S3Source {
             },
             feed,
             location,
+            resume,
+            checkpoint_every: crate::lister::CHECKPOINT_EVERY,
+            unaddressable,
             fingerprint: feed_fingerprint(
                 &self.config.url,
                 self.config.compression,
                 self.config.split_target_bytes.as_u64(),
                 delimiter,
             ),
+            retry_base: crate::lister::LISTER_RETRY_BASE,
         };
         self.handle.block_on(lister.run())
     }
@@ -337,8 +478,8 @@ impl S3Source {
 impl S3Source {
     /// The store the source reads: the injected one, or one built from
     /// `config.url`. Returns it with the listing prefix, the unaddressable
-    /// keys its client takes out of listings, and the bucket a
-    /// notification's records must name.
+    /// keys its client takes out of listings, the bucket a notification's
+    /// records must name, and whether a lister can resume over it.
     fn data_store(&mut self) -> Result<DataStore, SourceError> {
         let url = parse(&self.config.url)?;
         Ok(match self.store.take() {
@@ -353,7 +494,10 @@ impl S3Source {
                 let bucket = matches!(url.scheme(), "s3" | "s3a")
                     .then(|| url.host_str().map(str::to_owned))
                     .flatten();
-                (store, path, None, bucket)
+                // A `file://` URL stands for `LocalFileSystem`, whose offset
+                // listing walks unsorted.
+                let resumable = url.scheme() != "file";
+                (store, path, None, bucket, resumable)
             }
             None => {
                 let built =
@@ -366,6 +510,7 @@ impl S3Source {
                     built.prefix,
                     built.unaddressable,
                     built.bucket,
+                    built.resumable,
                 )
             }
         })
@@ -398,15 +543,7 @@ impl S3Source {
             )));
         }
         let options = apply_options(AmazonS3Builder::from_env(), &self.config.store);
-        // `object_store` reads the flag with these spellings, in any case.
-        let virtual_hosted = options
-            .get_config_value(&AmazonS3ConfigKey::VirtualHostedStyleRequest)
-            .is_some_and(|v| {
-                matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "on" | "yes" | "y"
-                )
-            });
+        let virtual_hosted = flag_set(&options, AmazonS3ConfigKey::VirtualHostedStyleRequest);
         let endpoint = [AmazonS3ConfigKey::Endpoint, AmazonS3ConfigKey::S3Endpoint]
             .iter()
             .any(|key| options.get_config_value(key).is_some());
@@ -494,6 +631,7 @@ impl Source for S3Source {
         &mut self,
         section: &FeedSection,
         feed: Arc<dyn Feed>,
+        origin: FeedOrigin,
     ) -> Result<(), ConfigError> {
         if self.feed.is_some() {
             return Err(ConfigError::Component {
@@ -516,8 +654,24 @@ impl Source for S3Source {
             .as_deref()
             .map(|location| self.parse_location(location))
             .transpose()?;
+        let memory = section.backend().type_tag() == "memory";
+        if section.settling_window.is_some() && self.location.is_none() && !memory {
+            return Err(ConfigError::Component {
+                context: "feed".into(),
+                message: "`settling_window` times the end of a bounded job, and a job on a \
+                          durable feed is bounded only with a `location`; set `location`, or \
+                          remove `settling_window`"
+                    .into(),
+            });
+        }
         self.feed = Some(feed);
         self.units_held = section.units_held;
+        self.re_enqueue_cap = section
+            .attempt_cap
+            .map_or(DEFAULT_RE_ENQUEUE_CAP, NonZeroU32::get);
+        self.settling_window = section.settling_window_or_default();
+        self.solo_lister = memory;
+        self.solo_ends = memory && origin == FeedOrigin::Section;
         Ok(())
     }
 
@@ -542,7 +696,7 @@ impl Source for S3Source {
             reason: e.to_string(),
         })?;
 
-        let (store, prefix, unaddressable, bucket) = self.data_store()?;
+        let (store, prefix, unaddressable, bucket, resume) = self.data_store()?;
 
         let metrics = ctx.meter.as_ref().map(S3Metrics::new);
         if let Some(feed) = self.feed.take() {
@@ -562,6 +716,17 @@ impl Source for S3Source {
                      failed back to the feed"
                 );
             }
+            // Each depth is asked once here, before the fingerprint wait, so a
+            // feed that cannot count fails the job at its start, never at its
+            // end.
+            if (self.location.is_some() || self.solo_ends)
+                && [DepthOf::Feed, DepthOf::DeadLetters]
+                    .into_iter()
+                    .any(|of| feed.read_depth(of).is_none())
+            {
+                return Err(no_depth(feed.as_ref()));
+            }
+            let mut finish = None;
             if let Some(location) = &self.location {
                 let location_store = self.location_store(location)?;
                 let mine = feed_fingerprint(
@@ -572,7 +737,7 @@ impl Source for S3Source {
                 );
                 tracing::info!(
                     location = %location.shown(),
-                    window = ?SETTLING_WINDOW,
+                    window = ?self.settling_window,
                     "waiting for the job fingerprint at the job location"
                 );
                 self.handle.block_on(await_fingerprint(
@@ -581,9 +746,25 @@ impl Source for S3Source {
                     &mine,
                     self.clock.as_ref(),
                     &ctx.stop,
-                    SETTLING_WINDOW,
+                    self.settling_window,
                 ))?;
+                finish = Some(Finish::Marker {
+                    store: location_store,
+                    location: location.clone(),
+                    window: self.settling_window,
+                });
+            } else if self.solo_ends {
+                finish = Some(Finish::Solo { finished: false });
             }
+            let end = finish.map(|finish| {
+                JobEnd::new(
+                    finish,
+                    Arc::clone(&self.clock),
+                    self.handle.clone(),
+                    ctx.stop.clone(),
+                )
+            });
+            let lister_store = Arc::clone(&store);
             let parts = LaneParts {
                 store,
                 handle: self.handle.clone(),
@@ -598,12 +779,38 @@ impl Source for S3Source {
                 range_bytes: self.config.prefetch_bytes.as_u64() as usize,
                 retry_base: RETRY_BASE,
                 metrics,
+                re_enqueue_cap: self.re_enqueue_cap,
             };
-            tracing::warn!(
-                feed = feed.backend(),
-                "the S3 source publishes no units of its own and reads only the units and \
-                 storage notifications published to the feed"
-            );
+            if self.solo_lister {
+                tracing::warn!(
+                    "this run lists the prefix into the in-process feed, which keeps nothing \
+                     across a restart, so a restart lists and reads the prefix from the \
+                     beginning; a run that must resume reads a durable feed with a `location`, \
+                     filled by a separate lister run"
+                );
+                let lister = crate::lister::Lister {
+                    store: lister_store,
+                    prefix: prefix.clone(),
+                    packing: parts.packing,
+                    feed: Arc::clone(&feed),
+                    location: None,
+                    resume,
+                    checkpoint_every: crate::lister::CHECKPOINT_EVERY,
+                    unaddressable,
+                    fingerprint: String::new(),
+                    retry_base: crate::lister::LISTER_RETRY_BASE,
+                };
+                // On the I/O runtime, so the source thread reads units while
+                // the listing runs; `poll_events` checks its outcome.
+                self.lister_task = Some(self.handle.spawn(lister.run()));
+            } else {
+                tracing::warn!(
+                    feed = feed.backend(),
+                    "the S3 source lists nothing on this feed: it reads the units and storage \
+                     notifications published to it, and publishes only a notification unit it \
+                     re-enqueues after an overwrite"
+                );
+            }
             let scope = Scope {
                 bucket,
                 prefix: prefix.clone(),
@@ -613,6 +820,7 @@ impl Source for S3Source {
                 parts,
                 scope,
                 self.units_held,
+                end,
             )));
             return Ok(());
         }
@@ -690,6 +898,30 @@ impl Source for S3Source {
     }
 
     fn poll_events(&mut self, timeout: Duration) -> Result<SourceEvent<S3Lane>, SourceError> {
+        // Never waits: a lister still running yields `None`.
+        if let Some(task) = &mut self.lister_task
+            && let Some(outcome) = task.now_or_never()
+        {
+            self.lister_task = None;
+            // Fatal whatever the class: the solo lister runs once, so a run
+            // whose listing failed would never read the rest of the prefix.
+            let reason = match outcome {
+                Ok(Ok(())) => {
+                    if let State::Feed(reader) = &mut self.state {
+                        reader.lister_finished();
+                    }
+                    None
+                }
+                Ok(Err(e)) => Some(format!("the solo run's lister failed: {e}")),
+                Err(e) => Some(format!("the solo run's lister ended: {e}")),
+            };
+            if let Some(reason) = reason {
+                return Err(SourceError::Client {
+                    class: ErrorClass::Fatal,
+                    reason,
+                });
+            }
+        }
         let open = match &mut self.state {
             State::Open(open) => open,
             State::Feed(reader) => return reader.poll_events(timeout),
@@ -779,6 +1011,11 @@ impl Source for S3Source {
 
 impl Drop for S3Source {
     fn drop(&mut self) {
+        if let Some(task) = &self.lister_task {
+            // Its units live in this process's feed, so nothing durable is
+            // lost.
+            task.abort();
+        }
         if let State::Open(open) = &mut self.state {
             // Graceful departure: peers take over this worker's splits and
             // roles without waiting out a lease. Fetchers are detached and
@@ -856,6 +1093,9 @@ fn build_store(
             prefix,
             unaddressable: None,
             bucket: None,
+            // `LocalFileSystem` walks a directory unsorted and skips the keys
+            // at or before an offset, so a resume there loses keys.
+            resumable: false,
         });
     }
     // Harden the HTTP client (idle-connection recycling, explicit timeouts)
@@ -863,7 +1103,12 @@ fn build_store(
     // still wins; see `harden_client_defaults`.
     let builder = harden_client_defaults(AmazonS3Builder::from_env().with_url(url.as_str()));
     let unaddressable = UnaddressableKeys::default();
-    let store = apply_options(builder, options)
+    let builder = apply_options(builder, options);
+    // `object_store` sends no `start-after` to an S3 directory bucket. It
+    // lists the whole prefix and skips the keys at or before the offset,
+    // and a directory bucket does not list in key order.
+    let resumable = !flag_set(&builder, AmazonS3ConfigKey::S3Express);
+    let store = builder
         .with_http_connector(UnaddressableConnector::new(unaddressable.clone()))
         .build()?;
     Ok(BuiltStore {
@@ -871,6 +1116,18 @@ fn build_store(
         store: Box::new(store),
         prefix: path,
         unaddressable: Some(unaddressable),
+        resumable,
+    })
+}
+
+/// Whether `builder` holds `key` set to true, in any of the spellings
+/// `object_store` reads as true.
+fn flag_set(builder: &AmazonS3Builder, key: AmazonS3ConfigKey) -> bool {
+    builder.get_config_value(&key).is_some_and(|v| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "y"
+        )
     })
 }
 
@@ -889,13 +1146,14 @@ pub(crate) fn scope_bucket(store: &AmazonS3) -> Option<String> {
 }
 
 /// The store the source reads, its listing prefix, the unaddressable keys
-/// its client takes out of listings, and the bucket a notification's records
-/// must name.
+/// its client takes out of listings, the bucket a notification's records
+/// must name, and whether a lister can resume over the store.
 type DataStore = (
     Arc<dyn ObjectStore>,
     object_store::path::Path,
     Option<UnaddressableKeys>,
     Option<String>,
+    bool,
 );
 
 /// What [`build_store`] returns.
@@ -909,6 +1167,9 @@ struct BuiltStore {
     /// The bucket a notification's records must name; `None` for any other
     /// scheme.
     bucket: Option<String>,
+    /// Whether `object_store` lists after an offset with `start-after`,
+    /// which a lister needs to resume from its checkpoint.
+    resumable: bool,
 }
 
 /// Conservative HTTP-client defaults for the S3 backend, applied *before* the
@@ -1014,6 +1275,40 @@ mod tests {
         );
     }
 
+    /// Pins that the `feed:` section's `attempt_cap` caps re-enqueues, and
+    /// that a section without one, or a feed given through `with_feed`,
+    /// caps them at [`DEFAULT_RE_ENQUEUE_CAP`].
+    #[test]
+    fn the_feed_sections_attempt_cap_caps_re_enqueues() {
+        use spate_core::config::FeedSection;
+        use spate_core::feed::{FeedOrigin, memory::MemoryFeed};
+        use spate_core::source::Source as _;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let source = || {
+            S3Source::from_component_config(
+                &spate_test::component_config("s3", "url: \"s3://b/data/\"\n"),
+                rt.handle().clone(),
+            )
+            .unwrap()
+        };
+        let configured = |cap: Option<u32>| {
+            let mut section = FeedSection::new(spate_test::component_config("memory", "{}"));
+            section.attempt_cap = cap.and_then(NonZeroU32::new);
+            let mut source = source();
+            source
+                .configure_feed(&section, Arc::new(MemoryFeed::new()), FeedOrigin::Section)
+                .unwrap();
+            source.re_enqueue_cap
+        };
+        assert_eq!(configured(Some(2)), 2);
+        assert_eq!(configured(None), DEFAULT_RE_ENQUEUE_CAP);
+        let given = source().with_feed(Arc::new(MemoryFeed::new()));
+        assert_eq!(given.re_enqueue_cap, DEFAULT_RE_ENQUEUE_CAP);
+        assert_eq!(DEFAULT_RE_ENQUEUE_CAP, 10);
+    }
+
     /// Every key `validate` accepts reaches the builder, in any case.
     #[test]
     fn apply_options_applies_upper_case_keys() {
@@ -1065,6 +1360,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = Url::from_directory_path(dir.path()).unwrap();
         assert_eq!(build_store(&file, &BTreeMap::new()).unwrap().bucket, None);
+    }
+
+    /// Pins which built stores a lister resumes over: the S3 client of a
+    /// general-purpose bucket, and neither one with `aws_s3_express` set nor
+    /// a `file://` store. Building sends nothing.
+    #[test]
+    fn only_an_s3_client_without_s3_express_resumes() {
+        let built = build_store(&Url::parse("s3://b/data/").unwrap(), &BTreeMap::new()).unwrap();
+        assert!(built.resumable);
+        let express = BTreeMap::from([("aws_s3_express".to_owned(), "true".to_owned())]);
+        let built = build_store(
+            &Url::parse("s3://b--usw2-az1--x-s3/data/").unwrap(),
+            &express,
+        )
+        .unwrap();
+        assert!(!built.resumable);
+        let dir = tempfile::tempdir().unwrap();
+        let file = Url::from_directory_path(dir.path()).unwrap();
+        assert!(!build_store(&file, &BTreeMap::new()).unwrap().resumable);
     }
 
     #[test]

@@ -171,7 +171,9 @@ metric_names! {
 
         // Queues.
 
-        /// Items currently queued, by [`L_QUEUE`].
+        /// Chunks currently queued, by [`L_QUEUE`]. Sampled by the senders after
+        /// each send and by the shard worker after each intake pass; a closed
+        /// queue keeps its last reading.
         QUEUE_DEPTH = "spate_queue_depth",
         /// Configured queue bound, by [`L_QUEUE`].
         QUEUE_CAPACITY = "spate_queue_capacity",

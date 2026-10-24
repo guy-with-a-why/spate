@@ -22,7 +22,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use serde_json::{Map, Value, json};
-use spate_s3::fuzz_seams::{addressable, decode_unit};
+use spate_s3::fuzz_seams::{DecodedUnit, addressable, decode_unit};
 use std::fmt::Write as _;
 
 const BUCKET: &str = "bucket";
@@ -116,7 +116,7 @@ enum Outcome {
 
 fuzz_target!(|input: Input| {
     let prefix = PREFIXES[usize::from(input.prefix) % PREFIXES.len()];
-    let _ = decode_unit(&input.bytes, Some(BUCKET), prefix);
+    let _ = decode_unit(&input.bytes, BUCKET, prefix);
 
     let mut values = Vec::with_capacity(input.records.len());
     let mut outcomes = Vec::with_capacity(input.records.len());
@@ -131,16 +131,21 @@ fuzz_target!(|input: Input| {
         message["Key"] = json!("bucket/key");
     }
     let body = serde_json::to_vec(&message).expect("a JSON value serialises");
-    let decoded = decode_unit(&body, Some(BUCKET), prefix);
+    let decoded = decode_unit(&body, BUCKET, prefix);
 
     if outcomes.iter().any(|o| matches!(o, Outcome::Fail)) {
-        assert!(
-            decoded.is_err(),
-            "a message with a failing record read {decoded:?}; expected {outcomes:?}"
+        assert_eq!(
+            decoded,
+            DecodedUnit::Fail,
+            "a message with a failing record must fail; expected {outcomes:?}"
         );
         return;
     }
-    let parts = decoded.unwrap_or_else(|e| panic!("failed ({e}); expected {outcomes:?}"));
+    let parts: Vec<(String, Option<String>)> = match decoded {
+        DecodedUnit::Read(parts) => parts.into_iter().map(|p| (p.key, p.etag)).collect(),
+        DecodedUnit::Acknowledge => Vec::new(),
+        DecodedUnit::Fail => panic!("failed; expected {outcomes:?}"),
+    };
     for (key, etag) in &parts {
         assert!(
             prefix.is_empty() || key.starts_with(&format!("{prefix}/")),

@@ -651,6 +651,7 @@ impl Pipeline {
                     replicas,
                     e2e_basis,
                 )
+                .map(|m| m.with_queue(queues.metrics(), shard))
                 .map_err(|e| BuildError::DuplicateSeries(e.to_string()))
             })
             .collect::<Result<_, _>>()?;
@@ -709,11 +710,14 @@ impl Pipeline {
     ///
     /// The feed's [`backend`](Feed::backend) must equal the key the section
     /// names, and the config must have a `feed:` section; `run` fails at
-    /// startup otherwise. The section's backend keys and its `attempt_cap`
-    /// apply only when a feed is built from the section, so a feed passed
-    /// here keeps the settings it was built with. Without this call, `run`
-    /// builds the in-process feed itself for `feed: { memory: {} }`, which
-    /// nothing can publish to, and refuses any other backend. To publish to
+    /// startup otherwise. The section's backend keys, and `attempt_cap` as
+    /// the feed's delivery cap, apply only when a feed is built from the
+    /// section, so a feed passed here keeps the settings it was built with.
+    /// The source still reads `units_held`, `location`, `settling_window`
+    /// and, as the cap of a source that re-enqueues units, `attempt_cap`
+    /// from the section. Without this call, `run`
+    /// builds the in-process feed itself for `feed: { memory: {} }` and
+    /// refuses any other backend. To publish to
     /// the in-process feed, keep a handle to a `MemoryFeed` and pass it here.
     #[must_use]
     pub fn feed(mut self, feed: Arc<dyn Feed>) -> Self {

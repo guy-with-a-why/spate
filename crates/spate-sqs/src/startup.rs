@@ -6,7 +6,9 @@
 //! longer than the queue does. SQS counts a message's retention from its
 //! first send and keeps that count when the message moves to the dead-letter
 //! queue, so a dead-letter queue that does not outlive the source can delete
-//! a unit as soon as it arrives. The checks run once, at connect.
+//! a unit as soon as it arrives. Both queues must report their message
+//! counts, which a bounded job's end check reads. The checks run once, at
+//! connect.
 
 use crate::error::{CallError, Class, SqsError};
 use crate::queue::BoxFuture;
@@ -23,13 +25,63 @@ const SOURCE_ATTRIBUTES: &[&str] = &[
     "MessageRetentionPeriod",
     "VisibilityTimeout",
     "RedrivePolicy",
+    "ApproximateNumberOfMessages",
+    "ApproximateNumberOfMessagesDelayed",
+    "ApproximateNumberOfMessagesNotVisible",
 ];
 
 /// The attributes read from its dead-letter queue.
-const DEAD_LETTER_ATTRIBUTES: &[&str] = &["MessageRetentionPeriod"];
+const DEAD_LETTER_ATTRIBUTES: &[&str] = &[
+    "MessageRetentionPeriod",
+    "ApproximateNumberOfMessages",
+    "ApproximateNumberOfMessagesDelayed",
+    "ApproximateNumberOfMessagesNotVisible",
+];
+
+/// The attributes a depth read asks for: the messages ready, delayed and
+/// received but not yet deleted, each an estimate that can lag the queue.
+pub(crate) const COUNT_ATTRIBUTES: &[&str] = &[
+    "ApproximateNumberOfMessages",
+    "ApproximateNumberOfMessagesDelayed",
+    "ApproximateNumberOfMessagesNotVisible",
+];
+
+/// A queue's message counts, as [`counts`] reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Counts {
+    pub(crate) visible: u64,
+    pub(crate) delayed: u64,
+    pub(crate) not_visible: u64,
+}
+
+/// The longest count value an error quotes.
+const SHOWN_VALUE_CHARS: usize = 32;
+
+/// Read the three counts from a queue's attributes.
+///
+/// # Errors
+///
+/// A message naming the first count that is absent or is not a `u64`, with
+/// the value cut to 32 characters.
+pub(crate) fn counts(attributes: &HashMap<String, String>) -> Result<Counts, String> {
+    let read = |name: &str| -> Result<u64, String> {
+        let value = attributes
+            .get(name)
+            .ok_or_else(|| format!("the queue reported no `{name}`"))?;
+        value.parse().map_err(|_| {
+            let shown: String = value.chars().take(SHOWN_VALUE_CHARS).collect();
+            format!("the queue reported `{name}` as {shown:?}, which is not a count")
+        })
+    };
+    Ok(Counts {
+        visible: read("ApproximateNumberOfMessages")?,
+        delayed: read("ApproximateNumberOfMessagesDelayed")?,
+        not_visible: read("ApproximateNumberOfMessagesNotVisible")?,
+    })
+}
 
 /// Reads a queue's attributes by URL.
-pub(crate) trait QueueAttributes: Send + Sync {
+pub(crate) trait QueueAttributes: Send + Sync + std::fmt::Debug {
     /// The attributes `names` of the queue at `queue_url`, keyed by name. An
     /// attribute the queue does not report is absent.
     fn attributes<'a>(
@@ -49,7 +101,14 @@ pub(crate) struct Checked {
     pub(crate) visibility_timeout: Option<String>,
     pub(crate) max_receive_count: u32,
     pub(crate) dead_letter_arn: String,
+    /// The dead-letter queue's URL, which a depth read of the dead letters
+    /// reads.
+    pub(crate) dead_letter_url: String,
     pub(crate) dead_letter_retention: Option<u64>,
+    /// The queue's message counts at connect.
+    pub(crate) counts: Counts,
+    /// The dead-letter queue's message counts at connect.
+    pub(crate) dead_letter_counts: Counts,
 }
 
 /// The queue's `RedrivePolicy` attribute.
@@ -75,7 +134,8 @@ enum Count {
 ///
 /// [`SqsError::Refused`] for a FIFO queue, a missing or unreadable redrive
 /// policy, a dead-letter ARN that is not an SQS queue's, an unreadable
-/// dead-letter queue, or one that keeps messages no longer than the queue;
+/// dead-letter queue, one that keeps messages no longer than the queue, or a
+/// queue of the two that does not report its message counts;
 /// [`SqsError::Config`] for a `queue_url` that is not a URL;
 /// [`SqsError::Unavailable`] when a read keeps failing transiently.
 pub(crate) async fn check(
@@ -152,6 +212,10 @@ pub(crate) async fn check(
             )),
         })?;
 
+    let source_counts =
+        counts(&source).map_err(|e| SqsError::Refused(format!("{e}: queue {arn}")))?;
+    let dead_letter_counts = counts(&dead)
+        .map_err(|e| SqsError::Refused(format!("{e}: dead-letter queue {dead_letter_arn}")))?;
     let retention = seconds(&source);
     let dead_letter_retention = seconds(&dead);
     let unreported = match (retention, dead_letter_retention) {
@@ -182,7 +246,10 @@ pub(crate) async fn check(
         visibility_timeout: source.get("VisibilityTimeout").cloned(),
         max_receive_count,
         dead_letter_arn,
+        dead_letter_url: dead_letter.to_string(),
         dead_letter_retention,
+        counts: source_counts,
+        dead_letter_counts,
     })
 }
 
@@ -232,6 +299,59 @@ mod tests {
     const DEAD_URL: &str = "http://127.0.0.1:9324/000000000000/jobs-dlq";
     const DEAD_ARN: &str = "arn:aws:sqs:elasticmq:000000000000:jobs-dlq";
 
+    /// A store that knows no `ApproximateNumberOfMessagesDelayed`, which SQS
+    /// answers with `InvalidAttributeName`, a 400.
+    #[derive(Debug)]
+    struct NoDelayedCount;
+
+    impl QueueAttributes for NoDelayedCount {
+        fn attributes<'a>(
+            &'a self,
+            _queue_url: &'a str,
+            names: &'static [&'static str],
+        ) -> BoxFuture<'a, Result<HashMap<String, String>, CallError>> {
+            use aws_sdk_sqs::config::http::HttpResponse;
+            use aws_sdk_sqs::error::{ErrorMetadata, SdkError};
+            use aws_sdk_sqs::operation::get_queue_attributes::GetQueueAttributesError;
+            let answer = if names.contains(&"ApproximateNumberOfMessagesDelayed") {
+                let meta = ErrorMetadata::builder()
+                    .code("InvalidAttributeName")
+                    .message("Unknown Attribute ApproximateNumberOfMessagesDelayed.")
+                    .build();
+                let raw = HttpResponse::new(400.try_into().unwrap(), "".into());
+                let e = SdkError::service_error(GetQueueAttributesError::generic(meta), raw);
+                Err(crate::error::classify("GetQueueAttributes", &e))
+            } else {
+                let policy =
+                    format!(r#"{{"deadLetterTargetArn":"{DEAD_ARN}","maxReceiveCount":5}}"#);
+                Ok([
+                    (
+                        "QueueArn",
+                        "arn:aws:sqs:elasticmq:000000000000:jobs".to_owned(),
+                    ),
+                    ("RedrivePolicy", policy),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect())
+            };
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// Pins that a store that does not know one of the three counts is
+    /// refused at connect, where a retryable class would read as a store
+    /// that may answer later.
+    #[test]
+    fn a_store_without_a_count_is_refused() {
+        let step = Mutex::new("starting");
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(check(&NoDelayedCount, SOURCE, &step));
+        assert!(matches!(result, Err(SqsError::Refused(_))), "{result:?}");
+    }
+
     /// The attribute names `GetQueueAttributes` accepts on a standard queue.
     const STANDARD_NAMES: &[&str] = &[
         "All",
@@ -280,19 +400,42 @@ mod tests {
     /// Attributes per queue URL, or the error reading that queue fails with.
     /// Like SQS, it fails a read that names an attribute the queue does not
     /// have, and a queue is FIFO when its `QueueArn` ends in `.fifo`.
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     struct Scripted {
         queues: HashMap<String, Result<HashMap<String, String>, CallError>>,
         read: Mutex<Vec<String>>,
     }
 
     impl Scripted {
+        /// A queue with `attributes`, and each message count `attributes`
+        /// leaves out reported as `0`.
         fn queue(mut self, url: &str, attributes: &[(&str, &str)]) -> Scripted {
-            let attributes = attributes
+            let mut attributes: HashMap<String, String> = attributes
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect();
+            for name in COUNT_ATTRIBUTES {
+                attributes
+                    .entry((*name).to_owned())
+                    .or_insert_with(|| "0".to_owned());
+            }
             self.queues.insert(url.to_owned(), Ok(attributes));
+            self
+        }
+
+        /// The queue at `url` with the attribute `name` left out.
+        fn without(mut self, url: &str, name: &str) -> Scripted {
+            if let Some(Ok(attributes)) = self.queues.get_mut(url) {
+                attributes.remove(name);
+            }
+            self
+        }
+
+        /// The queue at `url` reporting `name` as `value`.
+        fn with(mut self, url: &str, name: &str, value: &str) -> Scripted {
+            if let Some(Ok(attributes)) = self.queues.get_mut(url) {
+                attributes.insert(name.to_owned(), value.to_owned());
+            }
             self
         }
 
@@ -531,6 +674,73 @@ mod tests {
                 .queue(DEAD_URL, &[]);
             assert_eq!(run(&queue).unwrap().max_receive_count, 5, "{count}");
         }
+    }
+
+    /// Pins that connect refuses a queue, or a dead-letter queue, that does
+    /// not report each of its three message counts as a number, naming the
+    /// count and the queue, and keeps the dead-letter URL it reads.
+    #[test]
+    fn connect_refuses_a_queue_that_does_not_report_its_counts() {
+        for name in COUNT_ATTRIBUTES {
+            for (url, which) in [(SOURCE, ": queue arn"), (DEAD_URL, ": dead-letter queue")] {
+                let queue = Scripted::pair(None, None).without(url, name);
+                let message = refusal(run(&queue));
+                assert!(
+                    message.contains(name) && message.contains(which),
+                    "{name} on {which}: {message}"
+                );
+                let queue = Scripted::pair(None, None).with(url, name, "-1");
+                let message = refusal(run(&queue));
+                assert!(message.contains("not a count"), "{name}: {message}");
+            }
+        }
+        let checked = run(&Scripted::pair(None, None)).unwrap();
+        assert_eq!(checked.dead_letter_url, DEAD_URL);
+    }
+
+    /// Pins how [`counts`] reads each count: a `u64` passes, and an absent
+    /// one, a negative, a float, one past `u64::MAX` and a long value fail,
+    /// the last quoted at most 32 characters long.
+    #[test]
+    fn a_count_that_is_not_a_u64_fails_the_read() {
+        let attributes = |visible: &str| -> HashMap<String, String> {
+            [
+                ("ApproximateNumberOfMessages", visible),
+                ("ApproximateNumberOfMessagesDelayed", "2"),
+                ("ApproximateNumberOfMessagesNotVisible", "3"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+        };
+        assert_eq!(
+            counts(&attributes("1")).unwrap(),
+            Counts {
+                visible: 1,
+                delayed: 2,
+                not_visible: 3
+            }
+        );
+        for bad in ["-1", "1e3", "18446744073709551616", ""] {
+            let e = counts(&attributes(bad)).unwrap_err();
+            assert!(
+                e.contains("ApproximateNumberOfMessages") && e.contains("not a count"),
+                "{bad}: {e}"
+            );
+        }
+        let long = "9".repeat(100);
+        let e = counts(&attributes(&long)).unwrap_err();
+        assert!(
+            e.contains(&"9".repeat(32)) && !e.contains(&"9".repeat(33)),
+            "{e}"
+        );
+        let mut missing = attributes("1");
+        missing.remove("ApproximateNumberOfMessagesDelayed");
+        let e = counts(&missing).unwrap_err();
+        assert!(
+            e.contains("reported no `ApproximateNumberOfMessagesDelayed`"),
+            "{e}"
+        );
     }
 
     /// Pins how a failed read of each queue maps: Fatal is a refusal, and a

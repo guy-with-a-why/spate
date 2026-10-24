@@ -10,15 +10,16 @@ mod support;
 
 use rdkafka::mocking::{MockCluster, MockCoordinator};
 use rdkafka::types::RDKafkaRespErr;
-use spate_core::feed::{Feed, FeedErrorKind, Receipt, Unit};
+use spate_core::feed::{Depth, DepthOf, Feed, FeedError, FeedErrorKind, Receipt, Unit};
 use spate_core::pipeline::ExitState;
 use spate_kafka::feed::KafkaFeedError;
 use spate_test::{WriteOutcome, wait_until};
 use std::time::{Duration, Instant};
 use support::feed::{
-    ATTEMPT, ATTEMPT_PARTITIONS, COMMIT_PERIOD, DEAD, DEADLINE, ON_MOCK, RETRY, WORK, committed,
-    data_dir, direct, exists, feed_yaml, high_watermark, launch, produce_raw, publish,
-    read_attempts, read_topic, recs, sorted, stage, written,
+    ATTEMPT, ATTEMPT_PARTITIONS, COMMIT_PERIOD, DEAD, DEADLINE, ON_MOCK, RETRY, WORK,
+    bounded_section, committed, data_dir, direct, exists, feed_yaml, high_watermark,
+    high_watermarks, launch, launch_bounded, list_once, produce_raw, publish, publish_to,
+    publisher_on_mock, read_attempts, read_topic, recs, run_to_exit, sorted, stage, written,
 };
 use support::{corrupt_batch, produce_batch};
 
@@ -768,4 +769,251 @@ fn an_overlong_topic_name_is_refused() {
         ),
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// Pins the publisher end to end: a publish is confirmed and writes the
+/// unit to the work topic, key the unit's id, value its body and no header,
+/// and writes nothing to the retry or dead-letter topics.
+#[test]
+fn a_publisher_writes_the_unit_to_the_work_topic() {
+    let cluster = cluster(1);
+    let brokers = cluster.bootstrap_servers();
+    let (publisher, _io) = publisher_on_mock(&feed_yaml(
+        &brokers,
+        &spate_test::unique_name("publisher"),
+        "",
+        "",
+    ));
+    let publisher = publisher.unwrap();
+    let unit = Unit::new("u", b"body".to_vec());
+    publish_to(&publisher, unit.clone());
+    let read = read_topic(&brokers, WORK, 1);
+    assert_eq!(read[0].key.as_deref(), Some(unit.id.as_bytes()));
+    assert_eq!(read[0].payload.as_deref(), Some(&unit.body[..]));
+    assert!(read[0].headers.is_empty(), "{:?}", read[0].headers);
+    assert_eq!(high_watermark(&brokers, RETRY), 0);
+    assert_eq!(high_watermark(&brokers, DEAD), 0);
+}
+
+/// Pins that a publish-only handle on the workers' group charges no unit an
+/// attempt: a worker on that group reads each published unit on its first
+/// delivery, and the attempt topic holds one count and one tombstone per
+/// unit, the worker's.
+#[test]
+fn a_publish_only_handle_charges_no_attempt() {
+    let cluster = cluster(1);
+    let brokers = cluster.bootstrap_servers();
+    let group = spate_test::unique_name("publish-only");
+    let yaml = feed_yaml(&brokers, &group, "", "");
+    let (publisher, _io) = publisher_on_mock(&yaml);
+    let publisher = publisher.unwrap();
+    for i in 0..3 {
+        publish_to(&publisher, Unit::new(format!("u{i}"), b"body".to_vec()));
+    }
+    let worker = direct(&yaml);
+    for _ in 0..3 {
+        let delivery = worker.take("a published unit");
+        assert_eq!(delivery.deliveries, 1, "{}", delivery.unit.id);
+        worker.feed.acknowledge(delivery.receipt).unwrap();
+    }
+    wait_until(DEADLINE, "every unit is committed", || {
+        committed(&brokers, &group, WORK) == Some(3)
+    });
+    wait_until(DEADLINE, "a count and a tombstone per unit", || {
+        high_watermarks(&brokers, ATTEMPT, ATTEMPT_PARTITIONS) == 6
+    });
+    drop(publisher);
+}
+
+/// Pins that the publisher runs the workers' startup check and refuses a
+/// missing retry topic, naming it.
+#[test]
+fn a_publisher_refuses_a_missing_retry_topic() {
+    let cluster = MockCluster::new(1).expect("mock cluster");
+    cluster.create_topic(WORK, 1, 1).unwrap();
+    cluster.create_topic(DEAD, 1, 1).unwrap();
+    let (publisher, _io) = publisher_on_mock(&feed_yaml(
+        &cluster.bootstrap_servers(),
+        &spate_test::unique_name("publisher-missing"),
+        "",
+        "",
+    ));
+    match publisher {
+        Err(KafkaFeedError::Refused(message)) => assert!(
+            message.contains(&format!("the retry topic `{RETRY}` does not exist")),
+            "{message}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Pins that the publisher refuses a work topic the cluster reports
+/// unauthorized, naming the read.
+#[test]
+fn a_publisher_refuses_an_unauthorized_work_topic() {
+    let cluster = cluster(1);
+    cluster
+        .topic_error(
+            WORK,
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        )
+        .unwrap();
+    let (publisher, _io) = publisher_on_mock(&feed_yaml(
+        &cluster.bootstrap_servers(),
+        &spate_test::unique_name("publisher-unauthorized"),
+        "",
+        "",
+    ));
+    match publisher {
+        Err(KafkaFeedError::Refused(message)) => assert!(
+            message.contains(&format!("reading the metadata of the work topic `{WORK}`")),
+            "{message}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Pins that the publish in flight when the cluster refuses the
+/// publisher's idempotent producer id fails with the refusal's cause.
+#[test]
+fn the_publish_in_flight_at_a_fatal_producer_error_names_its_cause() {
+    let cluster = cluster(1);
+    cluster.request_errors(
+        rdkafka::types::RDKafkaApiKey::InitProducerId,
+        &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED],
+    );
+    let (publisher, io) = publisher_on_mock(&feed_yaml(
+        &cluster.bootstrap_servers(),
+        &spate_test::unique_name("publisher-in-flight-fatal"),
+        "",
+        "",
+    ));
+    let publisher = publisher.unwrap();
+    let err = io
+        .block_on(publisher.publish(Unit::new("a", b"body".to_vec())))
+        .unwrap_err();
+    assert_eq!(err.kind, FeedErrorKind::Fatal, "{}", err.reason);
+    assert!(
+        err.reason.contains("Cluster authorization failed"),
+        "{}",
+        err.reason
+    );
+}
+
+/// Pins that a bounded job on Kafka ends `Completed` once its unit is read
+/// and committed and the group's lag stays zero over the window, read
+/// through a consumer that never joins the group.
+#[test]
+fn a_bounded_job_on_kafka_ends_completed() {
+    let cluster = cluster(1);
+    let brokers = cluster.bootstrap_servers();
+    let group = spate_test::unique_name("bounded");
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    let rows = recs("b", 2);
+    let _unit = stage(&data, "b.ndjson", &rows);
+    let section = bounded_section(&brokers, &group, &dir);
+    list_once(publisher_on_mock(&section), &data, &section);
+
+    let clock = spate_core::clock::tokio::TestClock::frozen();
+    let worker = launch_bounded(ON_MOCK, &data, &section, &clock);
+    wait_until(DEADLINE, "the unit is read and committed", || {
+        written(&worker.script) == sorted(rows.clone())
+            && committed(&brokers, &group, WORK) == Some(1)
+    });
+    let report = run_to_exit(&worker, &clock);
+    assert_eq!(report.state, ExitState::Completed);
+    assert_eq!(report.exit_code(), 0);
+}
+
+/// Pins that a bounded job whose lister published nothing ends
+/// `Completed`: partitions with no commit read from their log start.
+#[test]
+fn a_bounded_job_that_published_nothing_ends_completed() {
+    let cluster = cluster(1);
+    let brokers = cluster.bootstrap_servers();
+    let group = spate_test::unique_name("empty");
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    let section = bounded_section(&brokers, &group, &dir);
+    list_once(publisher_on_mock(&section), &data, &section);
+
+    let clock = spate_core::clock::tokio::TestClock::frozen();
+    let worker = launch_bounded(ON_MOCK, &data, &section, &clock);
+    let report = run_to_exit(&worker, &clock);
+    assert_eq!(report.state, ExitState::Completed);
+}
+
+/// Pins that a message with no unit, which goes to the dead-letter topic at
+/// once, ends a bounded job `Stalled`, naming the dead-letter topic.
+#[test]
+fn a_message_with_no_unit_ends_a_bounded_job_stalled() {
+    let cluster = cluster(1);
+    let brokers = cluster.bootstrap_servers();
+    let group = spate_test::unique_name("no-unit-bounded");
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    let section = bounded_section(&brokers, &group, &dir);
+    list_once(publisher_on_mock(&section), &data, &section);
+    produce_raw(&brokers, WORK, &[(None, b"keyless")]);
+
+    let clock = spate_core::clock::tokio::TestClock::frozen();
+    let worker = launch_bounded(ON_MOCK, &data, &section, &clock);
+    wait_until(
+        DEADLINE,
+        "the message is dead-lettered and committed",
+        || high_watermark(&brokers, DEAD) == 1 && committed(&brokers, &group, WORK) == Some(1),
+    );
+    let report = run_to_exit(&worker, &clock);
+    assert_eq!(report.exit_code(), 1);
+    let ExitState::Failed(failure) = &report.state else {
+        panic!("expected a failed run, got {:?}", report.state);
+    };
+    assert!(
+        failure.reason.contains("bounded feed job stalled") && failure.reason.contains(DEAD),
+        "{}",
+        failure.reason
+    );
+}
+
+/// Read `of` from `feed` and wait for the answer.
+fn read_depth(feed: &dyn Feed, of: DepthOf) -> Result<Depth, FeedError> {
+    let mut reading = feed.read_depth(of).expect("the Kafka feed counts");
+    let mut outcome = None;
+    wait_until(DEADLINE, "the depth read is answered", || {
+        outcome = reading.try_outcome();
+        outcome.is_some()
+    });
+    outcome.expect("answered")
+}
+
+/// Pins that a broker refusing to describe the dead-letter topic, which it
+/// answers as the topic's own error in an answered metadata request, fails
+/// the dead-letter read Fatal, so a bounded job fails where it would read
+/// the topic again every 15 s.
+#[test]
+fn a_dead_letter_topic_authorization_failure_is_fatal() {
+    let cluster = MockCluster::new(1).expect("mock cluster");
+    for topic in [WORK, RETRY, DEAD] {
+        cluster.create_topic(topic, 1, 1).expect("create topic");
+    }
+    cluster
+        .create_topic(ATTEMPT, ATTEMPT_PARTITIONS, 1)
+        .expect("create topic");
+    let group = spate_test::unique_name("dead-letter-denied");
+    let d = direct(&feed_yaml(&cluster.bootstrap_servers(), &group, "", ""));
+    assert!(
+        read_depth(&d.feed, DepthOf::DeadLetters)
+            .unwrap()
+            .is_empty()
+    );
+    cluster
+        .topic_error(
+            DEAD,
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        )
+        .unwrap();
+    let e = read_depth(&d.feed, DepthOf::DeadLetters).unwrap_err();
+    assert_eq!(e.kind, FeedErrorKind::Fatal, "{e}");
+    assert!(e.reason.contains(DEAD), "{e}");
 }

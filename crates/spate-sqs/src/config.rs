@@ -15,6 +15,10 @@ const MIN_VISIBILITY: Duration = Duration::from_secs(3);
 /// The longest visibility period SQS accepts.
 const MAX_VISIBILITY: Duration = Duration::from_secs(12 * 60 * 60);
 
+/// The shortest settling window: AWS documents a queue's approximate counts
+/// as taking at least a minute to settle after its producers stop.
+const MIN_SETTLING_WINDOW: Duration = Duration::from_secs(60);
+
 fn default_visibility() -> Duration {
     Duration::from_secs(60)
 }
@@ -54,6 +58,14 @@ impl SqsFeedConfig {
                  queue's `maxReceiveCount`"
                     .to_owned(),
             ));
+        }
+        if let Some(window) = section.settling_window
+            && window < MIN_SETTLING_WINDOW
+        {
+            return Err(error(format!(
+                "`settling_window` must be at least 1m on `sqs`, whose message counts take at \
+                 least a minute to settle; got {window:?}"
+            )));
         }
         let config: SqsFeedConfig = backend.deserialize_into()?;
         config.validate()?;
@@ -181,6 +193,24 @@ mod tests {
             let err = with(bad).unwrap_err().to_string();
             assert!(err.contains("whole seconds from 3s to 12h"), "{bad}: {err}");
         }
+    }
+
+    /// Pins the SQS floor on `settling_window`: `60s` loads, `59s` is
+    /// refused naming the key, and a section that sets none loads.
+    #[test]
+    fn an_sqs_window_below_a_minute_is_refused() {
+        let body = "sqs: { queue_url: \"https://sqs.eu-west-2.amazonaws.com/1/q\" }";
+        let mut s = section(body);
+        s.settling_window = Some(Duration::from_secs(60));
+        SqsFeedConfig::from_section(&s).expect("a minute loads");
+        s.settling_window = Some(Duration::from_secs(59));
+        let err = SqsFeedConfig::from_section(&s).unwrap_err().to_string();
+        assert!(
+            err.contains("`settling_window`") && err.contains("59s"),
+            "{err}"
+        );
+        s.settling_window = None;
+        SqsFeedConfig::from_section(&s).expect("no window loads");
     }
 
     /// Pins the refusals: another backend's tag, `attempt_cap`, an unknown

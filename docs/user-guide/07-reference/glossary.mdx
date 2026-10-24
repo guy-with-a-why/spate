@@ -130,7 +130,11 @@ received unit from other readers only while its holder renews it, and
 delivers it again once the renewals stop. A unit that reaches the feed's
 delivery cap moves to its dead-letter destination. A source acknowledges a
 unit only after reading it to its end and after the sink has acknowledged
-every record in it. The in-process feed (`MemoryFeed`) serves one instance and
+every record in it. When the unit's input was replaced while it was read, the
+source may acknowledge it once the feed holds a unit naming the input's
+current state and the sink has acknowledged every record read from it; past
+the source's re-enqueue cap it acknowledges the unit without one and counts
+it. The in-process feed (`MemoryFeed`) serves one instance and
 keeps nothing across a restart.
 
 ### Fencing token
@@ -157,8 +161,12 @@ Where a bounded feed job keeps the state every instance of it reads, named by
 the `feed:` section's `location` key, such as the job fingerprint its lister
 writes. A job on a durable [feed](#feed)
 that names one is **bounded**, and its [work units](#work-unit) come from its
-lister. A job that names none is **continuous**, and its instances read no
-job location. A job on the in-process feed names none.
+lister. A bounded job ends once its lister's end marker holds over a
+[settling window](#settling-window) of empty reads of the feed. A job that
+names none is **continuous**, its instances read no job location, and it ends
+at a shutdown. A job on the in-process feed names none; one on the feed the
+runtime built ends once its own lister has finished and the feed reads empty,
+and one given a feed in code ends at a shutdown.
 
 *Connector mapping:*
 [S3 source](../04-connectors/sources/s3/README.mdx#bounded-jobs-and-the-job-location)
@@ -188,6 +196,19 @@ lease duration. A dead owner stops heartbeating and the lease expires,
 releasing the split to the fleet; a live owner that cannot reach the
 store self-fences after one full lease. Leases provide *liveness*;
 correctness comes from the [fencing token](#fencing-token).
+
+### Lister
+
+The one run per bounded job that lists the job's input once, publishes its
+[work units](#work-unit) to the [feed](#feed) and exits. A fleet's workers
+never list. The lister keeps its checkpoint at the
+[job location](#job-location), and writes an end marker there once the feed
+has confirmed every unit. Every worker reads that marker to end the job. A
+solo run on the in-process feed lists its own input.
+
+*Connector mapping:*
+[S3 source](../04-connectors/sources/s3/README.mdx#the-lister-run)
+— `S3Source::list_once`.
 
 ### Quarantine
 
@@ -288,6 +309,13 @@ seals when `batch.max_rows`, `batch.max_bytes`, or `batch.linger` trips, then
 writes it via the `ShardWriter`. The framework delivers the batch's
 acknowledgments only after the writer returns `Ok`, the durable-ack point, and
 fails them if the batch is abandoned.
+
+### Settling window
+
+How long a bounded feed job's [feed](#feed) must read empty, between two reads
+of its [lister](#lister)'s end marker naming the same run, before the job
+ends: five minutes unless the `feed:` section's `settling_window` sets another.
+The same span bounds a worker's wait for the job fingerprint at startup.
 
 ### Shard
 

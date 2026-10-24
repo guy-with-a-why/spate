@@ -178,13 +178,14 @@ fn next_component() -> String {
 
 fn fixture(shards: usize, replicas: usize, cfg: SinkPoolConfig, queue_cap: usize) -> Fixture {
     let writer = MockWriter::new();
-    let (queues, receivers) = shard_queues(shards, queue_cap);
+    let (mut queues, receivers) = shard_queues(shards, queue_cap);
     let budget = Arc::new(InflightBudget::new());
     // A distinct component per fixture. The shard gauges are owned by one live
     // handle set per series (`metrics::ownership`), and under `cargo test`
     // these fixtures are alive concurrently in one process. Sharing a label
     // set would make all but the first a shadow that publishes no gauge.
     let labels = ComponentLabels::new("test", next_component(), "mock");
+    queues.attach_metrics(&labels).expect("free queue series");
     let endpoints: Vec<Vec<MockEndpoint>> = (0..shards)
         .map(|s| {
             (0..replicas)
@@ -204,6 +205,7 @@ fn fixture(shards: usize, replicas: usize, cfg: SinkPoolConfig, queue_cap: usize
                 &replica_names,
                 E2eBasis::Ingest,
             )
+            .with_queue(queues.metrics(), s)
         })
         .collect();
     let pool = SinkPool::spawn(
@@ -1373,6 +1375,134 @@ fn sink_records_metric_matches_rows_written_exactly() {
         (value - 12.0).abs() < f64::EPSILON,
         "metric must equal rows written exactly, got {value}"
     );
+}
+
+/// The shard worker samples `spate_queue_depth` after each intake pass, so a
+/// queue the senders left full reads empty once the worker has drained it,
+/// with no further send to resample it.
+#[test]
+fn queue_depth_reads_zero_once_the_worker_drains_the_queue() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let depth = || queue_depth(&handle.render(), 0);
+    metrics::with_local_recorder(&recorder, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let fx = fixture(1, 1, SinkPoolConfig::default(), 2);
+            let (ack, _rx) = AckRef::test_pair();
+            // The worker is spawned but not yet polled on this runtime, so
+            // these sends fill the queue before it reads anything.
+            fx.queues
+                .try_send(0, chunk(1, 4, &ack))
+                .expect("first send fits");
+            fx.queues
+                .try_send(0, chunk(1, 4, &ack))
+                .expect("second send fills");
+            fx.queues.try_send(0, chunk(1, 4, &ack)).expect_err("full");
+            assert_eq!(depth(), 2, "the senders sample the full queue");
+
+            // The senders stay open and send nothing more.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while depth() != 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the worker must sample the queue it drained");
+
+            drop(ack);
+            drop(fx.queues);
+            fx.pool.drain(Duration::from_secs(5)).await;
+        });
+    });
+}
+
+/// A closed queue is shutdown rather than flow, so the worker draining it
+/// leaves the depth the senders last sampled.
+#[test]
+fn a_closed_queue_keeps_its_last_depth_reading() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let fx = fixture(1, 1, SinkPoolConfig::default(), 2);
+            let (ack, _rx) = AckRef::test_pair();
+            fx.queues
+                .try_send(0, chunk(1, 4, &ack))
+                .expect("first send fits");
+            fx.queues
+                .try_send(0, chunk(1, 4, &ack))
+                .expect("second send fills");
+            drop(ack);
+            // Closed before the worker's first poll, so its one intake pass
+            // reads both chunks from a closed queue.
+            drop(fx.queues);
+            let report = fx.pool.drain(Duration::from_secs(5)).await;
+            assert_eq!(report.flushed, 1, "both chunks were read and written");
+        });
+    });
+    assert_eq!(queue_depth(&handle.render(), 0), 2);
+}
+
+/// Each shard worker samples its own queue's depth: draining shard 1 moves
+/// shard 1's series to 0 and leaves shard 0's series alone.
+#[test]
+fn each_shard_worker_samples_its_own_queue_depth() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let depth = |shard| queue_depth(&handle.render(), shard);
+    metrics::with_local_recorder(&recorder, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let fx = fixture(2, 1, SinkPoolConfig::default(), 2);
+            let (ack, _rx) = AckRef::test_pair();
+            fx.queues
+                .try_send(1, chunk(1, 4, &ack))
+                .expect("first send fits");
+            fx.queues
+                .try_send(1, chunk(1, 4, &ack))
+                .expect("second send fills");
+            assert_eq!(depth(1), 2, "the senders sample shard 1's full queue");
+            assert_eq!(depth(0), 0, "shard 0's queue was never sent to");
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while depth(1) != 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("shard 1's worker must sample the queue it drained");
+            assert_eq!(depth(0), 0, "shard 1's worker leaves shard 0's series");
+
+            drop(ack);
+            drop(fx.queues);
+            fx.pool.drain(Duration::from_secs(5)).await;
+        });
+    });
+}
+
+/// `spate_queue_depth` for one shard of a fixture's queues.
+fn queue_depth(rendered: &str, shard: usize) -> u64 {
+    let value = metric_value(
+        rendered,
+        "spate_queue_depth",
+        &format!("queue=\"chain->sink/shard-{shard}\""),
+    );
+    assert!(
+        value >= 0.0 && value.fract() == 0.0,
+        "a depth is a count, got {value}"
+    );
+    value as u64
 }
 
 /// Pull one rendered Prometheus value by metric name plus a distinguishing
