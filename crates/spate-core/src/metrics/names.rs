@@ -33,7 +33,9 @@ pub const L_OUTCOME: &str = "outcome";
 pub const L_EVENT: &str = "event";
 /// Error class label. [`SINK_ERRORS_TOTAL`] carries the class the connector
 /// assigned (`retryable`, `record_level`, `fatal`); [`OPERATOR_ERRORS_TOTAL`]
-/// carries what the stage did with the error (`record_level`, `fatal`).
+/// carries what the stage did with the error (`record_level`, `fatal`);
+/// [`FEED_ERRORS_TOTAL`] carries the feed's error kind (`gone`, `refused`,
+/// `retryable`, `fatal`).
 pub const L_ERROR_TYPE: &str = "error_type";
 /// Queue edge label (`<upstream>-><downstream>`).
 pub const L_QUEUE: &str = "queue";
@@ -44,8 +46,6 @@ pub const L_VERSION: &str = "version";
 /// Feed call label (`receive`, `renew`, `acknowledge`, `fail`, `hand_back`,
 /// `publish`, `close`).
 pub const L_OP: &str = "op";
-/// Feed error kind label (`gone`, `refused`, `retryable`, `fatal`).
-pub const L_KIND: &str = "kind";
 
 // Declares each name as a constant and builds the kind's list from the same entries.
 macro_rules! metric_names {
@@ -146,7 +146,7 @@ metric_names! {
         /// Renewals the feed accepted.
         FEED_RENEWALS_TOTAL = "spate_feed_renewals_total",
         /// Feed calls answered with an error, and publishes and closes that
-        /// settled with one, by [`L_OP`] and [`L_KIND`].
+        /// settled with one, by [`L_OP`] and [`L_ERROR_TYPE`].
         FEED_ERRORS_TOTAL = "spate_feed_errors_total",
     }
 }

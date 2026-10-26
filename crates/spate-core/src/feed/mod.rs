@@ -30,15 +30,16 @@
 //!
 //! # Threading
 //!
-//! A feed is driven synchronously from the pipeline's controller thread, so
-//! no method waits on I/O. A backend runs its receives, lease renewals and
+//! A feed is driven synchronously, from the pipeline's controller thread and
+//! from the thread that runs the pipeline, so no method waits on I/O. A backend runs its receives, lease renewals and
 //! publishes on a task or thread it owns. [`receive`](Feed::receive) returns
 //! what that task has already buffered, and the other methods hand their
 //! request to it. The backend signals the [`FeedWaker`] it was given when a
 //! unit becomes ready to receive, and after a `receive` that takes some units
 //! and leaves others, so the source parks on the paired [`FeedPark`] between
 //! polls. A `receive` that takes nothing sends no signal. Methods take
-//! `&self`, so one `Arc<dyn Feed>` serves a reader and a publisher at once.
+//! `&self` and may be called from any thread, so one `Arc<dyn Feed>` serves a
+//! reader, a publisher and the runtime at once.
 //!
 //! # Ending a bounded job
 //!
@@ -214,7 +215,7 @@ impl FeedError {
     }
 }
 
-/// A queue of work units, read and filled from the controller thread.
+/// A queue of work units, read and filled without waiting.
 ///
 /// The module docs state the ack rule every implementation and caller
 /// follows. No method waits on I/O: a backend does its I/O on a task it owns
@@ -312,8 +313,7 @@ pub trait Feed: Send + Sync {
 
     /// Count what the feed, or its dead-letter destination, holds. The
     /// returned [`DepthReading`] settles once the backend has read the
-    /// counts. Never waits, and may be called from a thread other than the
-    /// controller's.
+    /// counts. Never waits.
     ///
     /// `None` means the backend cannot count, and a source that ends a
     /// bounded job on this feed refuses it. The default returns `None`.

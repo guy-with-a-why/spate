@@ -1,8 +1,9 @@
 //! The runtime's wrapper around the feed it hands a source.
 //!
-//! [`MeteredFeed`] forwards every call to the backend unchanged and records it
-//! under `spate_feed_*`, so every backend is counted the same way with no code
-//! of its own. [`DeadLetterSampler`] publishes the depth of the feed's
+//! [`MeteredFeed`] forwards every call to the backend unchanged and records
+//! the calls that receive, renew, settle, hand back and publish units, and the
+//! close, under `spate_feed_*`, so every backend is counted the same way with
+//! no code of its own. [`DeadLetterSampler`] publishes the depth of the feed's
 //! dead-letter destination from the runtime's own thread.
 
 use super::{
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 /// once a minute.
 pub(crate) const DEAD_LETTER_READ_INTERVAL: Duration = Duration::from_secs(60);
 
-/// A feed that records every call made through it.
+/// A feed that records the unit and publish calls made through it.
 ///
 /// Each call reaches the backend once, with the same arguments, and returns
 /// what the backend returned.
@@ -185,7 +186,8 @@ impl Feed for MeteredFeed {
 #[derive(Debug)]
 pub(crate) struct DeadLetterSampler {
     interval: Duration,
-    next: Instant,
+    // `None` once the next read would fall past what an `Instant` holds.
+    next: Option<Instant>,
     pending: Option<DepthReading>,
 }
 
@@ -194,7 +196,7 @@ impl DeadLetterSampler {
     pub(crate) fn new(interval: Duration, now: Instant) -> DeadLetterSampler {
         DeadLetterSampler {
             interval,
-            next: now,
+            next: Some(now),
             pending: None,
         }
     }
@@ -220,8 +222,8 @@ impl DeadLetterSampler {
             }
             self.pending = None;
         }
-        if now >= self.next {
-            self.next = now + self.interval;
+        if self.next.is_some_and(|due| now >= due) {
+            self.next = now.checked_add(self.interval);
             self.pending = feed.read_depth(DepthOf::DeadLetters);
         }
     }
@@ -393,7 +395,7 @@ mod tests {
         }
 
         fn errors(&self, op: &str, kind: &str) -> f64 {
-            let extra = format!(",op=\"{op}\",kind=\"{kind}\"");
+            let extra = format!(",op=\"{op}\",error_type=\"{kind}\"");
             self.value("spate_feed_errors_total", &extra).unwrap_or(0.0)
         }
 
@@ -672,6 +674,34 @@ mod tests {
         assert_eq!(reads(), 2, "the next read waits out the interval");
         sample(&mut sampler, Duration::from_secs(122));
         assert_eq!(reads(), 3);
+    }
+
+    /// Pins that an interval too long for an `Instant` reads once, at
+    /// startup, and never again, rather than overflowing.
+    #[test]
+    fn an_interval_past_any_instant_reads_once() {
+        let rig = Rig::new(
+            "metered-dead-letters-once",
+            Fake {
+                counts: true,
+                ..Fake::default()
+            },
+        );
+        let t0 = Instant::now();
+        let mut sampler = DeadLetterSampler::new(Duration::MAX, t0);
+        let sample = |sampler: &mut DeadLetterSampler, at: Duration| {
+            metrics::with_local_recorder(&rig.recorder, || sampler.sample(&rig.feed, t0 + at));
+        };
+        sample(&mut sampler, Duration::ZERO);
+        rig.fake.take_reporter().report(Ok(dead_letters(0)));
+        sample(&mut sampler, Duration::from_secs(1));
+        sample(&mut sampler, Duration::from_secs(86_400));
+        assert_eq!(rig.value("spate_feed_dead_letter_units", ""), Some(3.0));
+        assert_eq!(
+            rig.fake.calls.lock().unwrap().len(),
+            1,
+            "one read, at startup"
+        );
     }
 
     /// Pins that a backend that cannot count leaves the gauge absent, and

@@ -181,8 +181,9 @@ of [Metrics](../../METRICS.md).
   dead-letter destination is not delivered again, and it counts as
   unacknowledged until you redrive it. Every instance reads the destination's
   depth once a minute, so take the `max` across instances rather than the
-  `sum`. On a feed whose backend cannot count, the gauge is absent, and the
-  alert belongs in the feed's own monitoring.
+  `sum`. On a backend whose count never falls, alert on a rise instead. On a
+  feed whose backend cannot count, the gauge is absent, and the alert belongs
+  in the feed's own monitoring.
 
   :::note Connector specifics
   Where each feed keeps its dead letters:

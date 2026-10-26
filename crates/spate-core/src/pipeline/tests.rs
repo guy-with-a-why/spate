@@ -2499,14 +2499,7 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
     cfg.feed = feed_section("memory: {}");
     let pipeline_name = cfg.pipeline.name.clone();
-    // Installed before the pipeline builds, so the runtime's own install
-    // reuses it and renders through this handle.
-    let handle = crate::metrics::install(&crate::metrics::MetricsSettings {
-        exporter: crate::metrics::Exporter::Prometheus,
-        per_partition_detail: cfg.metrics.per_partition_detail,
-        e2e_basis: crate::metrics::E2eBasis::Ingest,
-    })
-    .expect("install the exporter");
+    let settings = crate::pipeline::metrics_settings(&cfg);
 
     // One unit dead-lettered and one waiting, through calls the runtime does
     // not see.
@@ -2527,6 +2520,9 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     wait_for("the source's feed", Duration::from_secs(5), || {
         h.shared.lock().unwrap().feed.is_some()
     });
+    // The runtime's own install, taken after it: a feed wrapped before the
+    // recorder existed would render nothing here.
+    let handle = crate::metrics::install(&settings).expect("the runtime's exporter");
     let feed = h
         .shared
         .lock()

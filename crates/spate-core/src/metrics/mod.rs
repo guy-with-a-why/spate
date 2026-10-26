@@ -68,8 +68,8 @@ pub use backpressure::BackpressureMetrics;
 pub(crate) use backpressure::InflightBudgetMetrics;
 pub use checkpoint::CheckpointMetrics;
 pub use deser::DeserMetrics;
-// The runtime resolves the only instance, when it wraps the feed it hands the
-// source.
+// A handle set built outside the runtime would take the feed's claim and stop
+// its pipeline starting, so this stays crate-internal.
 #[cfg(not(loom))]
 pub(crate) use feed::{FeedMetrics, FeedOp};
 pub use labels::ComponentLabels;

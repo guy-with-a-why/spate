@@ -3,7 +3,7 @@
 //!
 //! One handle set per pipeline, resolved by the runtime when it wraps the feed
 //! it hands the source. Every label takes its values from a fixed set: the
-//! feed calls, the [`FeedErrorKind`]s, and the backend's key as the
+//! recorded feed calls, the [`FeedErrorKind`]s, and the backend's key as the
 //! `component_type`.
 
 use super::MetricsError;
@@ -53,8 +53,8 @@ impl FeedOp {
     }
 }
 
-/// The `kind` label values, in the order [`kind_index`] numbers them.
-const KIND_LABELS: [&str; 4] = ["gone", "refused", "retryable", "fatal"];
+/// The `error_type` label values, in the order [`kind_index`] numbers them.
+const ERROR_TYPES: [&str; 4] = ["gone", "refused", "retryable", "fatal"];
 
 fn kind_index(kind: FeedErrorKind) -> usize {
     match kind {
@@ -75,7 +75,7 @@ pub(crate) struct FeedMetrics {
     handed_back: Counter,
     published: Counter,
     renewals: Counter,
-    errors: [[Counter; KIND_LABELS.len()]; FeedOp::ALL.len()],
+    errors: [[Counter; ERROR_TYPES.len()]; FeedOp::ALL.len()],
     call_duration: [Histogram; FeedOp::ALL.len()],
     publish_duration: Histogram,
     held_units: Gauge,
@@ -105,13 +105,13 @@ impl FeedMetrics {
             published: labels.counter(names::FEED_UNITS_PUBLISHED_TOTAL),
             renewals: labels.counter(names::FEED_RENEWALS_TOTAL),
             errors: FeedOp::ALL.map(|op| {
-                KIND_LABELS.map(|kind| {
+                ERROR_TYPES.map(|error_type| {
                     labels.counter2(
                         names::FEED_ERRORS_TOTAL,
                         names::L_OP,
                         op.label(),
-                        names::L_KIND,
-                        kind,
+                        names::L_ERROR_TYPE,
+                        error_type,
                     )
                 })
             }),
@@ -187,7 +187,7 @@ mod tests {
         }
     }
 
-    /// Pins the `op` and `kind` label each error lands under.
+    /// Pins the `op` and `error_type` label each error lands under.
     #[test]
     fn an_error_is_counted_under_its_call_and_kind() {
         let text = render_local(|| {
@@ -205,10 +205,10 @@ mod tests {
                 }
             }
         });
-        for (n, kind) in KIND_LABELS.into_iter().enumerate() {
+        for (n, error_type) in ERROR_TYPES.into_iter().enumerate() {
             let series = format!(
                 "spate_feed_errors_total{{pipeline=\"feed-error-labels\",component=\"feed\",\
-                 component_type=\"memory\",op=\"hand_back\",kind=\"{kind}\"}} {}",
+                 component_type=\"memory\",op=\"hand_back\",error_type=\"{error_type}\"}} {}",
                 n + 1
             );
             assert!(text.contains(&series), "missing {series} in:\n{text}");
