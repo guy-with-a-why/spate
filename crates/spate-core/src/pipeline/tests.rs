@@ -2520,8 +2520,9 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     wait_for("the source's feed", Duration::from_secs(5), || {
         h.shared.lock().unwrap().feed.is_some()
     });
-    // The runtime's own install, taken after it: a feed wrapped before the
-    // recorder existed would render nothing here.
+    // The runtime's own install, taken after it: in a process of its own, as
+    // nextest runs it, a feed wrapped before the recorder existed would render
+    // nothing here.
     let handle = crate::metrics::install(&settings).expect("the runtime's exporter");
     let feed = h
         .shared

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// once a minute.
 pub(crate) const DEAD_LETTER_READ_INTERVAL: Duration = Duration::from_secs(60);
 
-/// A feed that records the unit and publish calls made through it.
+/// A feed that records the unit, publish and close calls made through it.
 ///
 /// Each call reaches the backend once, with the same arguments, and returns
 /// what the backend returned.
@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(rig.counter("spate_feed_units_handed_back_total"), 0.0);
     }
 
-    /// Pins that every call is timed under its own `op`.
+    /// Pins that every recorded call is timed under its own `op`.
     #[test]
     fn every_call_is_timed_under_its_op() {
         let rig = Rig::new("metered-timed", Fake::default());
