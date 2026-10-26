@@ -122,9 +122,9 @@ timeout, `maxReceiveCount` and the dead-letter queue's retention.
 
 The checks run only when the feed connects. A redrive policy removed, or a
 dead-letter queue's retention shortened, while the pipeline runs goes
-unnoticed (see [Retention](#retention)). A dead-letter queue deleted while it
-runs fails the dead-letter depth read the pipeline makes once a minute, which
-logs a warning each time.
+unnoticed (see [Retention](#retention)). A dead-letter queue deleted while the
+pipeline runs fails the dead-letter depth read the pipeline makes once a
+minute, which logs a warning each time.
 
 ## Visibility and renewal
 

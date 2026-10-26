@@ -31,8 +31,9 @@
 //! # Threading
 //!
 //! A feed is driven synchronously, from the pipeline's controller thread and
-//! from the thread that runs the pipeline, so no method waits on I/O. A backend runs its receives, lease renewals and
-//! publishes on a task or thread it owns. [`receive`](Feed::receive) returns
+//! from the thread that runs the pipeline, so no method waits on I/O. A
+//! backend runs its receives, lease renewals and publishes on a task or thread
+//! it owns. [`receive`](Feed::receive) returns
 //! what that task has already buffered, and the other methods hand their
 //! request to it. The backend signals the [`FeedWaker`] it was given when a
 //! unit becomes ready to receive, and after a `receive` that takes some units
