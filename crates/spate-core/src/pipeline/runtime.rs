@@ -421,6 +421,12 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         // handles bind to the recorder installed above.
         let kept_feed = match resolved_feed {
             Some((section, feed, origin)) => {
+                feed.attach_metrics(Meter::for_component(
+                    feed.backend(),
+                    MetricRole::Feed,
+                    pipeline_name.clone(),
+                    "feed",
+                ));
                 let metrics = FeedMetrics::try_new(&ComponentLabels::new(
                     pipeline_name.clone(),
                     "feed",

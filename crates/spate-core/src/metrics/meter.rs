@@ -56,15 +56,17 @@
 use super::labels::{ComponentLabels, NamespaceRejection, classify_namespace, validate_namespace};
 use metrics::{Counter, Gauge, Histogram, SharedString};
 
-/// Which end of the pipeline a component sits at, appended to its namespace so
-/// a connector that can be both a source and a sink keeps its families apart
-/// (`spate_kafka_source_*` vs `spate_kafka_sink_*`). The runtime derives it
-/// from the wiring position when it builds a component's
-/// [`Meter`](Meter::for_component), so connector code never names a role.
+/// The part a component plays in the pipeline, appended to its namespace so a
+/// connector that is a source, a sink and a feed backend keeps its families
+/// apart (`spate_kafka_source_*`, `spate_kafka_sink_*`, `spate_kafka_feed_*`).
+/// The runtime derives it from the wiring position when it builds a
+/// component's [`Meter`](Meter::for_component), so connector code never names
+/// a role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MetricRole {
     Source,
     Sink,
+    Feed,
 }
 
 impl MetricRole {
@@ -72,6 +74,7 @@ impl MetricRole {
         match self {
             MetricRole::Source => "source",
             MetricRole::Sink => "sink",
+            MetricRole::Feed => "feed",
         }
     }
 }
@@ -215,16 +218,17 @@ impl Meter {
             super::names::PREFIX,
             self.prefix
         );
-        // A local name may not lead with a role segment (`source_`/`sink_`).
-        // The runtime injects those to separate a connector's source and sink
-        // families (`spate_<ns>_source_*` / `_sink_*`), so a hand-written
-        // `source_`/`sink_` name could otherwise alias a role-scoped family.
+        // A local name may not lead with a role segment (`source_`, `sink_`,
+        // `feed_`). The runtime injects those to separate a connector's
+        // families by role (`spate_<ns>_source_*`, `_sink_*`, `_feed_*`), so a
+        // hand-written name with one could otherwise alias a role-scoped
+        // family.
         let first = name.split('_').next().unwrap_or_default();
         assert!(
             !super::names::ROLE_SEGMENTS.contains(&first),
             "metric local name `{name}` must not begin with the role segment \
-             `{first}_`; the runtime reserves `source_`/`sink_` to scope a \
-             component's source vs sink families"
+             `{first}_`; the runtime reserves `source_`/`sink_`/`feed_` to scope \
+             a component's families by role"
         );
         format!("{}{name}", self.prefix).into()
     }

@@ -2097,6 +2097,80 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     assert_eq!(report.state, ExitState::Completed);
 }
 
+/// Pins that the runtime hands a feed backend a `Meter` scoped
+/// `spate_<backend>_feed_*`, carrying the feed's labels.
+#[test]
+fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
+    use crate::feed::{Confirmation, Delivery, Feed, FeedError, FeedWaker, Receipt, Unit};
+    use crate::metrics::Meter;
+
+    /// The in-process feed under another key, counting through the `Meter`
+    /// it is handed.
+    struct Probe(MemoryFeed);
+
+    impl Feed for Probe {
+        fn backend(&self) -> &str {
+            "probe"
+        }
+        fn set_waker(&self, waker: FeedWaker) {
+            self.0.set_waker(waker);
+        }
+        fn attach_metrics(&self, meter: Option<Meter>) {
+            meter
+                .expect("`probe` can scope a family")
+                .counter("attached_total", &[])
+                .increment(1);
+        }
+        fn receive(&self, max: usize) -> Result<Vec<Delivery>, FeedError> {
+            self.0.receive(max)
+        }
+        fn renew(&self, receipt: Receipt) -> Result<(), FeedError> {
+            self.0.renew(receipt)
+        }
+        fn acknowledge(&self, receipt: Receipt) -> Result<(), FeedError> {
+            self.0.acknowledge(receipt)
+        }
+        fn fail(&self, receipt: Receipt, reason: &str) -> Result<(), FeedError> {
+            self.0.fail(receipt, reason)
+        }
+        fn publish(&self, unit: Unit) -> Confirmation {
+            self.0.publish(unit)
+        }
+    }
+
+    let mut cfg = test_config(1);
+    cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
+    cfg.feed = feed_section("probe: {}");
+    let pipeline_name = cfg.pipeline.name.clone();
+    // Installed before the pipeline builds, so the runtime's own install
+    // reuses it and renders through this handle.
+    let handle = crate::metrics::install(&crate::metrics::MetricsSettings {
+        exporter: crate::metrics::Exporter::Prometheus,
+        per_partition_detail: cfg.metrics.per_partition_detail,
+        e2e_basis: crate::metrics::E2eBasis::Ingest,
+    })
+    .expect("install the exporter");
+
+    let h = start_prepared(
+        cfg,
+        test_options(),
+        |log| {
+            log.accept_feed = true;
+        },
+        |runtime, _| runtime.with_feed(Arc::new(Probe(MemoryFeed::new()))),
+        ok_chain,
+    );
+    h.script.lock().unwrap().push_back(Script::Drained);
+    let report = h.join.join().unwrap().unwrap();
+    assert_eq!(report.state, ExitState::Completed);
+
+    let series = format!(
+        r#"spate_probe_feed_attached_total{{pipeline="{pipeline_name}",component="feed",component_type="probe"}} 1"#
+    );
+    let rendered = handle.render();
+    assert!(rendered.lines().any(|l| l == series), "{rendered}");
+}
+
 /// Pins that `run` passes a `location` beside a backend other than the
 /// in-process feed on to the feed checks that follow.
 #[test]

@@ -9,7 +9,7 @@ use super::{
     Confirmation, Delivery, DepthOf, DepthReading, Feed, FeedError, FeedErrorKind, FeedWaker,
     Receipt, Unit,
 };
-use crate::metrics::{FeedMetrics, FeedOp};
+use crate::metrics::{FeedMetrics, FeedOp, Meter};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -98,6 +98,10 @@ impl Feed for MeteredFeed {
 
     fn set_waker(&self, waker: FeedWaker) {
         self.inner.set_waker(waker);
+    }
+
+    fn attach_metrics(&self, meter: Option<Meter>) {
+        self.inner.attach_metrics(meter);
     }
 
     fn receive(&self, max: usize) -> Result<Vec<Delivery>, FeedError> {
@@ -290,6 +294,10 @@ mod tests {
             self.log("set_waker".into());
         }
 
+        fn attach_metrics(&self, meter: Option<Meter>) {
+            self.log(format!("attach_metrics {}", meter.is_some()));
+        }
+
         fn receive(&self, max: usize) -> Result<Vec<Delivery>, FeedError> {
             self.log(format!("receive {max}"));
             self.answer()?;
@@ -418,6 +426,8 @@ mod tests {
         rig.fake.deliver([7]);
 
         assert_eq!(rig.feed.backend(), "fake");
+        rig.feed
+            .attach_metrics(Some(Meter::new("p", "feed", "fake")));
         rig.feed.set_waker(waker);
         let delivered = rig.feed.receive(4).unwrap();
         assert_eq!(delivered[0].receipt, Receipt(7));
@@ -439,6 +449,7 @@ mod tests {
         assert_eq!(
             *rig.fake.calls.lock().unwrap(),
             [
+                "attach_metrics true",
                 "set_waker",
                 "receive 4",
                 "renew 7",
