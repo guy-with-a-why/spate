@@ -27,8 +27,9 @@
 //!   `spate_kafka_*`). A connector that can appear at both ends of a pipeline (a
 //!   Kafka source *and* a future Kafka sink) is separated by the runtime into
 //!   `spate_kafka_source_*` / `spate_kafka_sink_*` when it injects the
-//!   component's `Meter`. The role is derived from the source-vs-sink
-//!   position, not set by hand.
+//!   component's `Meter`, and a feed backend's families land under
+//!   `spate_<backend>_feed_*`. The role is derived from the wiring position,
+//!   not set by hand.
 //!
 //! The namespace is validated once, at construction. It must be a lowercase
 //! `[a-z][a-z0-9_]*` segment and must not be one of the framework's reserved
@@ -144,8 +145,9 @@ impl Meter {
         }
     }
 
-    /// The scope the runtime hands a built-in component (a `Source` or a sink
-    /// `ShardWriter`). The namespace is the component's `component_type`, and
+    /// The scope the runtime hands a built-in component (a `Source`, a sink
+    /// `ShardWriter` or a `Feed` backend). The namespace is the component's
+    /// `component_type`, which for a feed backend is its `Feed::backend` key, and
     /// `role` (derived from the wiring position) is appended, giving
     /// `spate_<component_type>_<role>_*`. The `component_type` is also the
     /// standard `component_type` label, so a family joins the component's stage
@@ -264,5 +266,22 @@ impl Meter {
     #[must_use]
     pub fn labels(&self) -> &ComponentLabels {
         &self.labels
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use crate::metrics::names::ROLE_SEGMENTS;
+
+    /// Pins that every role's segment is reserved as a local name's lead, so
+    /// no hand-written name can alias a role-scoped family.
+    #[test]
+    fn every_role_segment_is_reserved() {
+        let segments: Vec<&str> = [MetricRole::Source, MetricRole::Sink, MetricRole::Feed]
+            .into_iter()
+            .map(MetricRole::segment)
+            .collect();
+        assert_eq!(segments, ROLE_SEGMENTS);
     }
 }

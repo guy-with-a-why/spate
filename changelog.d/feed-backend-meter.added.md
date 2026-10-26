@@ -1,5 +1,5 @@
-**Breaking:** **A feed backend receives a `Meter` for its own metrics** (`spate-core`)
+**Breaking:** **A `Meter` local name may not start with `feed_`** (`spate-core`)
 
-`Feed::attach_metrics` hands a feed backend a `Meter` for its own metric families. The runtime calls it once, before the source is handed the feed. The families land under `spate_<backend>_feed_*`, with `component="feed"` and the backend's key as `component_type`, beside the framework's `spate_feed_*` families for the same feed. The method has a default that ignores the `Meter`, so an existing backend compiles unchanged.
+`Meter::counter`, `Meter::gauge` and `Meter::histogram` panic on a local name that starts with `feed_`, as they do for `source_` and `sink_`. The rule holds in every namespace, including the `spate_custom_*` names `ChainCtx::meter` registers. v0.3.0 accepted such names, so a connector or pipeline author who registered one must rename it. `ROLE_SEGMENTS` lists `feed`.
 
-`feed` joins `ROLE_SEGMENTS`. A `Meter` local name that starts with `feed_` panics, as one that starts with `source_` or `sink_` does. A connector that registered a family under such a name must rename it.
+The segment is reserved for a feed backend's own families. `Feed::attach_metrics` hands a backend a `Meter` scoped `spate_<backend>_feed_*`, with `component="feed"` and the backend's key as `component_type`. The runtime calls it when it runs the feed, before the source is handed the feed. Calls made before then, and a feed used outside a pipeline, get no `Meter`.

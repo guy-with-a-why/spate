@@ -264,12 +264,17 @@ pub trait Feed: Send + Sync {
     /// Receive a [`Meter`] scoped `spate_<backend>_feed_*` for the backend's
     /// own metric families, pre-labeled with the pipeline, `component="feed"`
     /// and the [`backend`](Feed::backend) key as `component_type`. The
-    /// runtime calls it once, before the source is handed the feed. Resolve
-    /// handles here and keep them; with `&self` that takes interior
-    /// mutability, such as a `OnceLock`. `None` when the backend key cannot
-    /// scope a family: a reserved root or `custom` opts out silently, and a
-    /// malformed key is logged and also yields `None`. The default ignores
-    /// it.
+    /// runtime calls it when it runs the feed, before the source is handed
+    /// it, and calls it again, with the new pipeline's labels, for each later
+    /// pipeline the feed is handed to. Resolve handles here and keep them,
+    /// which `&self` leaves to interior mutability.
+    ///
+    /// The backend's own tasks, the calls made before the runtime runs, and a
+    /// feed used outside a pipeline all go without a `Meter`, so treat the
+    /// handles as optional wherever they are used. `None` when the backend key
+    /// cannot scope a family: a reserved root or `custom` opts out silently,
+    /// and a malformed key is logged and also yields `None`. The default
+    /// ignores it.
     fn attach_metrics(&self, _meter: Option<Meter>) {}
 
     /// Up to `max` deliveries the backend has buffered, oldest first. Never

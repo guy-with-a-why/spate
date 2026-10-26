@@ -2557,43 +2557,50 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
 }
 
 /// Pins that the runtime hands a feed backend a `Meter` scoped
-/// `spate_<backend>_feed_*`, carrying the feed's labels.
+/// `spate_<backend>_feed_*`, carrying the feed's labels, before the source is
+/// handed the feed.
 #[test]
 fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
     use crate::feed::{Confirmation, Delivery, Feed, FeedError, FeedWaker, Receipt, Unit};
     use crate::metrics::Meter;
 
     /// The in-process feed under another key, counting through the `Meter`
-    /// it is handed.
-    struct Probe(MemoryFeed);
+    /// it is handed and noting whether the source already held the feed.
+    struct Probe {
+        inner: MemoryFeed,
+        source: SharedLog,
+        source_had_feed: Arc<Mutex<Option<bool>>>,
+    }
 
     impl Feed for Probe {
         fn backend(&self) -> &str {
             "probe"
         }
         fn set_waker(&self, waker: FeedWaker) {
-            self.0.set_waker(waker);
+            self.inner.set_waker(waker);
         }
         fn attach_metrics(&self, meter: Option<Meter>) {
+            let had_feed = self.source.lock().unwrap().feed.is_some();
+            *self.source_had_feed.lock().unwrap() = Some(had_feed);
             meter
                 .expect("`probe` can scope a family")
                 .counter("attached_total", &[])
                 .increment(1);
         }
         fn receive(&self, max: usize) -> Result<Vec<Delivery>, FeedError> {
-            self.0.receive(max)
+            self.inner.receive(max)
         }
         fn renew(&self, receipt: Receipt) -> Result<(), FeedError> {
-            self.0.renew(receipt)
+            self.inner.renew(receipt)
         }
         fn acknowledge(&self, receipt: Receipt) -> Result<(), FeedError> {
-            self.0.acknowledge(receipt)
+            self.inner.acknowledge(receipt)
         }
         fn fail(&self, receipt: Receipt, reason: &str) -> Result<(), FeedError> {
-            self.0.fail(receipt, reason)
+            self.inner.fail(receipt, reason)
         }
         fn publish(&self, unit: Unit) -> Confirmation {
-            self.0.publish(unit)
+            self.inner.publish(unit)
         }
     }
 
@@ -2610,18 +2617,31 @@ fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
     })
     .expect("install the exporter");
 
+    let source_had_feed = Arc::new(Mutex::new(None));
+    let noted = Arc::clone(&source_had_feed);
     let h = start_prepared(
         cfg,
         test_options(),
         |log| {
             log.accept_feed = true;
         },
-        |runtime, _| runtime.with_feed(Arc::new(Probe(MemoryFeed::new()))),
+        move |runtime, source| {
+            runtime.with_feed(Arc::new(Probe {
+                inner: MemoryFeed::new(),
+                source: Arc::clone(source),
+                source_had_feed: noted,
+            }))
+        },
         ok_chain,
     );
     h.script.lock().unwrap().push_back(Script::Drained);
     let report = h.join.join().unwrap().unwrap();
     assert_eq!(report.state, ExitState::Completed);
+    assert_eq!(
+        *source_had_feed.lock().unwrap(),
+        Some(false),
+        "the backend's `Meter` arrives before the source is handed the feed"
+    );
 
     let series = format!(
         r#"spate_probe_feed_attached_total{{pipeline="{pipeline_name}",component="feed",component_type="probe"}} 1"#
