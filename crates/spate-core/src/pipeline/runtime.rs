@@ -48,7 +48,7 @@ pub struct RuntimeOptions {
     pub version: String,
     /// How often to read the depth of the feed's dead-letter destination for
     /// `spate_feed_dead_letter_units`, starting at startup. `None` makes no
-    /// such read, for a test that scripts or counts the feed's depth reads.
+    /// such read, so every depth read the feed answers is its source's.
     pub dead_letter_read_interval: Option<Duration>,
 }
 
