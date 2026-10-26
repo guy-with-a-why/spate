@@ -215,10 +215,11 @@ The dead-letter queue is read only after the window passes. A unit moved there
 earlier in the job and deleted at the end of the dead-letter queue's retention,
 counted from the unit's first send, leaves no trace, and the job ends
 completed over it. Keep a bounded job shorter than the dead-letter queue's
-retention, and alert on the dead-letter queue's
-`ApproximateNumberOfMessagesVisible` in CloudWatch: Spate does not see a
-message move there while a job runs, and a job with no `location` never reads
-the dead-letter queue at all.
+retention, and alert on the dead-letter queue's depth while the job runs. Each
+instance reads it once a minute with one `GetQueueAttributes` request and
+publishes it as `spate_feed_dead_letter_units`
+([Metrics](../../../../METRICS.md#feed-spate_feed_)), whether or not the job
+names a `location`.
 
 Give each bounded job a queue and a dead-letter queue of its own. A dead-letter
 queue that holds an earlier job's messages fails a later job as stalled, and a

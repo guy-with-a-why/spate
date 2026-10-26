@@ -48,6 +48,9 @@
 mod backpressure;
 mod checkpoint;
 mod deser;
+// Follows `crate::feed` out of loom model builds.
+#[cfg(not(loom))]
+mod feed;
 mod labels;
 mod meter;
 pub mod names;
@@ -65,6 +68,10 @@ pub use backpressure::BackpressureMetrics;
 pub(crate) use backpressure::InflightBudgetMetrics;
 pub use checkpoint::CheckpointMetrics;
 pub use deser::DeserMetrics;
+// The runtime resolves the only instance, when it wraps the feed it hands the
+// source.
+#[cfg(not(loom))]
+pub(crate) use feed::{FeedMetrics, FeedOp};
 pub use labels::ComponentLabels;
 pub use meter::Meter;
 // Role is derived by the runtime/builder from wiring position, never named by
@@ -752,6 +759,14 @@ mod tests {
     #[should_panic(expected = "reserved framework root")]
     fn coordination_stays_a_reserved_namespace() {
         Meter::with_namespace("coordination", "p", "c", "t");
+    }
+
+    /// `feed` is the runtime's root for the calls a source makes through its
+    /// feed, so no custom family may claim it.
+    #[test]
+    #[should_panic(expected = "reserved framework root")]
+    fn feed_is_a_reserved_namespace() {
+        Meter::with_namespace("feed", "p", "c", "t");
     }
 
     #[test]

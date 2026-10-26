@@ -9,9 +9,11 @@ use crate::checkpoint::Checkpointer;
 use crate::clock::{Clock, SystemClock};
 use crate::config::{MetricsExporter, PinningMode, PipelineConfig};
 use crate::feed::memory::MemoryFeed;
-use crate::feed::{Feed, FeedOrigin, STOP_RESERVE};
+use crate::feed::{
+    DEAD_LETTER_READ_INTERVAL, DeadLetterSampler, Feed, FeedOrigin, MeteredFeed, STOP_RESERVE,
+};
 use crate::metrics::{
-    self, BackpressureMetrics, CheckpointMetrics, ComponentLabels, E2eBasis, Exporter,
+    self, BackpressureMetrics, CheckpointMetrics, ComponentLabels, E2eBasis, Exporter, FeedMetrics,
     InflightBudgetMetrics, IoBusySampler, IoRuntimeMetrics, Meter, MetricRole, MetricsHandle,
     MetricsSettings, PipelineMetrics, PipelineState, SourceMetrics,
 };
@@ -44,6 +46,10 @@ pub struct RuntimeOptions {
     pub event_poll_timeout: Duration,
     /// Version string published on `spate_pipeline_info`.
     pub version: String,
+    /// How often to read the depth of the feed's dead-letter destination for
+    /// `spate_feed_dead_letter_units`, starting at startup. `None` makes no
+    /// such read, for a test that scripts or counts the feed's depth reads.
+    pub dead_letter_read_interval: Option<Duration>,
 }
 
 impl Default for RuntimeOptions {
@@ -56,6 +62,7 @@ impl Default for RuntimeOptions {
             blocked_retry: Duration::from_millis(2),
             event_poll_timeout: Duration::from_millis(50),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            dead_letter_read_interval: Some(DEAD_LETTER_READ_INTERVAL),
         }
     }
 }
@@ -319,7 +326,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                 )));
             }
         }
-        let mut kept_feed = None;
+        let mut resolved_feed = None;
         match (&self.config.feed, self.feed.take()) {
             (Some(section), given) => {
                 let (feed, origin) = match given {
@@ -345,10 +352,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                         feed.backend()
                     )));
                 }
-                kept_feed = Some(Arc::clone(&feed));
-                self.source
-                    .configure_feed(section, feed, origin)
-                    .map_err(|e| StartError::Config(e.to_string()))?;
+                resolved_feed = Some((section, feed, origin));
             }
             (None, Some(_)) => {
                 return Err(StartError::Config(
@@ -412,6 +416,25 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             ))
             .map_err(|e| StartError::Metrics(e.to_string()))?,
         );
+
+        // Wrapped here rather than where it is resolved, because the feed's
+        // handles bind to the recorder installed above.
+        let kept_feed = match resolved_feed {
+            Some((section, feed, origin)) => {
+                let metrics = FeedMetrics::try_new(&ComponentLabels::new(
+                    pipeline_name.clone(),
+                    "feed",
+                    feed.backend().to_owned(),
+                ))
+                .map_err(|e| StartError::Metrics(e.to_string()))?;
+                let feed = Arc::new(MeteredFeed::new(feed, metrics));
+                self.source
+                    .configure_feed(section, Arc::clone(&feed) as Arc<dyn Feed>, origin)
+                    .map_err(|e| StartError::Config(e.to_string()))?;
+                Some(feed)
+            }
+            None => None,
+        };
 
         let health = HealthState::new(threads, HealthThresholds::default());
 
@@ -685,6 +708,10 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             Instant::now(),
             metrics::io_busy_reading(&io_runtime_metrics).0,
         );
+        let mut dead_letters = self
+            .options
+            .dead_letter_read_interval
+            .map(|interval| DeadLetterSampler::new(interval, Instant::now()));
 
         let (mut state, final_watermarks, close_by) = loop {
             let (busy, workers) = metrics::io_busy_reading(&io_runtime_metrics);
@@ -696,6 +723,9 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                 workers,
                 &pipeline_name,
             );
+            if let (Some(feed), Some(sampler)) = (&kept_feed, &mut dead_letters) {
+                sampler.sample(feed, Instant::now());
+            }
             match to_main_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(ControllerSignal::LanesDrained { sink_deadline }) => {
                     for (i, h) in driver_handles.drain(..).enumerate() {

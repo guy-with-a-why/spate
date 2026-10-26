@@ -176,11 +176,13 @@ of [Metrics](../../METRICS.md).
   minutes (since start while shorter), shows that case.
 
 - **Dead-lettered work units** — on a pipeline that reads a
-  [work feed](../02-concepts/09-work-feed.mdx), alert when the feed's
-  dead-letter destination holds any unit, using the feed's own monitoring.
-  Spate reads that destination only when a job ends on its own, and a job
-  that runs until a shutdown never reads it, so no Spate metric reports a unit
-  moving there while a job runs.
+  [work feed](../02-concepts/09-work-feed.mdx),
+  `max by (pipeline) (spate_feed_dead_letter_units) > 0`. A unit in the feed's
+  dead-letter destination is not delivered again, and it counts as
+  unacknowledged until you redrive it. Every instance reads the destination's
+  depth once a minute, so take the `max` across instances rather than the
+  `sum`. On a feed whose backend cannot count, the gauge is absent, and the
+  alert belongs in the feed's own monitoring.
 
   :::note Connector specifics
   Where each feed keeps its dead letters:

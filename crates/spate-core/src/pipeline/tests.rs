@@ -2030,6 +2030,73 @@ fn the_source_learns_where_its_feed_came_from() {
     }
 }
 
+/// Pins that the source reads through a feed the runtime counts, under the
+/// `feed` component and the backend's key, and that the runtime publishes
+/// the dead-letter depth it reads at startup.
+#[test]
+fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
+    use crate::feed::{Feed, Unit};
+    let mut cfg = test_config(1);
+    cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
+    cfg.feed = feed_section("memory: {}");
+    let pipeline_name = cfg.pipeline.name.clone();
+    // Installed before the pipeline builds, so the runtime's own install
+    // reuses it and renders through this handle.
+    let handle = crate::metrics::install(&crate::metrics::MetricsSettings {
+        exporter: crate::metrics::Exporter::Prometheus,
+        per_partition_detail: cfg.metrics.per_partition_detail,
+        e2e_basis: crate::metrics::E2eBasis::Ingest,
+    })
+    .expect("install the exporter");
+
+    // One unit dead-lettered and one waiting, through calls the runtime does
+    // not see.
+    let backend = Arc::new(MemoryFeed::with_attempt_cap(std::num::NonZeroU32::MIN));
+    drop(backend.publish(Unit::new("poison", Vec::new())));
+    let poison = backend.receive(1).unwrap().remove(0);
+    backend.fail(poison.receipt, "unreadable").unwrap();
+    drop(backend.publish(Unit::new("work", Vec::new())));
+
+    let given = Arc::clone(&backend);
+    let h = start_prepared(
+        cfg,
+        test_options(),
+        |log| log.accept_feed = true,
+        move |runtime, _| runtime.with_feed(given),
+        ok_chain,
+    );
+    wait_for("the source's feed", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().feed.is_some()
+    });
+    let feed = h
+        .shared
+        .lock()
+        .unwrap()
+        .feed
+        .clone()
+        .expect("the source's feed");
+    let work = feed.receive(8).unwrap().remove(0);
+    feed.acknowledge(work.receipt).unwrap();
+
+    let series = |name: &str| {
+        format!(r#"{name}{{pipeline="{pipeline_name}",component="feed",component_type="memory"}} "#)
+    };
+    let reads = |name: &str, value: &str| {
+        let line = format!("{}{value}", series(name));
+        handle.render().lines().any(|l| l == line)
+    };
+    wait_for("the dead-letter depth", Duration::from_secs(5), || {
+        reads("spate_feed_dead_letter_units", "1")
+    });
+    assert!(reads("spate_feed_units_received_total", "1"));
+    assert!(reads("spate_feed_units_acknowledged_total", "1"));
+    assert!(reads("spate_feed_held_units", "0"));
+
+    h.script.lock().unwrap().push_back(Script::Drained);
+    let report = h.join.join().unwrap().unwrap();
+    assert_eq!(report.state, ExitState::Completed);
+}
+
 /// Pins that `run` passes a `location` beside a backend other than the
 /// in-process feed on to the feed checks that follow.
 #[test]
