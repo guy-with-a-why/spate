@@ -2604,14 +2604,7 @@ fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
     cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
     cfg.feed = feed_section("probe: {}");
     let pipeline_name = cfg.pipeline.name.clone();
-    // Installed before the pipeline builds, so the runtime's own install
-    // reuses it and renders through this handle.
-    let handle = crate::metrics::install(&crate::metrics::MetricsSettings {
-        exporter: crate::metrics::Exporter::Prometheus,
-        per_partition_detail: cfg.metrics.per_partition_detail,
-        e2e_basis: crate::metrics::E2eBasis::Ingest,
-    })
-    .expect("install the exporter");
+    let settings = crate::pipeline::metrics_settings(&cfg);
 
     let source_had_feed = Arc::new(Mutex::new(None));
     let noted = Arc::clone(&source_had_feed);
@@ -2639,6 +2632,9 @@ fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
         "the backend's `Meter` arrives before the source is handed the feed"
     );
 
+    // The runtime's own install, taken after it: a `Meter` handed over before
+    // the recorder existed would render nothing here.
+    let handle = crate::metrics::install(&settings).expect("the runtime's exporter");
     let series = format!(
         r#"spate_probe_feed_attached_total{{pipeline="{pipeline_name}",component="feed",component_type="probe"}} 1"#
     );
