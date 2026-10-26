@@ -2633,8 +2633,9 @@ fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
         "the backend's `Meter` arrives before the source is handed the feed"
     );
 
-    // The runtime's own install, taken after it: a `Meter` handed over before
-    // the recorder existed would render nothing here.
+    // The runtime's own install, taken after it: in a process of its own, as
+    // nextest runs it, a `Meter` handed over before the recorder existed would
+    // render nothing here.
     let handle = crate::metrics::install(&settings).expect("the runtime's exporter");
     let series = format!(
         r#"spate_probe_feed_attached_total{{pipeline="{pipeline_name}",component="feed",component_type="probe"}} 1"#

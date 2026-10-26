@@ -278,10 +278,15 @@ mod tests {
     /// no hand-written name can alias a role-scoped family.
     #[test]
     fn every_role_segment_is_reserved() {
-        let segments: Vec<&str> = [MetricRole::Source, MetricRole::Sink, MetricRole::Feed]
-            .into_iter()
-            .map(MetricRole::segment)
-            .collect();
+        let roles = [MetricRole::Source, MetricRole::Sink, MetricRole::Feed];
+        for role in roles {
+            // No wildcard arm, so a new role fails to compile here until it
+            // joins `roles`.
+            match role {
+                MetricRole::Source | MetricRole::Sink | MetricRole::Feed => {}
+            }
+        }
+        let segments: Vec<&str> = roles.into_iter().map(MetricRole::segment).collect();
         assert_eq!(segments, ROLE_SEGMENTS);
     }
 }
