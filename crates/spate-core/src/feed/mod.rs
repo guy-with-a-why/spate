@@ -270,9 +270,7 @@ pub trait Feed: Send + Sync {
     /// scope a family: a reserved root or `custom` opts out silently, and a
     /// malformed key is logged and also yields `None`. The default ignores
     /// it.
-    fn attach_metrics(&self, meter: Option<Meter>) {
-        let _ = meter;
-    }
+    fn attach_metrics(&self, _meter: Option<Meter>) {}
 
     /// Up to `max` deliveries the backend has buffered, oldest first. Never
     /// waits; returns an empty list when nothing is ready.
