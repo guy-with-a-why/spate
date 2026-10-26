@@ -68,6 +68,15 @@ pub(crate) struct SourceLog {
     /// Moved forward by this much in `open`, modeling a source that takes
     /// that long to open.
     pub(crate) advance_in_open: Option<(Arc<crate::clock::TestClock>, Duration)>,
+    /// The timeout of every `poll_events` call, in order.
+    pub(crate) poll_timeouts: Vec<Duration>,
+    /// The index into `poll_timeouts` of the last call that returned
+    /// `CommitReady`.
+    pub(crate) hinted_at: Option<usize>,
+    /// The index into `poll_timeouts` of the last `ReleaseHeld` call.
+    pub(crate) released_at: Option<usize>,
+    /// `poll_timeouts.len()` at each successful `commit`.
+    pub(crate) commit_polls: Vec<usize>,
 }
 
 pub(crate) enum Script {
@@ -88,6 +97,9 @@ pub(crate) enum Script {
     /// Panic inside `poll_events`, modeling a source bug that kills the
     /// controller thread outside its drain choreography.
     PanicPoll,
+    /// Drop the stashed acks inside `poll_events`, so they resolve while the
+    /// controller waits on the source, then report `Idle`.
+    ReleaseHeld(Arc<Mutex<Vec<crate::checkpoint::AckRef>>>),
 }
 
 pub(crate) struct LaneSpec {
@@ -165,6 +177,16 @@ impl Source for FakeSource {
 
     fn poll_events(&mut self, timeout: Duration) -> Result<SourceEvent<FakeLane>, SourceError> {
         let next = self.script.lock().unwrap().pop_front();
+        {
+            let mut log = self.shared.lock().unwrap();
+            if matches!(next, Some(Script::CommitReady(_))) {
+                log.hinted_at = Some(log.poll_timeouts.len());
+            }
+            if matches!(next, Some(Script::ReleaseHeld(_))) {
+                log.released_at = Some(log.poll_timeouts.len());
+            }
+            log.poll_timeouts.push(timeout);
+        }
         match next {
             Some(Script::Assign(specs)) => {
                 let issuer = self.issuer.as_ref().expect("open before assign");
@@ -219,6 +241,10 @@ impl Source for FakeSource {
                 Ok(SourceEvent::Drained)
             }
             Some(Script::PanicPoll) => panic!("scripted poll_events panic"),
+            Some(Script::ReleaseHeld(held)) => {
+                held.lock().unwrap().clear();
+                Ok(SourceEvent::Idle)
+            }
             None => {
                 std::thread::sleep(timeout.min(Duration::from_millis(5)));
                 Ok(SourceEvent::Idle)
@@ -256,6 +282,8 @@ impl Source for FakeSource {
             *slot = (*slot).max(o);
         }
         log.log.push("commit".into());
+        let polls = log.poll_timeouts.len();
+        log.commit_polls.push(polls);
         Ok(())
     }
 
