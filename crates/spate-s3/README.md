@@ -35,8 +35,10 @@ facade with the `s3` feature.
 - **Backpressure runs through bounded ranged GETs.** For an object with an
   ETag, the source reads GETs sized by `prefetch_bytes` (8 MiB by default) and
   buffers each GET in full before handing its chunks on, so a slow sink stalls
-  each read in progress with no request in flight. An object of at most
-  `prefetch_bytes` arrives in one GET and is held in memory whole, unless
+  each read in progress with no request in flight. While a lane hands on one
+  window, the source reads the next, so a lane holds three windows when each
+  spans at least four chunks, as at the defaults, and more when windows are
+  shorter. An object of at most `prefetch_bytes` arrives in one GET and is held in memory whole, unless
   `split_target_bytes` is set below its size and the object is cut into byte
   ranges. An object with no ETag is read in one streamed GET, and that
   response stays open while the sink is slow.
