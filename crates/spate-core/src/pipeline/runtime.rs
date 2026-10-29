@@ -293,8 +293,8 @@ impl<S: Source + 'static> PipelineRuntime<S> {
     }
 
     /// Read the commit tick, the fast-commit window, the stall check, the
-    /// idle flush and the health probe on `clock`, so a test moves them by
-    /// hand. Every drain deadline is computed on the stop clock set by
+    /// idle flush, the health probe, the feed's dead-letter reads and its call
+    /// timings on `clock`, so a test moves them by hand. Every drain deadline is computed on the stop clock set by
     /// `with_stop_clock`, and the sink pool counts its share down on its own
     /// tokio clock.
     #[cfg(any(test, feature = "testing"))]
@@ -462,7 +462,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                     feed.backend().to_owned(),
                 ))
                 .map_err(|e| StartError::Metrics(e.to_string()))?;
-                let feed = Arc::new(MeteredFeed::new(feed, metrics));
+                let feed = Arc::new(MeteredFeed::new(feed, metrics, Arc::clone(&self.clock)));
                 self.source
                     .configure_feed(section, Arc::clone(&feed) as Arc<dyn Feed>, origin)
                     .map_err(|e| StartError::Config(e.to_string()))?;
@@ -764,7 +764,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         let mut dead_letters = self
             .options
             .dead_letter_read_interval
-            .map(|interval| DeadLetterSampler::new(interval, Instant::now()));
+            .map(|interval| DeadLetterSampler::new(interval, self.clock.now()));
 
         let (mut state, final_watermarks, close_by) = loop {
             let (busy, workers) = metrics::io_busy_reading(&io_runtime_metrics);
@@ -777,7 +777,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                 &pipeline_name,
             );
             if let (Some(feed), Some(sampler)) = (&kept_feed, &mut dead_letters) {
-                sampler.sample(feed, Instant::now());
+                sampler.sample(feed, self.clock.now());
             }
             match to_main_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(ControllerSignal::LanesDrained { sink_deadline }) => {
