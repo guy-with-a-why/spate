@@ -9,18 +9,19 @@ use super::producer::FeedProducerContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{BaseRecord, ThreadedProducer};
+use spate_core::clock::{Clock, Stopwatch};
 use spate_core::error::ErrorClass;
 use spate_core::feed::{Confirmer, Receipt, Unit};
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The header that carries, on a copy written to the retry or dead-letter
 /// topic, the count of the delivery the copy was written from. The feed
 /// writes it for an operator and never reads it.
 pub(crate) const DELIVERIES_HEADER: &str = "spate.deliveries";
 
-const BACKOFF_START: Duration = Duration::from_millis(200);
+pub(crate) const BACKOFF_START: Duration = Duration::from_millis(200);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// The feed's producer.
@@ -117,7 +118,7 @@ pub(crate) struct Move {
     pub(crate) deliveries: u32,
     pub(crate) finish: Finish,
     /// When the first attempt was enqueued.
-    pub(crate) started: Instant,
+    pub(crate) started: Stopwatch,
     /// The wait before the next attempt, should this one fail.
     pub(crate) backoff: Duration,
 }
@@ -130,6 +131,7 @@ impl Move {
         unit: Option<String>,
         deliveries: u32,
         finish: Finish,
+        clock: &dyn Clock,
     ) -> Move {
         Move {
             message,
@@ -138,7 +140,7 @@ impl Move {
             unit,
             deliveries,
             finish,
-            started: Instant::now(),
+            started: Stopwatch::start(clock),
             backoff: BACKOFF_START,
         }
     }
@@ -156,7 +158,7 @@ pub(crate) struct Attempt {
     pub(crate) unit: Unit,
     pub(crate) identity: PublishId,
     pub(crate) attempt_partition: i32,
-    pub(crate) started: Instant,
+    pub(crate) started: Stopwatch,
     pub(crate) backoff: Duration,
 }
 
@@ -170,6 +172,7 @@ impl Attempt {
         attempts: u32,
         receipt: Receipt,
         unit: Unit,
+        clock: &dyn Clock,
     ) -> Attempt {
         Attempt {
             message: Outgoing::attempt_record(topic, &identity, partition, Some(attempts)),
@@ -178,7 +181,7 @@ impl Attempt {
             unit,
             identity,
             attempt_partition: partition,
-            started: Instant::now(),
+            started: Stopwatch::start(clock),
             backoff: BACKOFF_START,
         }
     }
