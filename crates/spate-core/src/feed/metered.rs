@@ -3,7 +3,8 @@
 //! [`MeteredFeed`] forwards every call to the backend unchanged and records
 //! the calls that receive, renew, settle, hand back and publish units under
 //! `spate_feed_*`, so every backend is counted the same way with no code of
-//! its own.
+//! its own. [`DeadLetterSampler`] publishes the depth of the feed's
+//! dead-letter destination.
 
 use super::{
     Confirmation, Delivery, DepthOf, DepthReading, Feed, FeedError, FeedErrorKind, FeedWaker,
@@ -12,7 +13,12 @@ use super::{
 use crate::clock::{SharedClock, Stopwatch};
 use crate::metrics::{FeedMetrics, FeedOp};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// The default for
+/// [`RuntimeOptions::dead_letter_read_interval`](crate::pipeline::RuntimeOptions::dead_letter_read_interval):
+/// once a minute.
+pub(crate) const DEAD_LETTER_READ_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A feed that records the unit and publish calls made through it.
 ///
@@ -146,25 +152,78 @@ impl Feed for MeteredFeed {
     }
 }
 
+/// Reads the depth of a feed's dead-letter destination every interval and
+/// publishes each reading that settles as `spate_feed_dead_letter_units`.
+///
+/// A read that fails leaves the gauge at its last reading. A backend that
+/// cannot count leaves it absent.
+#[derive(Debug)]
+pub(crate) struct DeadLetterSampler {
+    interval: Duration,
+    // `None` once the next read would fall past what an `Instant` holds.
+    next: Option<Instant>,
+    pending: Option<DepthReading>,
+}
+
+impl DeadLetterSampler {
+    /// A sampler whose first read is due at `now`.
+    pub(crate) fn new(interval: Duration, now: Instant) -> DeadLetterSampler {
+        DeadLetterSampler {
+            interval,
+            next: Some(now),
+            pending: None,
+        }
+    }
+
+    /// Publish the pending reading if it has settled, and start the next one
+    /// when it is due and none is pending. Never waits.
+    pub(crate) fn sample(&mut self, feed: &MeteredFeed, now: Instant) {
+        if let Some(reading) = &mut self.pending {
+            match reading.try_outcome() {
+                None => return,
+                Some(Ok(depth)) => feed.metrics.set_dead_letters(
+                    depth
+                        .visible
+                        .saturating_add(depth.delayed)
+                        .saturating_add(depth.in_flight),
+                ),
+                Some(Err(e)) => tracing::warn!(
+                    feed = feed.backend(),
+                    error = %e,
+                    "could not read the depth of the feed's dead-letter destination; \
+                     `spate_feed_dead_letter_units` keeps its last reading"
+                ),
+            }
+            self.pending = None;
+        }
+        if self.next.is_some_and(|due| now >= due) {
+            self.next = now.checked_add(self.interval);
+            self.pending = feed.read_depth(DepthOf::DeadLetters);
+        }
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::clock::TestClock;
-    use crate::feed::{Confirmer, confirmation};
+    use crate::feed::{Confirmer, Depth, DepthReporter, confirmation, depth_reading};
     use crate::metrics::ComponentLabels;
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
     /// A backend that logs every call, answers the calls that return a
-    /// `Result` from a script of refusals, and leaves each publish and close
-    /// for the test to settle.
+    /// `Result` from a script of refusals, and leaves each publish, close and,
+    /// when it `counts`, depth read for the test to settle.
     #[derive(Default)]
     struct Fake {
         calls: Mutex<Vec<String>>,
         refusals: Mutex<VecDeque<FeedErrorKind>>,
         deliveries: Mutex<Vec<Delivery>>,
         confirmers: Mutex<Vec<Confirmer>>,
+        reporters: Mutex<Vec<DepthReporter>>,
+        counts: bool,
         // Moved by each renewal, so a test can see what the call took.
         renew_takes: Mutex<Option<(Arc<TestClock>, Duration)>>,
     }
@@ -195,6 +254,10 @@ mod tests {
 
         fn take_confirmer(&self) -> Confirmer {
             self.confirmers.lock().unwrap().remove(0)
+        }
+
+        fn take_reporter(&self) -> DepthReporter {
+            self.reporters.lock().unwrap().remove(0)
         }
     }
 
@@ -240,7 +303,11 @@ mod tests {
 
         fn read_depth(&self, of: DepthOf) -> Option<DepthReading> {
             self.log(format!("read_depth {of:?}"));
-            None
+            self.counts.then(|| {
+                let (reporter, reading) = depth_reading();
+                self.reporters.lock().unwrap().push(reporter);
+                reading
+            })
         }
 
         fn hands_back(&self) -> bool {
@@ -277,8 +344,12 @@ mod tests {
 
     impl Rig {
         fn new(pipeline: &'static str) -> Rig {
+            Rig::with_fake(pipeline, Fake::default())
+        }
+
+        fn with_fake(pipeline: &'static str, fake: Fake) -> Rig {
             let recorder = PrometheusBuilder::new().build_recorder();
-            let fake = Arc::new(Fake::default());
+            let fake = Arc::new(fake);
             let clock = TestClock::frozen();
             let feed = metrics::with_local_recorder(&recorder, || {
                 let labels = ComponentLabels::new(pipeline, "feed", "fake");
@@ -514,5 +585,121 @@ mod tests {
             rig.value("spate_feed_publish_duration_seconds_count", ""),
             Some(2.0)
         );
+    }
+    fn dead_letters(n: u64) -> Depth {
+        let mut depth = Depth::new("the dead letters", true);
+        depth.visible = n;
+        depth.delayed = 2;
+        depth.in_flight = 1;
+        depth.unsent = 100;
+        depth
+    }
+
+    /// A metered fake that counts and leaves its depth reads pending.
+    fn counting(pipeline: &'static str) -> Rig {
+        Rig::with_fake(
+            pipeline,
+            Fake {
+                counts: true,
+                ..Fake::default()
+            },
+        )
+    }
+
+    /// Run one sample at `t0 + at` under the rig's recorder, where the gauge
+    /// registers on its first reading.
+    fn sample(rig: &Rig, sampler: &mut DeadLetterSampler, t0: Instant, at: Duration) {
+        metrics::with_local_recorder(&rig.recorder, || sampler.sample(&rig.feed, t0 + at));
+    }
+
+    fn dead_letter_reads(rig: &Rig) -> usize {
+        rig.fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "read_depth DeadLetters")
+            .count()
+    }
+
+    /// Pins the sampler's cadence: a read starts when due and only while
+    /// none is pending, and a settled reading is published as the visible,
+    /// delayed and in-flight units it counts.
+    #[test]
+    fn the_dead_letter_sampler_publishes_each_settled_reading() {
+        let rig = counting("metered-dead-letters");
+        let gauge = || rig.value("spate_feed_dead_letter_units", "");
+        let t0 = Instant::now();
+        let mut sampler = DeadLetterSampler::new(Duration::from_secs(60), t0);
+
+        sample(&rig, &mut sampler, t0, Duration::ZERO);
+        assert_eq!(dead_letter_reads(&rig), 1);
+        sample(&rig, &mut sampler, t0, Duration::from_secs(61));
+        assert_eq!(
+            dead_letter_reads(&rig),
+            1,
+            "no second read while one is pending"
+        );
+        assert_eq!(gauge(), None, "absent until a reading settles");
+
+        rig.fake.take_reporter().report(Ok(dead_letters(4)));
+        sample(&rig, &mut sampler, t0, Duration::from_secs(62));
+        assert_eq!(gauge(), Some(7.0));
+        assert_eq!(
+            dead_letter_reads(&rig),
+            2,
+            "the overdue read starts once the first settles"
+        );
+
+        rig.fake
+            .take_reporter()
+            .report(Err(FeedError::new(FeedErrorKind::Retryable, "throttled")));
+        sample(&rig, &mut sampler, t0, Duration::from_secs(63));
+        assert_eq!(gauge(), Some(7.0), "a failed read keeps the last reading");
+        sample(&rig, &mut sampler, t0, Duration::from_secs(121));
+        assert_eq!(
+            dead_letter_reads(&rig),
+            2,
+            "the next read waits out the interval"
+        );
+        sample(&rig, &mut sampler, t0, Duration::from_secs(122));
+        assert_eq!(dead_letter_reads(&rig), 3);
+    }
+
+    /// Pins that an interval too long for an `Instant` reads once, at
+    /// startup, and never again, rather than overflowing, and that a zero
+    /// interval reads again whenever no read is pending.
+    #[test]
+    fn the_interval_bounds_the_dead_letter_reads() {
+        let rig = counting("metered-dead-letters-bounds");
+        let t0 = Instant::now();
+        let mut once = DeadLetterSampler::new(Duration::MAX, t0);
+        sample(&rig, &mut once, t0, Duration::ZERO);
+        rig.fake.take_reporter().report(Ok(dead_letters(0)));
+        sample(&rig, &mut once, t0, Duration::from_secs(1));
+        sample(&rig, &mut once, t0, Duration::from_secs(86_400));
+        assert_eq!(rig.value("spate_feed_dead_letter_units", ""), Some(3.0));
+        assert_eq!(dead_letter_reads(&rig), 1, "one read, at startup");
+
+        let mut always = DeadLetterSampler::new(Duration::ZERO, t0);
+        for _ in 0..3 {
+            sample(&rig, &mut always, t0, Duration::ZERO);
+            rig.fake.take_reporter().report(Ok(dead_letters(0)));
+        }
+        assert_eq!(dead_letter_reads(&rig), 4);
+    }
+
+    /// Pins that a backend that cannot count leaves the gauge absent, and
+    /// is asked again each interval.
+    #[test]
+    fn a_feed_that_cannot_count_leaves_the_dead_letter_gauge_absent() {
+        let rig = Rig::new("metered-no-depth");
+        let t0 = Instant::now();
+        let mut sampler = DeadLetterSampler::new(Duration::from_secs(60), t0);
+        for at in [0, 1, 60] {
+            sample(&rig, &mut sampler, t0, Duration::from_secs(at));
+        }
+        assert_eq!(dead_letter_reads(&rig), 2);
+        assert_eq!(rig.value("spate_feed_dead_letter_units", ""), None);
     }
 }
