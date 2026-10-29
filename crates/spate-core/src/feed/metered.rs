@@ -435,6 +435,7 @@ mod tests {
         assert_eq!(rig.errors("hand_back", "fatal"), 1.0);
         assert_eq!(rig.errors("renew", "retryable"), 1.0);
         assert_eq!(rig.errors("receive", "fatal"), 1.0);
+        assert_eq!(rig.errors("receive", "retryable"), 0.0);
         for counter in [
             "spate_feed_units_acknowledged_total",
             "spate_feed_units_failed_total",
