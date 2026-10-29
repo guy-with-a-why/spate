@@ -47,8 +47,9 @@ pub struct RuntimeOptions {
     /// Version string published on `spate_pipeline_info`.
     pub version: String,
     /// How often to read the depth of the feed's dead-letter destination for
-    /// `spate_feed_dead_letter_units`, starting at startup. `None` makes no
-    /// such read, so every depth read the feed answers is its source's.
+    /// `spate_feed_dead_letter_units`, starting at startup. A zero interval
+    /// reads whenever no read is pending. `None` makes no such read, so every
+    /// depth read the feed answers is its source's.
     pub dead_letter_read_interval: Option<Duration>,
 }
 
@@ -293,10 +294,10 @@ impl<S: Source + 'static> PipelineRuntime<S> {
     }
 
     /// Read the commit tick, the fast-commit window, the stall check, the
-    /// idle flush, the health probe, the feed's dead-letter reads and its call
-    /// timings on `clock`, so a test moves them by hand. Every drain deadline is computed on the stop clock set by
-    /// `with_stop_clock`, and the sink pool counts its share down on its own
-    /// tokio clock.
+    /// idle flush, the health probe, the feed's call timings and its
+    /// dead-letter reads on `clock`, so a test moves them by hand. Every drain
+    /// deadline is computed on the stop clock set by `with_stop_clock`, and the
+    /// sink pool counts its share down on its own tokio clock.
     #[cfg(any(test, feature = "testing"))]
     #[doc(hidden)]
     #[must_use]

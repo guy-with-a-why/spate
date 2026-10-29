@@ -44,7 +44,7 @@ pub const L_STATE: &str = "state";
 /// Build version label on `spate_pipeline_info`.
 pub const L_VERSION: &str = "version";
 /// Feed call label (`receive`, `renew`, `acknowledge`, `fail`, `hand_back`,
-/// `publish`, `close`).
+/// `publish`).
 pub const L_OP: &str = "op";
 
 // Declares each name as a constant and builds the kind's list from the same entries.
@@ -145,8 +145,8 @@ metric_names! {
         FEED_UNITS_PUBLISHED_TOTAL = "spate_feed_units_published_total",
         /// Renewals the feed accepted.
         FEED_RENEWALS_TOTAL = "spate_feed_renewals_total",
-        /// Feed calls answered with an error, and publishes and closes that
-        /// settled with one, by [`L_OP`] and [`L_ERROR_TYPE`].
+        /// Feed calls answered with an error, and publishes that settled with
+        /// one, by [`L_OP`] and [`L_ERROR_TYPE`].
         FEED_ERRORS_TOTAL = "spate_feed_errors_total",
     }
 }

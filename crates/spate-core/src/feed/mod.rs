@@ -30,17 +30,16 @@
 //!
 //! # Threading
 //!
-//! A feed is driven synchronously, from the pipeline's controller thread and
-//! from the thread that runs the pipeline, so no method waits on I/O. A
-//! backend runs its receives, lease renewals and publishes on a task or thread
-//! it owns. [`receive`](Feed::receive) returns
-//! what that task has already buffered, and the other methods hand their
+//! A feed is driven synchronously, so no method waits on I/O. A backend runs
+//! its receives, lease renewals and publishes on a task or thread it owns.
+//! [`receive`](Feed::receive) returns what that task has already buffered,
+//! and the other methods hand their
 //! request to it. The backend signals the [`FeedWaker`] it was given when a
 //! unit becomes ready to receive, and after a `receive` that takes some units
 //! and leaves others, so the source parks on the paired [`FeedPark`] between
 //! polls. A `receive` that takes nothing sends no signal. Methods take
 //! `&self` and may be called from any thread, so one `Arc<dyn Feed>` serves a
-//! reader, a publisher and the runtime at once.
+//! reader and a publisher at once.
 //!
 //! # Ending a bounded job
 //!

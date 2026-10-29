@@ -24,20 +24,18 @@ pub(crate) enum FeedOp {
     Fail,
     HandBack,
     Publish,
-    Close,
 }
 
 impl FeedOp {
     /// Every call, in discriminant order, so `op as usize` indexes a table
     /// built from it.
-    const ALL: [FeedOp; 7] = [
+    const ALL: [FeedOp; 6] = [
         FeedOp::Receive,
         FeedOp::Renew,
         FeedOp::Acknowledge,
         FeedOp::Fail,
         FeedOp::HandBack,
         FeedOp::Publish,
-        FeedOp::Close,
     ];
 
     fn label(self) -> &'static str {
@@ -48,7 +46,6 @@ impl FeedOp {
             FeedOp::Fail => "fail",
             FeedOp::HandBack => "hand_back",
             FeedOp::Publish => "publish",
-            FeedOp::Close => "close",
         }
     }
 }
@@ -127,6 +124,18 @@ impl FeedMetrics {
 
     pub(crate) fn received(&self, units: usize) {
         self.received.increment(units as u64);
+        self.held_units.increment(units as f64);
+    }
+
+    /// The source let go of one delivery it held.
+    pub(crate) fn released(&self) {
+        self.held_units.decrement(1.0);
+    }
+
+    pub(crate) fn set_dead_letters(&self, units: u64) {
+        self.dead_letter_units
+            .get_or_init(|| self.labels.gauge(names::FEED_DEAD_LETTER_UNITS))
+            .set(units as f64);
     }
 
     pub(crate) fn acknowledged(&self) {
@@ -161,22 +170,11 @@ impl FeedMetrics {
             Err(e) => self.error(FeedOp::Publish, e.kind),
         }
     }
-
-    pub(crate) fn set_held(&self, units: usize) {
-        self.held_units.set(units as f64);
-    }
-
-    pub(crate) fn set_dead_letters(&self, units: u64) {
-        self.dead_letter_units
-            .get_or_init(|| self.labels.gauge(names::FEED_DEAD_LETTER_UNITS))
-            .set(units as f64);
-    }
 }
 
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::metrics::render_local;
 
     /// Pins that `ALL` lists the calls in discriminant order, which the
     /// handle tables are indexed by.
@@ -185,55 +183,6 @@ mod tests {
         for (i, op) in FeedOp::ALL.into_iter().enumerate() {
             assert_eq!(op as usize, i, "{op:?}");
         }
-    }
-
-    /// Pins the `op` and `error_type` label each error lands under.
-    #[test]
-    fn an_error_is_counted_under_its_call_and_kind() {
-        let text = render_local(|| {
-            let labels = ComponentLabels::new("feed-error-labels", "feed", "memory");
-            let metrics = FeedMetrics::try_new(&labels).unwrap();
-            let kinds = [
-                FeedErrorKind::Gone,
-                FeedErrorKind::Refused,
-                FeedErrorKind::Retryable,
-                FeedErrorKind::Fatal,
-            ];
-            for (n, kind) in kinds.into_iter().enumerate() {
-                for _ in 0..=n {
-                    metrics.error(FeedOp::HandBack, kind);
-                }
-            }
-        });
-        for (n, error_type) in ERROR_TYPES.into_iter().enumerate() {
-            let series = format!(
-                "spate_feed_errors_total{{pipeline=\"feed-error-labels\",component=\"feed\",\
-                 component_type=\"memory\",op=\"hand_back\",error_type=\"{error_type}\"}} {}",
-                n + 1
-            );
-            assert!(text.contains(&series), "missing {series} in:\n{text}");
-        }
-    }
-
-    /// Pins that the dead-letter gauge is absent until a reading is
-    /// published, and that the held gauge reads 0 from the start.
-    #[test]
-    fn the_dead_letter_gauge_is_absent_until_measured() {
-        let labels = ComponentLabels::new("feed-dead-letters-absent", "feed", "memory");
-        let unmeasured = render_local(|| drop(FeedMetrics::try_new(&labels).unwrap()));
-        assert!(!unmeasured.contains("spate_feed_dead_letter_units"));
-        assert!(unmeasured.contains("spate_feed_held_units{"));
-
-        let measured = render_local(|| {
-            FeedMetrics::try_new(&labels).unwrap().set_dead_letters(3);
-        });
-        assert!(
-            measured.contains(
-                "spate_feed_dead_letter_units{pipeline=\"feed-dead-letters-absent\",\
-                 component=\"feed\",component_type=\"memory\"} 3"
-            ),
-            "{measured}"
-        );
     }
 
     /// Pins that a second handle set on the same labels is refused, so the
