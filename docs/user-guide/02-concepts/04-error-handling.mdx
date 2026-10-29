@@ -68,10 +68,9 @@ process exits non-zero. A stalled job never reports success over a unit it did
 not read. A restart does not help, since the units sit in the dead-letter
 destination; fix what made them fail, then re-run the job with them.
 
-A job that runs until a shutdown, with no job location, does not end over its
-dead-letter destination and keeps reading past it. The runtime publishes the
-destination's depth as `spate_feed_dead_letter_units`, and
-[Monitoring](../05-deployment/monitoring.mdx) gives the alert on it.
+A job that runs until a shutdown, with no job location, never reads its
+dead-letter destination. Alert on that destination's depth in the feed's own
+monitoring, as [Monitoring](../05-deployment/monitoring.mdx) describes.
 
 :::note Connector specifics
 Re-running a stalled job:

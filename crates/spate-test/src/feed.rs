@@ -412,12 +412,6 @@ impl FeedScript {
     /// [`DeadLetters`](DepthOf::DeadLetters), the units
     /// [`dead_letter`](Self::dead_letter) moved as visible, all exact.
     ///
-    /// A running pipeline makes dead-letter reads of its own, at
-    /// startup and then every
-    /// [`dead_letter_read_interval`](spate_core::pipeline::RuntimeOptions::dead_letter_read_interval).
-    /// A test that scripts or counts the source's dead-letter reads sets that
-    /// option to `None`.
-    ///
     /// # Examples
     ///
     /// ```

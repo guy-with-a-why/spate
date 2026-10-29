@@ -541,12 +541,6 @@ error naming the record's offset.
 
 The Kafka feed registers no metric families of its own.
 
-`spate_feed_dead_letter_units` reads the dead-letter topic as the sum of its
-partitions' end offsets, so it counts every record ever written there, redriven
-or deleted by retention included, and never falls. Alert on a rise, such as
-`max by (pipeline) (delta(spate_feed_dead_letter_units[10m])) > 0`, rather than
-on a non-zero value.
-
 ## Related
 
 - [Feeds](../README.mdx) — the other feed backends.

@@ -137,10 +137,8 @@ comparison. Connecting logs the queue's retention, its default visibility
 timeout, `maxReceiveCount` and the dead-letter queue's retention.
 
 The checks run only when the feed connects. A redrive policy removed, or a
-dead-letter queue's retention shortened, while the pipeline runs goes
-unnoticed (see [Retention](#retention)). A dead-letter queue deleted while the
-pipeline runs fails the dead-letter depth read the pipeline makes once a
-minute, which logs a warning each time.
+dead-letter queue deleted or shortened, while the pipeline runs goes
+unnoticed (see [Retention](#retention)).
 
 ## Visibility and renewal
 
@@ -223,7 +221,7 @@ when it was first sent and kept when the message moves to the dead-letter
 queue. A unit deleted that way is lost, which INV-1 places outside its
 property (see [the invariants](../../../../INVARIANTS.md#inv-1)). A
 dead-letter queue deleted after the pipeline starts loses the units moved to
-it.
+it; nothing checks for it while the pipeline runs.
 
 ## Ending a bounded job
 
@@ -246,14 +244,14 @@ queue is tried again 15 seconds later. A read SQS refuses, such as for a missing
 permission, fails the job. The reads need `sqs:GetQueueAttributes` on both
 queues, which [the startup checks](#startup-checks) already need.
 
-The end check reads the dead-letter queue only after the window passes. A unit
-moved there earlier in the job and deleted at the end of the dead-letter queue's
-retention, counted from the unit's first send, leaves no trace, and the job ends
+The dead-letter queue is read only after the window passes. A unit moved there
+earlier in the job and deleted at the end of the dead-letter queue's retention,
+counted from the unit's first send, leaves no trace, and the job ends
 completed over it. Keep a bounded job shorter than the dead-letter queue's
-retention, and alert on the dead-letter queue's depth while the job runs, which
-each instance publishes as `spate_feed_dead_letter_units`
-([Metrics](../../../../METRICS.md#feed-spate_feed_)), whether or not the job
-names a `location`.
+retention, and alert on the dead-letter queue's
+`ApproximateNumberOfMessagesVisible` in CloudWatch: Spate does not see a
+message move there while a job runs, and a job with no `location` never reads
+the dead-letter queue at all.
 
 Give each bounded job a queue and a dead-letter queue of its own. A dead-letter
 queue that holds an earlier job's messages fails a later job as stalled, and a
@@ -344,8 +342,7 @@ batched the same way. A unit handed back at a stop costs one more visibility
 change. A worker that wants more units than it holds keeps one
 long poll open, so an idle worker sends a receive every `visibility / 3`
 seconds, at most every 20: three a minute at the default visibility, and
-thirty a minute at `6s`. Each worker also reads the dead-letter queue's depth
-once a minute, with one `GetQueueAttributes` request.
+thirty a minute at `6s`.
 
 ## Metrics
 

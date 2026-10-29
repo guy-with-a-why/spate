@@ -350,25 +350,24 @@ but a new connector must not.
 
 A source that reads a [work feed](user-guide/02-concepts/09-work-feed.mdx)
 reads it through the runtime, which records the calls that receive, renew,
-settle, hand back and publish units, and the feed's close, on any backend. The
-series carry `component="feed"` and the backend's key in the
-`feed:` section as `component_type`. Calls on a feed handed to the source
+settle, hand back and publish units, on any backend. The series carry
+`component="feed"` and the backend's key in the `feed:` section as
+`component_type`. Calls on a feed handed to the source
 directly, and on a handle kept after passing the feed to `Pipeline::feed`, are
 not recorded.
 
 | Metric | Type | Extra labels | Description |
 |---|---|---|---|
 | `spate_feed_units_received_total` | counter | | Deliveries the source received. A redelivery counts again. |
-| `spate_feed_held_units` | gauge | | Deliveries the source holds: received, and neither settled by an acknowledge, fail or hand-back the feed accepted nor answered `Gone`. Reads `0` once the feed closes. |
+| `spate_feed_held_units` | gauge | | Deliveries the source holds: received, and neither settled by an acknowledge, fail or hand-back the feed accepted nor answered `Gone`. |
 | `spate_feed_units_acknowledged_total` | counter | | Acknowledges the feed accepted. |
 | `spate_feed_units_failed_total` | counter | | Fails the feed accepted. Each returns the unit for redelivery or, at the feed's delivery cap, moves it to the dead-letter destination. |
 | `spate_feed_units_handed_back_total` | counter | | Hand-backs the feed accepted during a graceful stop. |
 | `spate_feed_renewals_total` | counter | | Renewals the feed accepted. |
 | `spate_feed_units_published_total` | counter | | Publishes the feed confirmed it stored, counted when the publisher first checks or awaits the confirmation. |
-| `spate_feed_errors_total` | counter | `op` (`receive`\|`renew`\|`acknowledge`\|`fail`\|`hand_back`\|`publish`\|`close`), `error_type` (`gone`\|`refused`\|`retryable`\|`fatal`) | Calls answered with an error, and publishes and closes whose confirmation settled with one. `error_type` is the feed's error kind, and the error's text is never a label. `op="renew",error_type="gone"` counts deliveries the feed took back while the source still read them, as when a lease lapses: the unit is read again from its start under a newer delivery, on this instance or another. |
-| `spate_feed_call_duration_seconds` | histogram | `op` | Time spent inside one call. A feed call never waits on I/O, so readings belong in the lowest bucket, and a heavier tail is a backend blocking the source's controller. |
+| `spate_feed_errors_total` | counter | `op` (`receive`\|`renew`\|`acknowledge`\|`fail`\|`hand_back`\|`publish`), `error_type` (`gone`\|`refused`\|`retryable`\|`fatal`) | Calls answered with an error, and publishes whose confirmation settled with one. `error_type` is the feed's error kind, and the error's text is never a label. `op="renew",error_type="gone"` counts deliveries the feed took back while the source still read them, as when a lease lapses: the unit is read again from its start under a newer delivery, on this instance or another. |
+| `spate_feed_call_duration_seconds` | histogram | `op` | Time spent inside one call. A feed call never waits on I/O, so readings belong in the lowest bucket, and a heavier tail is a backend blocking its caller. |
 | `spate_feed_publish_duration_seconds` | histogram | | Time from a publish to the first check or await that found its confirmation settled, either outcome. A publisher that checks on a schedule adds up to one interval of its own. |
-| `spate_feed_dead_letter_units` | gauge | | Units in the feed's dead-letter destination: the visible, delayed and in-flight counts of a depth read the runtime makes once a minute. Absent until the first read settles, and on a backend that cannot count. A failed read leaves the last reading in place. Every instance on a feed reads the same destination, so aggregate with `max`, not `sum`. A backend whose count never falls, because it counts every unit ever moved there, says so on its page. |
 
 ## End-to-end
 
@@ -408,11 +407,6 @@ Configured on the exporter, by name suffix or full name:
   average has read below 0.9 for a full 5 minutes.
 - `rate(spate_deser_records_dropped_total[5m]) > 0` — schema drift or poison
   messages being skipped.
-- `max by (pipeline) (spate_feed_dead_letter_units) > 0` — work units have
-  reached the feed's dead-letter destination and are not delivered again. A
-  bounded job ends stalled over them, and a job that runs until a shutdown
-  keeps running past them. On a backend whose count never falls, alert on a
-  rise instead.
 - `spate_sink_replica_healthy == 0` — replica down; sustained across all
   replicas of a shard means the shard channel will fill and pause the source.
 - `spate_sink_shard_healthy == 0` — no replica of the shard is circuit-closed;

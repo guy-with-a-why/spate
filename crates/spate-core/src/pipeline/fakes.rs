@@ -767,7 +767,6 @@ pub(crate) fn test_options() -> RuntimeOptions {
         blocked_retry: Duration::from_millis(1),
         event_poll_timeout: Duration::from_millis(5),
         version: "test".into(),
-        dead_letter_read_interval: Some(crate::feed::DEAD_LETTER_READ_INTERVAL),
     }
 }
 

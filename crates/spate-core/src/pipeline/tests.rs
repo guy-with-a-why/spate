@@ -2604,8 +2604,7 @@ fn the_source_learns_where_its_feed_came_from() {
 }
 
 /// Pins that the source reads through a feed the runtime counts, under the
-/// `feed` component and the backend's key, and that the runtime publishes
-/// the dead-letter depth it reads at startup.
+/// `feed` component and the backend's key.
 #[test]
 fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     use crate::feed::{Feed, Unit};
@@ -2615,12 +2614,8 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     let pipeline_name = cfg.pipeline.name.clone();
     let settings = crate::pipeline::metrics_settings(&cfg);
 
-    // One unit dead-lettered and one waiting, through calls the runtime does
-    // not see.
-    let backend = Arc::new(MemoryFeed::with_attempt_cap(std::num::NonZeroU32::MIN));
-    drop(backend.publish(Unit::new("poison", Vec::new())));
-    let poison = backend.receive(1).unwrap().remove(0);
-    backend.fail(poison.receipt, "unreadable").unwrap();
+    // One unit waiting, published through a call the runtime does not see.
+    let backend = Arc::new(MemoryFeed::new());
     drop(backend.publish(Unit::new("work", Vec::new())));
 
     let given = Arc::clone(&backend);
@@ -2655,9 +2650,6 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
         let line = format!("{}{value}", series(name));
         handle.render().lines().any(|l| l == line)
     };
-    wait_for("the dead-letter depth", Duration::from_secs(5), || {
-        reads("spate_feed_dead_letter_units", "1")
-    });
     assert!(reads("spate_feed_units_received_total", "1"));
     assert!(reads("spate_feed_units_acknowledged_total", "1"));
     assert!(reads("spate_feed_held_units", "0"));

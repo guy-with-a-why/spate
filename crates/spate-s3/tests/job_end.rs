@@ -14,7 +14,7 @@ use spate_core::feed::{
     Confirmation, Delivery, Depth, DepthOf, DepthReading, DepthReporter, Feed, FeedError,
     FeedErrorKind, FeedWaker, Receipt, Unit, depth_reading,
 };
-use spate_core::pipeline::{ExitReport, ExitState, RuntimeOptions};
+use spate_core::pipeline::{ExitReport, ExitState};
 use spate_test::{FeedScript, ScriptedFeed, SinkScript, WriteOutcome, scripted_feed, wait_until};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,15 +37,6 @@ const FINGERPRINT_KEY: &str = "jobs/backfill-1/fingerprint";
 const END_KEY: &str = "jobs/backfill-1/end";
 const RUN_A: &str = "run=0123456789abcdef0123456789abcdef\n";
 const RUN_B: &str = "run=fedcba9876543210fedcba9876543210\n";
-
-/// The runtime's options with its own dead-letter reads off, so every depth
-/// read a test counts or scripts is the end check's.
-fn options() -> RuntimeOptions {
-    RuntimeOptions {
-        dead_letter_read_interval: None,
-        ..test_options()
-    }
-}
 
 fn data_dir(dir: &tempfile::TempDir) -> PathBuf {
     let data = dir.path().join("data");
@@ -114,9 +105,9 @@ fn launch_job(
     };
     match stop_clock {
         Some(stop_clock) => {
-            launch_with_feed_on_clock(&yaml, options(), pre, feed, stop_clock, make_source)
+            launch_with_feed_on_clock(&yaml, test_options(), pre, feed, stop_clock, make_source)
         }
-        None => launch_with_feed(&yaml, options(), pre, feed, make_source),
+        None => launch_with_feed(&yaml, test_options(), pre, feed, make_source),
     }
 }
 
@@ -526,7 +517,7 @@ fn a_continuous_job_does_not_end_on_an_empty_feed() {
     let worker_clock = Arc::clone(&clock);
     let l = launch_with_feed(
         &yaml,
-        options(),
+        test_options(),
         |_| {},
         Arc::new(feed),
         move |source, _io| line_framer(source).with_clock(worker_clock),
@@ -563,7 +554,7 @@ fn a_settling_window_key_sets_the_fingerprint_wait() {
     let worker_clock = Arc::clone(&clock);
     let l = launch_with_feed(
         &yaml,
-        options(),
+        test_options(),
         |_| {},
         Arc::new(feed),
         move |source, _io| {
@@ -624,7 +615,7 @@ fn a_settling_window_without_a_location_is_refused() {
         .build();
     let l = launch_with_feed(
         &yaml,
-        options(),
+        test_options(),
         |_| {},
         Arc::new(feed),
         |source, _io| line_framer(source),
@@ -1098,7 +1089,7 @@ fn launch_solo(data: &Path, extra: &str, clock: &Arc<TestClock>) -> Launched {
     let clock = Arc::clone(clock);
     launch_customized(
         &yaml,
-        options(),
+        test_options(),
         |_| {},
         move |source, _io| line_framer(source).with_clock(clock),
     )
@@ -1162,7 +1153,7 @@ fn a_solo_run_given_a_feed_in_code_keeps_running() {
         .build();
     let l = launch_with_feed(
         &yaml,
-        options(),
+        test_options(),
         |_| {},
         Arc::new(feed.clone()),
         |source, _io| line_framer(source),

@@ -9,9 +9,7 @@ use crate::checkpoint::Checkpointer;
 use crate::clock::{Clock, SystemClock};
 use crate::config::{MetricsExporter, PinningMode, PipelineConfig};
 use crate::feed::memory::MemoryFeed;
-use crate::feed::{
-    DEAD_LETTER_READ_INTERVAL, DeadLetterSampler, Feed, FeedOrigin, MeteredFeed, STOP_RESERVE,
-};
+use crate::feed::{Feed, FeedOrigin, MeteredFeed, STOP_RESERVE};
 use crate::metrics::{
     self, BackpressureMetrics, CheckpointMetrics, ComponentLabels, E2eBasis, Exporter, FeedMetrics,
     InflightBudgetMetrics, IoBusySampler, IoRuntimeMetrics, Meter, MetricRole, MetricsHandle,
@@ -46,10 +44,6 @@ pub struct RuntimeOptions {
     pub event_poll_timeout: Duration,
     /// Version string published on `spate_pipeline_info`.
     pub version: String,
-    /// How often to read the depth of the feed's dead-letter destination for
-    /// `spate_feed_dead_letter_units`, starting at startup. `None` makes no
-    /// such read, so every depth read the feed answers is its source's.
-    pub dead_letter_read_interval: Option<Duration>,
 }
 
 impl Default for RuntimeOptions {
@@ -62,7 +56,6 @@ impl Default for RuntimeOptions {
             blocked_retry: Duration::from_millis(2),
             event_poll_timeout: Duration::from_millis(50),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            dead_letter_read_interval: Some(DEAD_LETTER_READ_INTERVAL),
         }
     }
 }
@@ -293,10 +286,10 @@ impl<S: Source + 'static> PipelineRuntime<S> {
     }
 
     /// Read the commit tick, the fast-commit window, the stall check, the
-    /// idle flush, the health probe, the feed's dead-letter reads and its call
-    /// timings on `clock`, so a test moves them by hand. Every drain deadline is computed on the stop clock set by
-    /// `with_stop_clock`, and the sink pool counts its share down on its own
-    /// tokio clock.
+    /// idle flush, the health probe and the feed's call timings on `clock`, so
+    /// a test moves them by hand. Every drain deadline is computed on the stop
+    /// clock set by `with_stop_clock`, and the sink pool counts its share down
+    /// on its own tokio clock.
     #[cfg(any(test, feature = "testing"))]
     #[doc(hidden)]
     #[must_use]
@@ -761,10 +754,6 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             SystemClock.now(),
             metrics::io_busy_reading(&io_runtime_metrics).0,
         );
-        let mut dead_letters = self
-            .options
-            .dead_letter_read_interval
-            .map(|interval| DeadLetterSampler::new(interval, self.clock.now()));
 
         let (mut state, final_watermarks, close_by) = loop {
             let (busy, workers) = metrics::io_busy_reading(&io_runtime_metrics);
@@ -776,9 +765,6 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                 workers,
                 &pipeline_name,
             );
-            if let (Some(feed), Some(sampler)) = (&kept_feed, &mut dead_letters) {
-                sampler.sample(feed, self.clock.now());
-            }
             match to_main_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(ControllerSignal::LanesDrained { sink_deadline }) => {
                     for (i, h) in driver_handles.drain(..).enumerate() {
