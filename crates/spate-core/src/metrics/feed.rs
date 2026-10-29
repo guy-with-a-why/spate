@@ -12,6 +12,7 @@ use super::names;
 use super::ownership::{SeriesClaim, series_key};
 use crate::feed::{FeedError, FeedErrorKind};
 use metrics::{Counter, Gauge, Histogram};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// A feed call, as the `op` label names it.
@@ -64,6 +65,7 @@ fn kind_index(kind: FeedErrorKind) -> usize {
 /// Feed handles (`spate_feed_*`).
 #[derive(Debug)]
 pub(crate) struct FeedMetrics {
+    labels: ComponentLabels,
     received: Counter,
     acknowledged: Counter,
     failed: Counter,
@@ -74,6 +76,9 @@ pub(crate) struct FeedMetrics {
     call_duration: [Histogram; FeedOp::ALL.len()],
     publish_duration: Histogram,
     held_units: Gauge,
+    // Registered by the first reading, so the series is absent until a depth
+    // has been measured rather than reading as an empty destination.
+    dead_letter_units: OnceLock<Gauge>,
     _claim: SeriesClaim,
 }
 
@@ -89,6 +94,7 @@ impl FeedMetrics {
         let held_units = labels.gauge(names::FEED_HELD_UNITS);
         held_units.set(0.0);
         Ok(FeedMetrics {
+            labels: labels.clone(),
             received: labels.counter(names::FEED_UNITS_RECEIVED_TOTAL),
             acknowledged: labels.counter(names::FEED_UNITS_ACKNOWLEDGED_TOTAL),
             failed: labels.counter(names::FEED_UNITS_FAILED_TOTAL),
@@ -111,6 +117,7 @@ impl FeedMetrics {
             }),
             publish_duration: labels.histogram(names::FEED_PUBLISH_DURATION_SECONDS),
             held_units,
+            dead_letter_units: OnceLock::new(),
             _claim: claim,
         })
     }
@@ -123,6 +130,12 @@ impl FeedMetrics {
     /// The source let go of one delivery it held.
     pub(crate) fn released(&self) {
         self.held_units.decrement(1.0);
+    }
+
+    pub(crate) fn set_dead_letters(&self, units: u64) {
+        self.dead_letter_units
+            .get_or_init(|| self.labels.gauge(names::FEED_DEAD_LETTER_UNITS))
+            .set(units as f64);
     }
 
     pub(crate) fn acknowledged(&self) {
@@ -173,7 +186,7 @@ mod tests {
     }
 
     /// Pins that a second handle set on the same labels is refused, so the
-    /// held gauge has one owner (INV-10).
+    /// held and dead-letter gauges have one owner (INV-10).
     #[test]
     fn a_second_feed_handle_set_is_refused() {
         let labels = ComponentLabels::new("feed-duplicate", "feed", "memory");
