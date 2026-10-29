@@ -16,8 +16,9 @@ pub(crate) struct S3Metrics {
     /// pipeline.
     pub(crate) objects_completed: Counter,
     /// Objects not yet completed across this worker's currently-held
-    /// units, a cut object counting once per range (rises when a lane opens,
-    /// falls per completed object, settles when the lane closes).
+    /// units, a cut object counting once per range (rises by the objects a
+    /// lane reads when it opens, falls per completed object, settles when the
+    /// lane closes).
     pub(crate) objects_remaining: Gauge,
     /// Bytes read from the store (as stored, pre-decompression).
     pub(crate) bytes_read: Counter,
@@ -33,8 +34,8 @@ pub(crate) struct S3Metrics {
     /// Of those, the keys acknowledged at the re-enqueue cap without a
     /// re-enqueue.
     pub(crate) overwrites_dropped: Counter,
-    /// Objects that poisoned their split, by bounded reason, with one
-    /// pre-registered handle per [`PoisonKind`].
+    /// Objects, or byte ranges of one, that failed their unit, by bounded
+    /// reason, with one pre-registered handle per [`PoisonKind`].
     objects_failed_not_found: Counter,
     objects_failed_etag_drift: Counter,
     objects_failed_undecodable: Counter,

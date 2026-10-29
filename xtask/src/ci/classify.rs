@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use super::graph::Graph;
-use super::outputs::{Lane, Outputs, Shard};
+use super::outputs::{Lane, Outputs, Shard, StoreLane};
 
 /// The webhook event a run was started from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +231,23 @@ pub(crate) fn is_release_tooling(path: &str) -> bool {
     )
 }
 
+/// The lanes of each multi-lane service that need a CI job beyond the one
+/// covering its primary lane.
+#[derive(Debug, Default)]
+pub(crate) struct ExtraLanes {
+    /// ClickHouse server lanes, by name.
+    pub(crate) clickhouse: Vec<String>,
+    /// S3 store lanes, each with the tests its store supports.
+    pub(crate) s3: Vec<StoreLane>,
+}
+
+/// The container suites that boot an S3 store.
+const S3_STORE_SUITES: [&str; 3] = ["spate-kafka", "spate-s3", "spate-test-support"];
+
+/// The suites whose selection schedules the extra S3 store lanes. The shared
+/// helpers' suite is also selected by an image bump that boots no store.
+const S3_LANE_SUITES: [&str; 2] = ["spate-kafka", "spate-s3"];
+
 /// Classify a change. Pure: no git, no environment, no filesystem beyond the
 /// graph handed in.
 pub(crate) fn classify(
@@ -238,7 +255,7 @@ pub(crate) fn classify(
     event: Event,
     ctx: &Context,
     graph: &Graph,
-    extra_clickhouse_lanes: &[String],
+    extra_lanes: &ExtraLanes,
 ) -> Outputs {
     let mut out = Outputs::default();
     let mut bench_pkgs: BTreeSet<String> = BTreeSet::new();
@@ -296,12 +313,11 @@ pub(crate) fn classify(
                 image_suites.extend(graph.container_suites_for("spate-kafka"));
                 out.container_pkgs.extend(image_suites.iter().cloned());
             }
-            // The S3 store the spate-s3 suites run against, and the queue the
-            // shared helpers start. The Kafka feed's notification suite boots
-            // it beside the broker.
-            if glob(path, "ci/rustfs/*") {
-                image_suites
-                    .extend(["spate-kafka", "spate-s3", "spate-test-support"].map(String::from));
+            // The S3 store lanes the spate-s3 suites run against, and the
+            // store the shared helpers start. The Kafka feed's notification
+            // suite boots one beside the broker.
+            if glob(path, "ci/s3/*") {
+                image_suites.extend(S3_STORE_SUITES.map(String::from));
                 out.container_pkgs.extend(image_suites.iter().cloned());
             }
             // The queue the SQS feed's suite runs against, and the shared
@@ -442,10 +458,17 @@ pub(crate) fn classify(
     }
 
     if out.container_pkgs.contains("spate-clickhouse") {
-        out.clickhouse_lanes = extra_clickhouse_lanes
+        out.clickhouse_lanes = extra_lanes
+            .clickhouse
             .iter()
             .map(|l| Lane { lane: l.clone() })
             .collect();
+    }
+    if S3_LANE_SUITES
+        .iter()
+        .any(|suite| out.container_pkgs.contains(*suite))
+    {
+        out.s3_lanes.clone_from(&extra_lanes.s3);
     }
 
     out
@@ -490,6 +513,12 @@ fn apply_deferrals(
 mod tests {
     use super::*;
 
+    /// No extra lanes for any service.
+    const NONE: &ExtraLanes = &ExtraLanes {
+        clickhouse: Vec::new(),
+        s3: Vec::new(),
+    };
+
     fn graph() -> Graph {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -504,7 +533,7 @@ mod tests {
             Event::PullRequest,
             &Context::default(),
             &graph(),
-            &[],
+            NONE,
         )
     }
 
@@ -805,7 +834,7 @@ mod tests {
             author: "dependabot[bot]".into(),
         };
         let bump = vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()];
-        let out = classify(&bump, Event::PullRequest, &ctx, &graph(), &[]);
+        let out = classify(&bump, Event::PullRequest, &ctx, &graph(), NONE);
         assert!(out.bench);
         assert!(out.container_pkgs.is_empty());
     }
@@ -892,13 +921,13 @@ mod tests {
         };
         let lock = vec!["Cargo.lock".to_string()];
         assert!(
-            classify(&lock, Event::PullRequest, &ctx, &graph(), &[])
+            classify(&lock, Event::PullRequest, &ctx, &graph(), NONE)
                 .container_pkgs
                 .is_empty()
         );
 
         let image = vec!["ci/clickhouse/lts/Dockerfile".to_string()];
-        let out = classify(&image, Event::PullRequest, &ctx, &graph(), &[]);
+        let out = classify(&image, Event::PullRequest, &ctx, &graph(), NONE);
         assert_eq!(suites(&out), ["spate", "spate-clickhouse"]);
     }
 
@@ -915,7 +944,7 @@ mod tests {
             author: "dependabot[bot]".into(),
         };
         let image = vec!["ci/debian/trixie/Dockerfile".to_string()];
-        let out = classify(&image, Event::PullRequest, &ctx, &graph(), &[]);
+        let out = classify(&image, Event::PullRequest, &ctx, &graph(), NONE);
         assert_eq!(suites(&out), ["spate-kafka"]);
     }
 
@@ -932,14 +961,14 @@ mod tests {
             author: "dependabot[bot]".into(),
         };
         let image = vec!["ci/rust/stable/Dockerfile".to_string()];
-        let out = classify(&image, Event::PullRequest, &ctx, &graph(), &[]);
+        let out = classify(&image, Event::PullRequest, &ctx, &graph(), NONE);
         assert_eq!(suites(&out), ["spate-kafka"]);
 
         let both = vec![
             "examples/docker/Dockerfile".to_string(),
             "ci/rust/stable/Dockerfile".to_string(),
         ];
-        let out = classify(&both, Event::PullRequest, &ctx, &graph(), &[]);
+        let out = classify(&both, Event::PullRequest, &ctx, &graph(), NONE);
         assert_eq!(suites(&out), ["spate-kafka"]);
     }
 
@@ -956,13 +985,13 @@ mod tests {
             author: "dependabot[bot]".into(),
         };
         let image = vec!["ci/kafka/stable/Dockerfile".to_string()];
-        let out = classify(&image, Event::PullRequest, &ctx, &graph(), &[]);
+        let out = classify(&image, Event::PullRequest, &ctx, &graph(), NONE);
         assert_eq!(suites(&out), ["spate", "spate-kafka"]);
     }
 
-    /// A RustFS bump selects the suites that boot RustFS and an ElasticMQ bump
-    /// the SQS feed's suite and the shared helpers' suite, on a Dependabot
-    /// pull request too.
+    /// A bump of any S3 store lane, or a change of the primary store, selects
+    /// the suites that boot an S3 store, and an ElasticMQ bump the SQS feed's
+    /// suite and the shared helpers' suite, on a Dependabot pull request too.
     #[test]
     fn a_test_store_image_bump_selects_the_suites_that_boot_it() {
         let ctx = Context {
@@ -970,7 +999,15 @@ mod tests {
         };
         for (image, expected) in [
             (
-                "ci/rustfs/stable/Dockerfile",
+                "ci/s3/rustfs/Dockerfile",
+                &["spate-kafka", "spate-s3", "spate-test-support"][..],
+            ),
+            (
+                "ci/s3/other/Dockerfile",
+                &["spate-kafka", "spate-s3", "spate-test-support"][..],
+            ),
+            (
+                "ci/s3/PRIMARY",
                 &["spate-kafka", "spate-s3", "spate-test-support"][..],
             ),
             (
@@ -980,7 +1017,7 @@ mod tests {
         ] {
             assert_eq!(suites(&run(&[image])), expected, "{image}");
             let image = vec![image.to_string()];
-            let out = classify(&image, Event::PullRequest, &ctx, &graph(), &[]);
+            let out = classify(&image, Event::PullRequest, &ctx, &graph(), NONE);
             assert_eq!(suites(&out), expected, "{image:?}");
         }
     }
@@ -991,7 +1028,7 @@ mod tests {
             author: "spate-release[bot]".into(),
         };
         let paths = vec!["Cargo.lock".to_string()];
-        let out = classify(&paths, Event::PullRequest, &ctx, &graph(), &[]);
+        let out = classify(&paths, Event::PullRequest, &ctx, &graph(), NONE);
         assert!(out.container_pkgs.is_empty());
         assert!(out.semver_pkgs.is_empty());
     }
@@ -1002,13 +1039,13 @@ mod tests {
             author: "dependabot[bot]".into(),
         };
         let paths = vec!["Cargo.lock".to_string()];
-        let out = classify(&paths, Event::MergeGroup, &ctx, &graph(), &[]);
+        let out = classify(&paths, Event::MergeGroup, &ctx, &graph(), NONE);
         assert!(!out.container_pkgs.is_empty());
     }
 
     #[test]
     fn force_all_selects_everything() {
-        let out = classify(&[], Event::ForceAll, &Context::default(), &graph(), &[]);
+        let out = classify(&[], Event::ForceAll, &Context::default(), &graph(), NONE);
         assert!(
             out.rust
                 && out.site
@@ -1068,7 +1105,7 @@ mod tests {
                 Event::MergeGroup,
                 &Context::default(),
                 &graph(),
-                &[],
+                NONE,
             )
         };
         assert!(queue("crates/spate-core/src/lib.rs").macos);
@@ -1086,7 +1123,7 @@ mod tests {
             author: "dependabot[bot]".into(),
         };
         let paths = vec!["Cargo.lock".to_string()];
-        let out = classify(&paths, Event::PullRequest, &ctx, &graph(), &[]);
+        let out = classify(&paths, Event::PullRequest, &ctx, &graph(), NONE);
         assert!(out.macos);
         assert!(out.container_pkgs.is_empty());
     }
@@ -1103,7 +1140,10 @@ mod tests {
 
     #[test]
     fn clickhouse_lanes_follow_the_suite() {
-        let lanes = ["lts-previous".to_string()];
+        let lanes = ExtraLanes {
+            clickhouse: vec!["lts-previous".to_string()],
+            s3: Vec::new(),
+        };
         let paths = vec!["crates/spate-clickhouse/src/lib.rs".to_string()];
         let out = classify(
             &paths,
@@ -1123,6 +1163,80 @@ mod tests {
             &lanes,
         );
         assert!(out.clickhouse_lanes.is_empty());
+    }
+
+    /// An ElasticMQ image bump boots no S3 store, so it schedules no S3 store
+    /// lane.
+    #[test]
+    fn an_elasticmq_bump_runs_no_s3_store_lane() {
+        let lanes = ExtraLanes {
+            clickhouse: Vec::new(),
+            s3: vec![StoreLane::new("other", &[])],
+        };
+        for author in ["", "dependabot[bot]"] {
+            let ctx = Context {
+                author: author.into(),
+            };
+            let out = classify(
+                &["ci/elasticmq/Dockerfile".to_string()],
+                Event::PullRequest,
+                &ctx,
+                &graph(),
+                &lanes,
+            );
+            assert!(out.s3_lanes.is_empty(), "{author}: {:?}", out.s3_lanes);
+        }
+    }
+
+    /// The extra S3 store lanes run whenever a suite that boots a store runs,
+    /// on a Dependabot store bump too, and never on a change no such suite
+    /// reaches.
+    #[test]
+    fn s3_lanes_follow_the_suites_that_boot_a_store() {
+        let lanes = ExtraLanes {
+            clickhouse: vec!["lts-previous".to_string()],
+            s3: vec![StoreLane::new("other", &[])],
+        };
+        let classified = |path: &str, author: &str| {
+            let ctx = Context {
+                author: author.into(),
+            };
+            let out = classify(
+                &[path.to_string()],
+                Event::PullRequest,
+                &ctx,
+                &graph(),
+                &lanes,
+            );
+            let s3: Vec<String> = out.s3_lanes.iter().map(|l| l.lane.clone()).collect();
+            let clickhouse: Vec<String> = out
+                .clickhouse_lanes
+                .iter()
+                .map(|l| l.lane.clone())
+                .collect();
+            (s3, clickhouse)
+        };
+        let s3_only = (vec!["other".to_string()], Vec::new());
+        for path in [
+            "crates/spate-s3/src/lib.rs",
+            "crates/spate-kafka/src/feed/consumer.rs",
+        ] {
+            assert_eq!(classified(path, ""), s3_only, "{path}");
+        }
+        // The shared helpers reach every container suite, ClickHouse's too.
+        assert_eq!(classified("test-support/src/s3.rs", "").0, s3_only.0);
+        assert_eq!(
+            classified("ci/s3/other/Dockerfile", "dependabot[bot]"),
+            s3_only
+        );
+        assert_eq!(
+            classified("crates/spate-clickhouse/src/lib.rs", ""),
+            (Vec::new(), vec!["lts-previous".to_string()])
+        );
+        assert_eq!(
+            classified("crates/spate-sqs/src/lib.rs", ""),
+            (Vec::new(), Vec::new())
+        );
     }
 
     /// The release's own tooling and the selector that gates it select the
@@ -1173,7 +1287,7 @@ mod tests {
             author: "dependabot[bot]".into(),
         };
         let paths = vec![".github/actions/setup-rust/action.yml".to_string()];
-        let out = classify(&paths, Event::PullRequest, &ctx, &graph(), &[]);
+        let out = classify(&paths, Event::PullRequest, &ctx, &graph(), NONE);
         assert!(out.release_tooling);
     }
 

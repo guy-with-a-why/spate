@@ -7,7 +7,8 @@ you care to run.
 
 The pipeline's `feed:` section names the feed the source reads, and a pipeline
 with none fails to start. The source reads work units from the feed, each
-naming one object or one byte range of one object, and storage notifications,
+naming one object, one byte range of one object, or several objects read whole
+in turn on one lane, and storage notifications,
 one part per non-empty created object. It reads a large object in byte ranges.
 It acknowledges each finished unit to the feed, and every read is pinned to the
 object's ETag, so an object rewritten under a running job is detected rather
@@ -34,8 +35,10 @@ facade with the `s3` feature.
 - **Backpressure runs through bounded ranged GETs.** For an object with an
   ETag, the source reads GETs sized by `prefetch_bytes` (8 MiB by default) and
   buffers each GET in full before handing its chunks on, so a slow sink stalls
-  each read in progress with no request in flight. An object of at most
-  `prefetch_bytes` arrives in one GET and is held in memory whole, unless
+  each read in progress with no request in flight. While a lane hands on one
+  window, the source reads the next, so a lane holds three windows when each
+  spans at least four chunks, as at the defaults, and more when windows are
+  shorter. An object of at most `prefetch_bytes` arrives in one GET and is held in memory whole, unless
   `split_target_bytes` is set below its size and the object is cut into byte
   ranges. An object with no ETag is read in one streamed GET, and that
   response stays open while the sink is slow.

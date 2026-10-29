@@ -10,6 +10,7 @@ use super::{
     Confirmation, Delivery, DepthOf, DepthReading, Feed, FeedError, FeedErrorKind, FeedWaker,
     Receipt, Unit,
 };
+use crate::clock::{SharedClock, Stopwatch};
 use crate::metrics::{FeedMetrics, FeedOp, Meter};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -27,16 +28,23 @@ pub(crate) const DEAD_LETTER_READ_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) struct MeteredFeed {
     inner: Arc<dyn Feed>,
     metrics: Arc<FeedMetrics>,
+    clock: SharedClock,
     // Tracked by receipt so a second answer about one delivery, such as a
     // Gone renewal after an accepted acknowledge, moves the gauge once.
     held: Mutex<HashSet<Receipt>>,
 }
 
 impl MeteredFeed {
-    pub(crate) fn new(inner: Arc<dyn Feed>, metrics: FeedMetrics) -> MeteredFeed {
+    /// Wrap `inner`, timing its calls on `clock`.
+    pub(crate) fn new(
+        inner: Arc<dyn Feed>,
+        metrics: FeedMetrics,
+        clock: SharedClock,
+    ) -> MeteredFeed {
         MeteredFeed {
             inner,
             metrics: Arc::new(metrics),
+            clock,
             held: Mutex::new(HashSet::new()),
         }
     }
@@ -54,9 +62,9 @@ impl MeteredFeed {
     }
 
     fn timed<T>(&self, op: FeedOp, call: impl FnOnce() -> T) -> T {
-        let started = Instant::now();
+        let watch = Stopwatch::start(&*self.clock);
         let out = call();
-        self.metrics.call(op, started.elapsed());
+        self.metrics.call(op, watch.elapsed(&*self.clock));
         out
     }
 
@@ -142,10 +150,13 @@ impl Feed for MeteredFeed {
     }
 
     fn publish(&self, unit: Unit) -> Confirmation {
-        let started = Instant::now();
+        let watch = Stopwatch::start(&*self.clock);
         let confirmation = self.timed(FeedOp::Publish, || self.inner.publish(unit));
         let metrics = Arc::clone(&self.metrics);
-        confirmation.on_settle(move |outcome| metrics.publish_settled(outcome, started.elapsed()))
+        let clock = Arc::clone(&self.clock);
+        confirmation.on_settle(move |outcome| {
+            metrics.publish_settled(outcome, watch.elapsed(&*clock));
+        })
     }
 
     fn read_depth(&self, of: DepthOf) -> Option<DepthReading> {
@@ -236,6 +247,7 @@ impl DeadLetterSampler {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
     use crate::feed::{Confirmer, Depth, DepthReporter, confirmation, depth_reading};
     use crate::metrics::ComponentLabels;
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
@@ -364,6 +376,7 @@ mod tests {
     struct Rig {
         feed: MeteredFeed,
         fake: Arc<Fake>,
+        clock: Arc<TestClock>,
         recorder: PrometheusRecorder,
         pipeline: &'static str,
     }
@@ -372,14 +385,20 @@ mod tests {
         fn new(pipeline: &'static str, fake: Fake) -> Rig {
             let recorder = PrometheusBuilder::new().build_recorder();
             let fake = Arc::new(fake);
+            let clock = TestClock::frozen();
             let feed = metrics::with_local_recorder(&recorder, || {
                 let labels = ComponentLabels::new(pipeline, "feed", "fake");
                 let metrics = FeedMetrics::try_new(&labels).expect("free series");
-                MeteredFeed::new(Arc::clone(&fake) as Arc<dyn Feed>, metrics)
+                MeteredFeed::new(
+                    Arc::clone(&fake) as Arc<dyn Feed>,
+                    metrics,
+                    Arc::clone(&clock) as SharedClock,
+                )
             });
             Rig {
                 feed,
                 fake,
+                clock,
                 recorder,
                 pipeline,
             }
@@ -573,8 +592,8 @@ mod tests {
     }
 
     /// Pins that a publish is counted once, by outcome, when a check or an
-    /// await first finds its confirmation settled, and that the caller sees
-    /// the backend's outcome.
+    /// await first finds its confirmation settled, timed on the feed's clock,
+    /// and that the caller sees the backend's outcome.
     #[test]
     fn a_publish_is_counted_when_its_confirmation_settles() {
         let rig = Rig::new("metered-publish", Fake::default());
@@ -584,10 +603,15 @@ mod tests {
             rig.value("spate_feed_publish_duration_seconds_count", ""),
             Some(0.0)
         );
+        rig.clock.advance(Duration::from_secs(3));
         rig.fake.take_confirmer().confirm();
         assert!(matches!(checked.try_outcome(), Some(Ok(()))));
         assert!(matches!(checked.try_outcome(), Some(Ok(()))));
         assert_eq!(rig.counter("spate_feed_units_published_total"), 1.0);
+        assert_eq!(
+            rig.value("spate_feed_publish_duration_seconds_sum", ""),
+            Some(3.0)
+        );
 
         let awaited = rig.feed.publish(Unit::new("b", Vec::new()));
         rig.fake

@@ -2,15 +2,15 @@
 //!
 //! Four tasks on the I/O runtime do the queue's I/O. The receive task long
 //! polls while the reader wants more units than are buffered. The renewal
-//! task sends each hand-back as it is queued, and extends, every third of
-//! the visibility period, each unit handed out or renewed since the last
-//! extension, and each unit still buffered when the reader has called the
-//! feed since then; from a stop until the close, it extends every unit
-//! handed out. The settle task sends deletes and fails, and the publish task
-//! sends publishes, each in batches of up to ten. A close adds a task that
-//! settles its confirmation. The [`Feed`] methods only lock the shared
-//! state, change it and signal a task or spawn one, so none of them waits
-//! (INV-2).
+//! task sends each hand-back as it is queued, spending at most one renewal
+//! period at a time on them, and extends, every third of the visibility
+//! period, each unit handed out or renewed since the last extension, and
+//! each unit still buffered when the reader has called the feed since then;
+//! from a stop until the close, it extends every unit handed out. The settle
+//! task sends deletes and fails, and the publish task sends publishes, each
+//! in batches of up to ten. A close adds a task that settles its
+//! confirmation. The [`Feed`] methods only lock the shared state, change it
+//! and signal a task or spawn one, so none of them waits (INV-2).
 //!
 //! # The 12-hour hold
 //!
@@ -411,8 +411,8 @@ impl SqsFeed {
     /// [`SqsError::Config`] for a section the feed cannot read, a
     /// `queue_url` ending in `.fifo` and a `settling_window` below one
     /// minute among them.
-    /// [`SqsError::Refused`] when SQS refuses the credentials or the queue,
-    /// and for a queue the feed cannot dead-letter from: one whose ARN names
+    /// [`SqsError::Refused`] when SQS refuses the credentials, the queue or a
+    /// request no retry can fix, and for a queue the feed cannot dead-letter from: one whose ARN names
     /// a FIFO queue, one with no redrive policy or one the feed cannot read,
     /// or one whose dead-letter queue cannot be read or keeps messages no
     /// longer than the queue does. Also when the queue or its dead-letter
@@ -1146,14 +1146,17 @@ fn held_from(m: Received, sent_at: Instant, hold_end: Instant, visibility: Durat
     }
 }
 
-/// Sends each hand-back as it is queued. Every renewal period, extends each
-/// held unit marked since the last tick, and each buffered unit when the
-/// reader was active since the last tick; once the worker stops, every held
-/// unit.
+/// Sends each hand-back as it is queued, at most one renewal period at a
+/// time, and a tick's extensions before its hand-backs. Every renewal
+/// period, extends each held unit marked since the last tick, and each
+/// buffered unit when the reader was active since the last tick; once the
+/// worker stops, every held unit. A tick's batches are extended together,
+/// each bounded as [`extend_chunk`] says, and a batch whose call fails with
+/// a renewal period or less left is sent once more at once.
 ///
 /// Hand-backs and extensions go out from this one task, so a unit is never
-/// handed back while an extension of it is in flight, and is not extended
-/// after its hand-back.
+/// handed back while an extension of it is in flight from this task, and is
+/// not extended after its hand-back.
 async fn renewal_task(shared: Arc<Shared>) {
     let settings = shared.settings;
     // No tick at start: a unit received before the first one still has its
@@ -1171,10 +1174,12 @@ async fn renewal_task(shared: Arc<Shared>) {
             })
             .await
         };
-        if send_hand_backs(&shared).await.is_err() {
-            return;
-        }
+        // A tick's extensions go before the hand-backs, so a slow hand-back
+        // delays them by at most the one pass already running.
         if !ticked {
+            if send_hand_backs(&shared).await.is_err() {
+                return;
+            }
             continue;
         }
         let now = Instant::now();
@@ -1204,90 +1209,177 @@ async fn renewal_task(shared: Arc<Shared>) {
                 .collect()
         };
         due.sort_by_key(|(receipt, _, _)| *receipt);
-        for chunk in due.chunks(BATCH_ENTRIES) {
-            // Re-read: a unit handed back or settled while an earlier chunk
-            // was in flight is extended no more, and a stop that came in
-            // the meantime bounds the calls left.
-            let (chunk, within): (Vec<&(u64, String, Duration)>, _) = {
-                let st = shared.lock();
-                (
-                    chunk
-                        .iter()
-                        .filter(|(receipt, _, _)| st.held.contains_key(receipt))
-                        .collect(),
-                    st.stopping.then_some(STOP_EXTENSION_BOUND),
-                )
-            };
-            if chunk.is_empty() {
-                continue;
-            }
-            let entries = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, (_, handle, ext))| VisibilityEntry {
-                    id: i.to_string(),
-                    handle: handle.clone(),
-                    // At most 12 h, so the cast cannot truncate.
-                    seconds: ext.as_secs() as i32,
+        // The tick's chunks go out together, so a slow call takes no time
+        // from the others. Hand-backs wait for every call in flight.
+        // A batch sent once more goes as soon as its own call fails, since
+        // its deadline does not wait for the slowest batch of the tick.
+        join_all(
+            due.chunks(BATCH_ENTRIES)
+                .map(|chunk| {
+                    let shared = &shared;
+                    async move {
+                        if extend_chunk(shared, chunk, true).await == Extended::Again {
+                            extend_chunk(shared, chunk, false).await;
+                        }
+                    }
                 })
-                .collect();
-            let sent_at = Instant::now();
-            match shared.queue.change_visibility_batch(entries, within).await {
-                Ok(outcome) => {
-                    let mut st = shared.lock();
-                    for (i, (receipt, _, ext)) in chunk.iter().enumerate() {
-                        let Some(h) = st.held.get_mut(receipt) else {
-                            continue;
-                        };
-                        match entry_result(&outcome, i) {
-                            // `ext` was cut to the hold at the tick, before
-                            // the calls for earlier chunks ran.
-                            Some(Ok(())) => h.deadline = (sent_at + *ext).min(h.hold_end),
-                            Some(Err(failure))
-                                if code_is(&failure.code, "ReceiptHandleIsInvalid")
-                                    || code_is(&failure.code, "MessageNotInflight") =>
-                            {
-                                h.gone = true;
-                            }
-                            // It lapses at its own deadline.
-                            Some(Err(failure)) => tracing::debug!(
-                                code = %failure.code,
-                                "SQS refused to extend a held unit"
-                            ),
-                            None => {}
-                        }
-                    }
-                }
-                Err(e) if e.class == Class::Fatal => {
-                    shared.set_fatal(&e);
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e.message, "extending held units failed");
-                    // Marked again, so the next tick tries them with a fresh
-                    // extension.
-                    let mut st = shared.lock();
-                    for (receipt, _, _) in &chunk {
-                        if let Some(h) = st.held.get_mut(receipt) {
-                            h.marked = true;
-                        }
-                    }
-                }
-            }
-            if send_hand_backs(&shared).await.is_err() {
-                return;
-            }
+                .collect(),
+        )
+        .await;
+        // `Err` too once a call failed Fatal.
+        if send_hand_backs(&shared).await.is_err() {
+            return;
         }
     }
 }
 
+/// What became of one batch's extension call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Extended {
+    /// Answered, failed and marked for the next tick, or failed Fatal.
+    Done,
+    /// Failed with one renewal period or less left, to send once more now.
+    Again,
+}
+
+/// Extend one batch of up to ten held units. The call is given up after one
+/// renewal period, or half the time left to the batch's earliest deadline if
+/// that is shorter, so a call given up leaves the other half for one more;
+/// once the worker stops, after [`STOP_EXTENSION_BOUND`]. `Again` only when
+/// `once_more` is set.
+async fn extend_chunk(
+    shared: &Shared,
+    chunk: &[(u64, String, Duration)],
+    once_more: bool,
+) -> Extended {
+    let settings = shared.settings;
+    // Re-read: a unit handed back or settled since the tick is extended no
+    // more, and a stop that came in the meantime bounds the call.
+    let (chunk, earliest, within) = {
+        let st = shared.lock();
+        let chunk: Vec<&(u64, String, Duration)> = chunk
+            .iter()
+            .filter(|(receipt, _, _)| st.held.contains_key(receipt))
+            .collect();
+        let earliest = chunk
+            .iter()
+            .filter_map(|(receipt, _, _)| st.held.get(receipt))
+            .map(|h| h.deadline)
+            .min();
+        let within = if st.stopping {
+            STOP_EXTENSION_BOUND
+        } else {
+            let left = earliest.map_or(Duration::ZERO, |d| d - Instant::now());
+            // At most a period, so a buffered unit keeps the period
+            // `receive` asks of it.
+            settings.period.min(left / 2)
+        };
+        (chunk, earliest, within)
+    };
+    let Some(earliest) = earliest else {
+        return Extended::Done;
+    };
+    let entries = chunk
+        .iter()
+        .enumerate()
+        .map(|(i, (_, handle, ext))| VisibilityEntry {
+            id: i.to_string(),
+            handle: handle.clone(),
+            // At most 12 h, so the cast cannot truncate.
+            seconds: ext.as_secs() as i32,
+        })
+        .collect();
+    let sent_at = Instant::now();
+    match shared
+        .queue
+        .change_visibility_batch(entries, Some(within))
+        .await
+    {
+        Ok(outcome) => {
+            let mut st = shared.lock();
+            for (i, (receipt, _, ext)) in chunk.iter().enumerate() {
+                let Some(h) = st.held.get_mut(receipt) else {
+                    continue;
+                };
+                match entry_result(&outcome, i) {
+                    // `ext` was cut to the hold at the tick.
+                    Some(Ok(())) => h.deadline = (sent_at + *ext).min(h.hold_end),
+                    Some(Err(failure))
+                        if code_is(&failure.code, "ReceiptHandleIsInvalid")
+                            || code_is(&failure.code, "MessageNotInflight") =>
+                    {
+                        h.gone = true;
+                    }
+                    // It lapses at its own deadline.
+                    Some(Err(failure)) => tracing::debug!(
+                        code = %failure.code,
+                        "SQS refused to extend a held unit"
+                    ),
+                    None => {}
+                }
+            }
+            Extended::Done
+        }
+        Err(e) if e.class == Class::Fatal => {
+            shared.set_fatal(&e);
+            Extended::Done
+        }
+        Err(e) => {
+            tracing::warn!(error = %e.message, "extending held units failed");
+            // With a period or less left, the next tick comes too late.
+            // Otherwise the units are marked again, so the next tick tries
+            // them with a fresh extension.
+            if once_more && earliest.saturating_duration_since(Instant::now()) <= settings.period {
+                return Extended::Again;
+            }
+            let mut st = shared.lock();
+            for (receipt, _, _) in &chunk {
+                if let Some(h) = st.held.get_mut(receipt) {
+                    h.marked = true;
+                }
+            }
+            Extended::Done
+        }
+    }
+}
+
+/// Poll `futures` together on the calling task, and return their outputs in
+/// order once every one is ready.
+async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut ready = true;
+        for (future, output) in futures.iter_mut().zip(&mut outputs) {
+            // A future is never polled again once it has answered.
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(v) => *output = Some(v),
+                    Poll::Pending => ready = false,
+                }
+            }
+        }
+        if ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
+}
+
 /// Send the queued hand-backs, each setting its unit visible at once, in
-/// batches of up to ten. A hand-back past its unit's deadline is dropped
-/// unsent, since the unit is visible already, and so is one past a close's
-/// bound.
+/// batches of up to ten. A pass is given up one renewal period after it
+/// starts, each call and its retries included, or at a batch's earliest
+/// deadline or a close's bound if sooner. A batch not answered by then goes
+/// back to the front of the queue for the next pass; one past its deadline
+/// is dropped unsent, since the unit is visible already, and so is one past
+/// a close's bound.
 ///
 /// `Err` when the feed has stopped.
 async fn send_hand_backs(shared: &Shared) -> Result<(), ()> {
+    let pass_end = Instant::now() + shared.settings.period;
     loop {
         let chunk: Vec<Settle> = {
             let mut st = shared.lock();
@@ -1301,6 +1393,10 @@ async fn send_hand_backs(shared: &Shared) -> Result<(), ()> {
             {
                 let n = std::mem::take(&mut st.hand_backs).len();
                 st.dropped(n);
+            }
+            if now >= pass_end {
+                // What is left goes after the next tick's extensions.
+                return Ok(());
             }
             let n = st.hand_backs.len().min(BATCH_ENTRIES);
             st.handing_back += n;
@@ -1321,23 +1417,60 @@ async fn send_hand_backs(shared: &Shared) -> Result<(), ()> {
                 seconds: 0,
             })
             .collect();
-        let sent = settle_batch(shared, "handing back", &chunk, |bound| {
-            let left = until(oldest, bound).saturating_duration_since(Instant::now());
-            shared
-                .queue
-                .change_visibility_batch(entries.clone(), Some(left))
-        })
+        // The last error, for the line logged when the pass ends:
+        // `settle_batch` logs none while it retries.
+        let last_error: Mutex<Option<String>> = Mutex::new(None);
+        // The bound wraps only the call, so the bookkeeping below still runs
+        // when it elapses.
+        let sent = tokio::time::timeout_at(
+            pass_end,
+            settle_batch(shared, "handing back", &chunk, |bound| {
+                let left = until(oldest, bound)
+                    .min(pass_end)
+                    .saturating_duration_since(Instant::now());
+                let call = shared
+                    .queue
+                    .change_visibility_batch(entries.clone(), Some(left));
+                let last_error = &last_error;
+                async move {
+                    let answer = call.await;
+                    if let Err(e) = &answer {
+                        *last_error.lock().unwrap_or_else(PoisonError::into_inner) =
+                            Some(e.message.clone());
+                    }
+                    answer
+                }
+            }),
+        )
         .await;
         {
+            // One lock, so a close counts the batch once.
             let mut st = shared.lock();
             st.handing_back -= chunk.len();
             st.last_hand_back = Some(Instant::now());
-            if let Ok(unapplied) = sent {
-                st.dropped(unapplied);
+            match sent {
+                Ok(Ok(unapplied)) => st.dropped(unapplied),
+                Ok(Err(())) => {}
+                Err(_) => {
+                    let error = last_error
+                        .into_inner()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    tracing::debug!(
+                        error = error.as_deref().unwrap_or("no answer"),
+                        "a hand-back batch was not applied within a renewal period; sending it again"
+                    );
+                    st.hand_backs.splice(0..0, chunk);
+                }
             }
         }
         shared.progress.notify_one();
-        sent?;
+        match sent {
+            Ok(Ok(_)) => {}
+            Ok(Err(())) => return Err(()),
+            // The pass took a renewal period, so the next tick is due and
+            // its hand-back pass sends the batch again.
+            Err(_) => return Ok(()),
+        }
     }
 }
 

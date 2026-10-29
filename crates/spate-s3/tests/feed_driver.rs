@@ -10,9 +10,9 @@ mod support;
 
 use spate_core::checkpoint::Checkpointer;
 use spate_core::clock::TestClock;
-use spate_core::config::PipelineConfig;
+use spate_core::config::{FeedSection, PipelineConfig};
 use spate_core::feed::memory::{FeedCounts, MemoryFeed};
-use spate_core::feed::{Feed, FeedErrorKind, Receipt, STOP_RESERVE, Unit};
+use spate_core::feed::{Feed, FeedErrorKind, FeedOrigin, Receipt, STOP_RESERVE, Unit};
 use spate_core::ops::chain_owned;
 use spate_core::pipeline::{ExitState, Pipeline, RuntimeOptions};
 use spate_core::sink::{KeyHashRouter, SinkPoolConfig};
@@ -23,6 +23,7 @@ use spate_test::{
     scripted_feed, wait_until,
 };
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,8 +31,9 @@ use support::scripted_store::{HeadAnswer, ScriptedStore};
 use support::spy::{SpyOptions, spying_local_store};
 use support::{
     DRAIN_TIMEOUT, Launched, PipelineYaml, captured_rows, etag_of, key_of, launch_customized,
-    launch_customized_on_clock, launch_with_feed_on_clock, line_framer, lines_bytes, recs, sorted,
-    stop, test_options, two_range_unit, unit_over,
+    launch_customized_on_clock, launch_on_notifications, launch_with_feed,
+    launch_with_feed_on_clock, line_framer, lines_bytes, notification, recs, sorted, stop,
+    test_options, two_range_unit, unit_over,
 };
 
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -239,12 +241,13 @@ fn a_unit_is_acknowledged_only_after_its_last_record_is_acknowledged() {
     stop(&l);
 }
 
-/// Pins the in-process feed end to end: a unit with rows, a zero-byte unit
-/// and a unit naming a byte range cut on the framer's delimiter are
-/// acknowledged, the range read alone. A unit over a missing object, a unit
-/// whose body names two objects, a unit whose body is not a descriptor, a
-/// range cut on another delimiter and a range of a compressed object are
-/// failed on every delivery until the feed dead-letters them.
+/// Pins the in-process feed end to end: a unit with rows, a zero-byte unit,
+/// a unit naming two objects and a unit naming a byte range cut on the
+/// framer's delimiter are acknowledged, the two objects each read whole and
+/// the range read alone. A unit over a missing object, a unit whose body is
+/// not a descriptor, a range cut on another delimiter and a range of a
+/// compressed object are failed on every delivery until the feed
+/// dead-letters them.
 #[test]
 fn in_process_units_are_acknowledged_or_dead_lettered_at_the_cap() {
     let dir = tempfile::tempdir().unwrap();
@@ -303,7 +306,7 @@ fn in_process_units_are_acknowledged_or_dead_lettered_at_the_cap() {
         c.visible == 0 && c.held == 0
     });
     stop(&l);
-    assert_eq!(counts(feed.counts()), (0, 0, 5, 3));
+    assert_eq!(counts(feed.counts()), (0, 0, 4, 4));
 
     let mut dead: Vec<String> = feed.dead_letters().into_iter().map(|u| u.id).collect();
     dead.sort();
@@ -314,16 +317,17 @@ fn in_process_units_are_acknowledged_or_dead_lettered_at_the_cap() {
             "not-a-descriptor",
             "ranged-cr",
             "ranged-gz",
-            "two-members"
         ]
     );
     let got = captured_rows(&l.script);
-    let mut want = rows;
+    let mut want = rows.clone();
+    want.extend(rows);
+    want.extend(other.iter().cloned());
     want.push(other[0].clone());
     assert_eq!(
         sorted(got),
         sorted(want),
-        "the rows unit and the range are each read once"
+        "the rows unit, both objects of the two-object unit and the range are each read once"
     );
 }
 
@@ -443,6 +447,38 @@ fn a_whole_unit_over_a_large_object_is_read_in_ranges() {
     );
 }
 
+/// Pins that `Source::renew_held` on a source reading a feed renews the
+/// unit it holds. Regression for #1278.
+#[test]
+fn renew_held_renews_the_unit_the_source_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    stage(&data, "a.ndjson", &[r#"{"k":1}"#.to_owned()]);
+    let config =
+        PipelineConfig::from_str(&PipelineYaml::file("s3-feed-renew-held", &data).build()).unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (feed, script) = scripted_feed();
+    let receipt = script.deliver(unit_over(&data, "a.ndjson"));
+    let mut source =
+        line_framer(S3Source::from_component_config(&config.source, rt.handle().clone()).unwrap())
+            .with_feed(Arc::new(feed));
+    source
+        .open(SourceCtx::new(Checkpointer::new().handle()))
+        .unwrap();
+    wait_until(DEADLINE, "the unit is held", || {
+        source.poll_events(Duration::ZERO).unwrap();
+        script.held() == vec![receipt]
+    });
+
+    let before = renewals_of(&script, receipt);
+    source.renew_held();
+    assert_eq!(renewals_of(&script, receipt), before + 1);
+}
+
 /// A framer that declares no resync delimiter.
 #[derive(Default)]
 struct NoResync(support::LineFramer);
@@ -501,6 +537,177 @@ fn a_framer_with_no_delimiter_is_reported_when_the_feed_path_opens() {
     assert!(!said(&lines), "{lines:#?}");
 }
 
+/// The units a pipeline at `threads` holds once its first receive lands,
+/// reading 16 queued one-object units from a `scripted` feed section that
+/// sets `units_held` to `explicit`. The store holds every GET, so no unit
+/// settles and frees room before the count is read.
+fn units_held_at_start(name: &str, threads: u32, explicit: Option<usize>) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    stage(&data, "a.ndjson", &[r#"{"k":1}"#.to_owned()]);
+    let (feed, script) = scripted_feed();
+    for _ in 0..16 {
+        script.deliver(unit_over(&data, "a.ndjson"));
+    }
+    // A depth above the queued units is never reached, so the gate holds
+    // every GET until `open_gate`.
+    let (store, spy) = spying_local_store(SpyOptions {
+        gate_depth: 17,
+        gate_deadline: Duration::from_secs(300),
+        ..SpyOptions::default()
+    });
+    let section = match explicit {
+        Some(n) => format!("feed:\n  scripted: {{}}\n  units_held: {n}\n"),
+        None => "feed:\n  scripted: {}\n".to_owned(),
+    };
+    let yaml = PipelineYaml::file(name, &data)
+        .threads(threads)
+        .section(&section)
+        .build();
+    let l = launch_with_feed(
+        &yaml,
+        test_options(),
+        |_| {},
+        Arc::new(feed),
+        |source, _io| line_framer(source).with_store(store),
+    );
+    wait_until(DEADLINE, "the first receive lands", || {
+        !script.held().is_empty()
+    });
+    let held = script.held().len();
+    spy.open_gate();
+    stop(&l);
+    held
+}
+
+/// Pins that a pipeline whose `feed:` section sets no `units_held` holds two
+/// units per pipeline thread.
+#[test]
+fn an_unset_units_held_holds_twice_the_pipeline_threads() {
+    // 3 threads tell `2 × threads` from `2 + threads`; 1 thread pins that
+    // the rule has no floor.
+    for (threads, held) in [(1, 2), (3, 6)] {
+        assert_eq!(
+            units_held_at_start("s3-feed-derived", threads, None),
+            held,
+            "threads: {threads}"
+        );
+    }
+}
+
+/// Pins that the `feed:` section's `units_held` wins over the thread count,
+/// above it and below it.
+#[test]
+fn an_explicit_units_held_wins_over_the_thread_count() {
+    for units in [7, 2] {
+        assert_eq!(
+            units_held_at_start("s3-feed-explicit", 3, Some(units)),
+            units,
+            "units_held: {units}"
+        );
+    }
+}
+
+/// Pins that a source opened by hand, with no thread count and no section,
+/// holds 96 units.
+#[test]
+fn a_source_opened_without_a_thread_count_holds_96() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    stage(&data, "a.ndjson", &[r#"{"k":1}"#.to_owned()]);
+    let config =
+        PipelineConfig::from_str(&PipelineYaml::file("s3-feed-fallback", &data).build()).unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (feed, script) = scripted_feed();
+    for _ in 0..98 {
+        script.deliver(unit_over(&data, "a.ndjson"));
+    }
+    let mut source =
+        line_framer(S3Source::from_component_config(&config.source, rt.handle().clone()).unwrap())
+            .with_feed(Arc::new(feed));
+    source
+        .open(SourceCtx::new(Checkpointer::new().handle()))
+        .unwrap();
+    wait_until(DEADLINE, "the first receive lands", || {
+        source.poll_events(Duration::ZERO).unwrap();
+        !script.held().is_empty()
+    });
+    assert_eq!(script.held().len(), 96);
+}
+
+/// Pins that `open` logs once the units the source holds and where the
+/// figure came from.
+#[test]
+fn the_open_log_states_units_held_and_its_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    let config =
+        PipelineConfig::from_str(&PipelineYaml::file("s3-feed-held-log", &data).build()).unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let open_logs = |explicit: Option<usize>, threads: Option<usize>| {
+        let mut source = line_framer(
+            S3Source::from_component_config(&config.source, rt.handle().clone()).unwrap(),
+        );
+        match explicit {
+            Some(n) => {
+                let mut section = FeedSection::new(spate_test::component_config("scripted", "{}"));
+                section.units_held = NonZeroUsize::new(n);
+                source
+                    .configure_feed(&section, Arc::new(MemoryFeed::new()), FeedOrigin::Given)
+                    .unwrap();
+            }
+            None => source = source.with_feed(Arc::new(MemoryFeed::new())),
+        }
+        spate_test::capture_logs(tracing::Level::INFO, || {
+            source
+                .open(
+                    SourceCtx::new(Checkpointer::new().handle())
+                        .with_threads(threads.and_then(NonZeroUsize::new)),
+                )
+                .unwrap();
+        })
+    };
+    // An explicit value equal to the derived one still reads as explicit.
+    let cases = [
+        (
+            (None, Some(3)),
+            "6 units at once units_held=6 origin=\"derived\" threads=3",
+        ),
+        (
+            (Some(7), Some(3)),
+            "7 units at once units_held=7 origin=\"explicit\" threads=3",
+        ),
+        (
+            (Some(6), Some(3)),
+            "6 units at once units_held=6 origin=\"explicit\" threads=3",
+        ),
+        (
+            (None, None),
+            "96 units at once units_held=96 origin=\"fallback\"",
+        ),
+    ];
+    for ((explicit, threads), tail) in cases {
+        let lines = open_logs(explicit, threads);
+        let held: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| l.find("the S3 source holds").map(|at| &l[at..]))
+            .collect();
+        assert_eq!(
+            held,
+            vec![format!("the S3 source holds up to {tail}").as_str()],
+            "{lines:#?}"
+        );
+    }
+}
+
 /// Launch over `feed` with one record per source batch and one row per sink
 /// write, so an object's records span many sink writes.
 fn launch_one_row_writes(
@@ -518,6 +725,7 @@ fn launch_one_row_writes(
         );
     let mut config = PipelineConfig::from_str(&yaml).unwrap();
     config.pipeline.name = spate_test::unique_name(&config.pipeline.name);
+    let name = config.pipeline.name.clone();
     let pipeline = Pipeline::from_config(config).unwrap();
     let io = pipeline.io_handle();
     let source =
@@ -555,6 +763,7 @@ fn launch_one_row_writes(
         run,
         script,
         shutdown,
+        pipeline: name,
     }
 }
 
@@ -934,44 +1143,6 @@ fn a_feed_section_is_refused_beside_a_feed_given_in_code() {
     assert!(err.to_string().contains("with_feed"), "{err}");
 }
 
-/// A run over `<scheme>://b/data/` whose store is the directory `root`, so a
-/// notification for bucket `b` names the file `root/<key>`.
-fn launch_on_notifications(
-    scheme: &str,
-    root: &Path,
-    feed: Arc<dyn Feed>,
-    pre: impl FnOnce(&SinkScript),
-) -> Launched {
-    let yaml = PipelineYaml::endpoint("s3-notification-test", "http://127.0.0.1:9")
-        .fed_by_code()
-        .build()
-        .replace("\"s3://b/data/\"", &format!("\"{scheme}://b/data/\""));
-    let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
-    launch_customized(&yaml, test_options(), pre, move |source, _io| {
-        line_framer(source).with_store(store).with_feed(feed)
-    })
-}
-
-/// A notification whose records each create the object of that size under
-/// that key in bucket `b`, with no ETag, so a local file reads unpinned.
-fn notification(objects: &[(&str, u64)]) -> Unit {
-    let records: Vec<serde_json::Value> = objects
-        .iter()
-        .map(|(key, size)| {
-            serde_json::json!({
-                "eventVersion": "2.1",
-                "eventSource": "aws:s3",
-                "eventName": "ObjectCreated:Put",
-                "s3": { "bucket": { "name": "b" }, "object": { "key": key, "size": size } },
-            })
-        })
-        .collect();
-    Unit::new(
-        "notification",
-        serde_json::to_vec(&serde_json::json!({ "Records": records })).unwrap(),
-    )
-}
-
 /// Pins that a notification naming two objects is acknowledged once, only
 /// after the sink has acknowledged every record of both.
 #[test]
@@ -1152,6 +1323,66 @@ fn overwrite_yaml() -> String {
         .source("chunk_bytes", "64KiB")
         .source("prefetch_bytes", "64KiB")
         .build()
+}
+
+/// Pins that a thread keeps reading a lane while a finished sibling lane on
+/// it waits on the sink for its acknowledgement.
+#[test]
+fn a_finished_lane_waiting_on_the_sink_does_not_starve_its_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    let (rows_a, rows_b) = (recs("a", 20), recs("b", 20));
+    stage(&data, "a.ndjson", &rows_a);
+    stage(&data, "b.ndjson", &rows_b);
+    let (feed, script) = scripted_feed();
+    for name in ["a.ndjson", "b.ndjson"] {
+        let (etag, size) = (etag_of(&data, name), size_of(&data, name));
+        script.deliver(pinned_notification(name, size, &etag, 0));
+    }
+    let store = ScriptedStore::new(dir.path());
+    store.hold_get(2);
+    let yaml = PipelineYaml::endpoint("s3-finished-sibling-held", "http://127.0.0.1:9")
+        .fed_by_code()
+        .threads(1)
+        .build();
+    let feed: Arc<dyn Feed> = Arc::new(feed);
+    let held_store = Arc::clone(&store);
+    let l = launch_customized(
+        &yaml,
+        test_options(),
+        |sink| sink.enqueue_global(WriteOutcome::ok().held()),
+        move |source, _io| line_framer(source).with_store(held_store).with_feed(feed),
+    );
+    // The first object's write is held, so its lane stays on the thread,
+    // finished and unacknowledged, while the second object's bytes arrive.
+    wait_until(DEADLINE, "the second GET is held", || store.holding());
+    wait_until(DEADLINE, "the first object's write is held", || {
+        l.script.held_writes() == 1
+    });
+    store.release();
+    // Whichever object the held GET belongs to, its rows can only reach the
+    // sink in a second write, read while the first object's lane is still
+    // on the thread, finished and held.
+    wait_until(
+        DEADLINE,
+        "the second object is read beside the finished lane",
+        || l.script.writes().len() >= 2,
+    );
+    // Only the first object's write is held, so at most the second unit can
+    // have been acknowledged.
+    assert!(
+        script.acknowledged().len() < 2,
+        "the first unit is still held"
+    );
+    l.script.release_held();
+    wait_until(DEADLINE, "both units are acknowledged", || {
+        script.acknowledged().len() == 2
+    });
+    stop(&l);
+    let every: Vec<String> = rows_a.iter().chain(&rows_b).cloned().collect();
+    let mut got = sorted(captured_rows(&l.script));
+    got.dedup();
+    assert_eq!(got, sorted(every));
 }
 
 /// A notification in bucket `b` creating `data/<name>` at `size` bytes,

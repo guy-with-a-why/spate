@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::clock::{SharedClock, SystemClock};
+
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -54,8 +56,8 @@ impl Default for HealthThresholds {
 
 /// Shared health state, updated by the pipeline runtime and read by the
 /// probes. All methods are lock-free and callable from any thread.
-#[derive(Debug)]
 pub struct HealthState {
+    clock: SharedClock,
     epoch: Instant,
     thresholds: HealthThresholds,
     assignment_received: AtomicBool,
@@ -67,13 +69,37 @@ pub struct HealthState {
     data_flowing: AtomicBool,
 }
 
+impl std::fmt::Debug for HealthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HealthState")
+            .field("epoch", &self.epoch)
+            .field("thresholds", &self.thresholds)
+            .field("assignment_received", &self.assignment_received)
+            .field("sinks_connected", &self.sinks_connected)
+            .field("heartbeats", &self.heartbeats)
+            .field("watermark_age_ms", &self.watermark_age_ms)
+            .field("data_flowing", &self.data_flowing)
+            .finish_non_exhaustive()
+    }
+}
+
 impl HealthState {
     /// Create state for `pipeline_threads` heartbeating threads. All
     /// heartbeats start "fresh" at creation time.
     #[must_use]
     pub fn new(pipeline_threads: usize, thresholds: HealthThresholds) -> Arc<Self> {
+        Self::with_clock(pipeline_threads, thresholds, Arc::new(SystemClock))
+    }
+
+    /// [`new`](Self::new), reading heartbeats and liveness on `clock`.
+    pub(crate) fn with_clock(
+        pipeline_threads: usize,
+        thresholds: HealthThresholds,
+        clock: SharedClock,
+    ) -> Arc<Self> {
         Arc::new(HealthState {
-            epoch: Instant::now(),
+            epoch: clock.now(),
+            clock,
             thresholds,
             assignment_received: AtomicBool::new(false),
             sinks_connected: AtomicBool::new(false),
@@ -87,11 +113,12 @@ impl HealthState {
         u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Beat thread `thread`'s heart. Called once per poll iteration; out of
-    /// range indices are ignored.
+    /// Beat thread `thread`'s heart on the clock given at construction, the
+    /// system clock from [`new`](Self::new). Called once per poll iteration;
+    /// out of range indices are ignored.
     pub fn heartbeat(&self, thread: usize) {
         if let Some(hb) = self.heartbeats.get(thread) {
-            hb.store(self.millis_since_epoch(Instant::now()), Ordering::Relaxed);
+            hb.store(self.millis_since_epoch(self.clock.now()), Ordering::Relaxed);
         }
     }
 
@@ -123,10 +150,11 @@ impl HealthState {
             && self.sinks_connected.load(Ordering::Relaxed)
     }
 
-    /// Liveness now.
+    /// Liveness now, on the clock given at construction, the system clock
+    /// from [`new`](Self::new).
     #[must_use]
     pub fn healthy(&self) -> bool {
-        self.healthy_at(Instant::now())
+        self.healthy_at(self.clock.now())
     }
 
     /// Liveness as of `now` (injectable for tests).
@@ -276,6 +304,46 @@ mod tests {
             heartbeat_stale: Duration::from_millis(stale_ms),
             watermark_stuck: Duration::from_millis(stuck_ms),
         }
+    }
+
+    /// A heartbeat is stamped on the injected clock, and stays fresh up to
+    /// and including the stale threshold after it.
+    #[test]
+    fn a_heartbeat_reads_the_injected_clock() {
+        let clock = crate::clock::TestClock::frozen();
+        let health = HealthState::with_clock(1, thresholds(1000, 60_000), clock.clone());
+        clock.advance(Duration::from_millis(300));
+        health.heartbeat(0);
+        assert!(health.healthy_at(health.epoch + Duration::from_millis(1300)));
+        assert!(!health.healthy_at(health.epoch + Duration::from_millis(1301)));
+    }
+
+    /// Liveness reads the injected clock: a heartbeat goes stale once that
+    /// clock moves past the threshold, with no real time passing.
+    #[test]
+    fn liveness_reads_the_injected_clock() {
+        let clock = crate::clock::TestClock::frozen();
+        let health = HealthState::with_clock(1, thresholds(1000, 60_000), clock.clone());
+        health.heartbeat(0);
+        assert!(health.healthy());
+        clock.advance(Duration::from_millis(1001));
+        assert!(!health.healthy());
+    }
+
+    /// The clock it holds leaves `HealthState` `UnwindSafe` and
+    /// `RefUnwindSafe`.
+    #[test]
+    fn health_state_stays_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        unwind_safe::<HealthState>();
+    }
+
+    /// The hand-written `Debug` names the type and its thresholds.
+    #[test]
+    fn debug_names_the_health_state_and_its_thresholds() {
+        let text = format!("{:?}", HealthState::new(1, thresholds(1000, 2000)));
+        assert!(text.starts_with("HealthState {"), "{text}");
+        assert!(text.contains("heartbeat_stale: 1s"), "{text}");
     }
 
     #[test]

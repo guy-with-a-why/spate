@@ -16,10 +16,22 @@ use crate::record::{PartitionId, RawPayload};
 use crate::source::{
     DrainBarrier, LaneId, PayloadBatch, Source, SourceCtx, SourceEvent, SourceLane,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
+
+/// Once `polled` has been polled, the first finished `finished()` read of
+/// `lane` that directly follows a finished read of `after` signals `reached`
+/// and blocks until `go` fires.
+pub(crate) struct FinishedHook {
+    pub(crate) polled: LaneId,
+    pub(crate) after: LaneId,
+    pub(crate) lane: LaneId,
+    pub(crate) reached: mpsc::Sender<()>,
+    pub(crate) go: mpsc::Receiver<()>,
+}
 
 #[derive(Default)]
 pub(crate) struct SourceLog {
@@ -32,6 +44,20 @@ pub(crate) struct SourceLog {
     /// the seam a source publishes consumer lag through; if the handles never
     /// arrive, the lag gauge renders a permanent zero on every pipeline.
     pub(crate) stage_metrics_attached: bool,
+    /// The thread count `open` received.
+    pub(crate) threads: Option<NonZeroUsize>,
+    /// Lanes that report `finished` from the empty poll after their last
+    /// batch, returning it without waiting, as a lane that has decided its
+    /// end of input does.
+    pub(crate) finishing: BTreeSet<LaneId>,
+    /// Every lane poll, with the timeout the driver passed.
+    pub(crate) lane_polls: Vec<(LaneId, Duration)>,
+    /// How many times the driver asked each lane whether it has finished.
+    pub(crate) finished_calls: BTreeMap<LaneId, usize>,
+    /// When set, blocks one `finished()` read; see [`FinishedHook`].
+    pub(crate) finished_hook: Option<FinishedHook>,
+    /// The previous `finished()` read: the lane and its answer.
+    pub(crate) last_finished_read: Option<(LaneId, bool)>,
     /// When set, `commit` and `flush_commits` fail retryably, modeling a
     /// checkpoint store outage; nothing is recorded as committed.
     pub(crate) fail_commits: bool,
@@ -58,6 +84,8 @@ pub(crate) struct SourceLog {
     pub(crate) read_on_stop: bool,
     /// How many times the controller asked `reading_on_stop`.
     pub(crate) reading_on_stop_calls: usize,
+    /// How many times the controller called `renew_held`.
+    pub(crate) renew_held_calls: usize,
     /// How many times the controller called `stop_reading`.
     pub(crate) stop_reading_calls: usize,
     /// When set, a dropped lane logs `lane-dropped`, which a stop's drain
@@ -159,6 +187,7 @@ impl Source for FakeSource {
             }
             log.opened = true;
             log.stage_metrics_attached = ctx.stage_metrics.is_some();
+            log.threads = ctx.threads;
             if let Some((clock, by)) = &log.advance_in_open {
                 clock.advance(*by);
             }
@@ -199,6 +228,7 @@ impl Source for FakeSource {
                         current: Vec::new(),
                         issuer: issuer.clone(),
                         log: Arc::clone(&self.shared),
+                        finished: false,
                     })
                     .collect();
                 Ok(SourceEvent::LanesAssigned(lanes))
@@ -214,6 +244,7 @@ impl Source for FakeSource {
                         current: Vec::new(),
                         issuer: issuer.clone(),
                         log: Arc::clone(&self.shared),
+                        finished: false,
                     })
                     .collect();
                 Ok(SourceEvent::LanesAdded(lanes))
@@ -310,6 +341,10 @@ impl Source for FakeSource {
         Ok(())
     }
 
+    fn renew_held(&mut self) {
+        self.shared.lock().unwrap().renew_held_calls += 1;
+    }
+
     fn reading_on_stop(&mut self) -> bool {
         let mut log = self.shared.lock().unwrap();
         log.reading_on_stop_calls += 1;
@@ -352,6 +387,7 @@ pub(crate) struct FakeLane {
     current: Vec<(i64, Vec<u8>)>,
     issuer: AckIssuer,
     log: SharedLog,
+    finished: bool,
 }
 
 impl Drop for FakeLane {
@@ -381,6 +417,11 @@ impl SourceLane for FakeLane {
         _max_records: usize,
         timeout: Duration,
     ) -> Result<Option<FakeBatch<'_>>, SourceError> {
+        let finishing = {
+            let mut log = self.log.lock().unwrap();
+            log.lane_polls.push((self.id, timeout));
+            log.finishing.contains(&self.id)
+        };
         match self.batches.pop_front() {
             Some(batch) => {
                 self.current = batch;
@@ -393,11 +434,39 @@ impl SourceLane for FakeLane {
                     ack,
                 }))
             }
+            None if finishing => {
+                self.finished = true;
+                Ok(None)
+            }
             None => {
                 std::thread::sleep(timeout.min(Duration::from_millis(2)));
                 Ok(None)
             }
         }
+    }
+
+    fn finished(&self) -> bool {
+        let hook = {
+            let mut log = self.log.lock().unwrap();
+            *log.finished_calls.entry(self.id).or_default() += 1;
+            let previous = log.last_finished_read.replace((self.id, self.finished));
+            if self.finished
+                && log.finished_hook.as_ref().is_some_and(|h| {
+                    h.lane == self.id
+                        && previous == Some((h.after, true))
+                        && log.lane_polls.iter().any(|(l, _)| *l == h.polled)
+                })
+            {
+                log.finished_hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook.reached.send(()).unwrap();
+            hook.go.recv().unwrap();
+        }
+        self.finished
     }
 }
 
@@ -561,6 +630,9 @@ pub(crate) enum ChainMode {
     HoldAcksUntilFlush {
         held: Arc<Mutex<Vec<crate::checkpoint::AckRef>>>,
     },
+    /// Take every batch, and report every flush blocked, as a terminal whose
+    /// sink queue stays full does. A drain's flush then runs to its deadline.
+    FlushBlocked,
 }
 
 pub(crate) struct FakeChain {
@@ -624,6 +696,12 @@ impl RunnableChain for FakeChain {
     fn flush(&mut self) -> PushOutcome {
         self.shared.flushes.fetch_add(1, Ordering::Relaxed);
         self.log.lock().unwrap().log.push("flush".into());
+        if matches!(self.mode, ChainMode::FlushBlocked) {
+            return PushOutcome::Blocked {
+                resume_at: 0,
+                reason: BlockReason::Capacity,
+            };
+        }
         if let ChainMode::HoldAcksUntilFlush { held } = &self.mode {
             // Dropping the stashed clones resolves the batches Delivered, the
             // fake equivalent of sealing a partial chunk and having the sink

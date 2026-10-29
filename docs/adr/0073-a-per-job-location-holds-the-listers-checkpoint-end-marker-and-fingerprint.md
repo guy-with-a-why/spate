@@ -95,7 +95,7 @@ window, so a marker from an earlier run waits one window like any other.
 - Bad, because one lister per location is an operator rule. The lister
   creates the fingerprint with `PutMode::Create`, which refuses a second
   lister with another fingerprint where the store honors `If-None-Match`. CI
-  checks that on RustFS, and it is unverified on Ceph RGW and Garage. Two
+  checks that on RustFS, and it is verified on Ceph RGW and Garage. Two
   listers with one fingerprint both publish.
 - Neutral, because the fingerprint includes the range target, though a worker
   given another target only cuts a whole-object unit into other ranges.
@@ -119,6 +119,11 @@ window, so a marker from an earlier run waits one window like any other.
 `crates/spate-core/src/pipeline/tests.rs`:
 `a_memory_feed_with_a_location_is_refused`. The one-lister rule has no check
 beyond the conditional create.
+`crates/spate-s3/tests/lister.rs`'s
+`a_second_conditional_create_at_the_location_ends_as_the_store_answers` checks
+the conditional create on RustFS, Ceph RGW and Garage in the Docker job, and
+`a_lister_with_another_fingerprint_is_refused_by_its_read_on_the_store` checks
+the read on each.
 
 ## More information
 

@@ -9,14 +9,15 @@
 //! A pipeline with no `feed:` section fails to start.
 //!
 //! The source reads work units from the feed the section names, each unit
-//! naming one object or one byte range of one object, and storage
+//! naming one object, one byte range of one object, or several objects read
+//! whole in turn on one lane, and storage
 //! notifications, one part per non-empty created object. On a durable feed it
 //! lists nothing itself: a bounded job's units come from a separate lister run,
 //! [`S3Source::list_once`], once per job, and a continuous job's from storage
 //! notifications or code. On the in-process feed the run lists its own prefix
 //! into the feed. A whole object that qualifies for byte ranges is
 //! read in ranges. The section's `units_held` bounds its read parallelism,
-//! one lane per object or range in progress. When the section names a
+//! one lane per unit part in progress. When the section names a
 //! `location`, the job is bounded: the source waits for the job fingerprint
 //! its lister writes there, refuses to start when it differs from its own,
 //! and ends once the lister's end marker holds over a settling window in
@@ -28,7 +29,8 @@
 //!
 //! - **Work is a stream of units.** Each unit has a deterministic identity
 //!   ([`split_id_for`], [`split_id_for_range`]) and a self-contained
-//!   [`SplitDescriptor`] carrying its member key, size and ETag, and its range.
+//!   [`SplitDescriptor`] carrying each member's key, size and ETag, and its
+//!   range.
 //!   Workers read units straight from their descriptors: **workers never
 //!   list**.
 //! - **One lane per unit in progress.** A received unit materializes one
@@ -41,14 +43,17 @@
 //!   unit to the feed once the sink has acknowledged every record in it, and a
 //!   redelivered unit is read again from its start. This crate names no
 //!   concrete backend and has no feed feature.
-//! - **Bad objects fail their unit, not the pipeline.** An object deleted
-//!   after listing, overwritten under its ETag pin, corrupt, or unreadable
-//!   past the retry budget fails its unit back to the feed (surfaced in
-//!   `spate_s3_source_objects_failed_total{reason}`), which dead-letters it at
-//!   its cap. A bounded job with a dead-lettered unit ends **failed**, never
-//!   silently incomplete. A rejected object read and a client-configuration
-//!   error are immediately fatal. A notification unit's object overwritten
-//!   under its pin is re-enqueued at its current ETag instead.
+//! - **Bad objects fail their unit, not the pipeline.** An object read as
+//!   `404` after it was listed or announced, a listed key that is not a valid
+//!   object path, and an object overwritten under its ETag pin, corrupt, or
+//!   unreadable past the retry budget each fail their unit back to the feed
+//!   (surfaced in `spate_s3_source_objects_failed_total{reason}`), which
+//!   dead-letters it at its cap. A bounded job with a dead-lettered unit ends
+//!   **failed**, never silently incomplete. A read the store rejects with
+//!   `401` or `403` and a client-configuration error are immediately fatal.
+//!   AWS S3 answers a read of a deleted object with `403` to a role without
+//!   `s3:ListBucket`. A notification unit's object overwritten under its pin
+//!   is re-enqueued at its current ETag instead.
 //! - **Records are framed, not decoded, here.** The source is
 //!   format-agnostic: it streams object bytes (after gzip/zstd decompression)
 //!   through a [`RecordFramer`](spate_core::framing::RecordFramer) *you supply*
@@ -111,6 +116,6 @@ pub use config::{Compression, S3SourceConfig};
 pub use lane::{S3Batch, S3Lane};
 pub use source::S3Source;
 pub use split::{
-    DESCRIPTOR_VERSION, DescriptorObject, SplitDescriptor, SplitError, SplitRange, split_id_for,
-    split_id_for_range,
+    DESCRIPTOR_VERSION, DescriptorObject, MAX_UNIT_MEMBERS, SplitDescriptor, SplitError,
+    SplitRange, split_id_for, split_id_for_range,
 };

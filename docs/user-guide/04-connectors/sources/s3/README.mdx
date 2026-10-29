@@ -8,9 +8,10 @@ The S3 source (`spate-s3`, feature `s3` on the `spate` facade) reads work units
 and storage notifications from a feed (see
 [Reading from a feed](#reading-from-a-feed)), and a pipeline with no `feed:`
 section fails at start. A
-[**work unit**](../../../07-reference/glossary.mdx#work-unit) names one object
-or one byte range of a [large object](#large-objects-and-byte-ranges), with its
-key, size and ETag, so a reader never lists. On a bounded backfill the source
+[**work unit**](../../../07-reference/glossary.mdx#work-unit) names one object,
+one byte range of a [large object](#large-objects-and-byte-ranges), or several
+small objects read in turn on one lane, with each object's key, size and ETag,
+so a reader never lists. On a bounded backfill the source
 streams every object's records through the pipeline and terminates the pipeline
 itself: `run()` returns `ExitState::Completed` once the feed has given out every
 unit and the sink has acknowledged every record. `Completed` is a strong claim
@@ -59,9 +60,9 @@ source:
 |---|---|---|---|
 | `url` | string | `required` | Bucket and prefix to backfill. Every object under the prefix is read. `file://` works for local runs; `memory://` fails at load, because it builds a fresh empty store per component and so cannot be shared. Part of the job fingerprint — byte-identical across every worker of a [bounded job](#bounded-jobs-and-the-job-location). |
 | `compression` | `auto` \| `none` \| `gzip` \| `zstd` | `auto` | Object codec. `auto` decides per object by extension (`.gz`/`.gzip`, `.zst`/`.zstd`, else uncompressed). Multi-member gzip and multi-frame zstd are read fully; truncated or corrupt streams [fail their unit](#object-errors-fail-the-unit). Part of the job fingerprint. |
-| `split_target_bytes` | bytes | `64MiB` | Size above which an object is [cut into byte ranges](#large-objects-and-byte-ranges) when it qualifies, each range at most this size and one unit each. Any other object is one unit. Floor `1MiB`. Part of the job fingerprint. |
+| `split_target_bytes` | bytes | `64MiB` | Objects read whole are packed into shared units of at most this many bytes and 16 objects, in listing order, except one whose key is longer than 1,024 bytes or whose ETag is longer than 256. A larger object is [cut into byte ranges](#large-objects-and-byte-ranges) of at most this size when it qualifies, one unit each, and any other is one unit. Floor `1MiB`. Part of the job fingerprint. |
 | `prefetch_bytes` | bytes | `8MiB` | Target window size for ETag-pinned ranged GETs; see [read-ahead memory sizing](#read-parallelism). Must be at least `chunk_bytes`; a smaller value fails at load. |
-| `chunk_bytes` | bytes | `512KiB` | Target size of one buffered chunk. Zero fails at load. |
+| `chunk_bytes` | bytes | `512KiB` | Target size of one buffered chunk. Read-ahead does not depend on it. Zero fails at load. |
 | `store` | string map | `{}` | Raw `object_store` options, applied on top of the environment. Bucket keys fail at load, and so do keys `object_store` does not recognize under an S3 URL — see [the `store` denylist](#the-store-passthrough-and-the-denylist). |
 
 Mind the units on the fingerprinted keys: `MB` and `MiB` parse to
@@ -99,11 +100,14 @@ finishes when the loaded thread does.
 
 Aim for a unit count that is a multiple of `pipeline.threads`, or large
 enough that one extra unit is a small share of the total. Prefixes of many
-objects get this for free, and so do large objects cut into byte ranges. A
-handful of large objects read whole is where it bites, since each is a unit of
-its own and the count is then fixed by the data. Raising `split_target_bytes`
-makes fewer, larger ranges and can make imbalance *worse*, so check the
-resulting count instead of assuming bigger is better.
+objects get this for free, and so do large objects cut into byte ranges. Small
+objects share units of up to 16, so a prefix of a few hundred small objects
+makes about one unit per 16 of them and can read on fewer lanes than
+`units_held` allows. A handful of large objects read whole is where it bites,
+since each is a unit of its own and the count is then fixed by the data.
+Raising `split_target_bytes` makes fewer, larger units of both kinds and can
+make imbalance *worse*, so check the resulting count instead of assuming
+bigger is better.
 
 ### Large objects and byte ranges
 
@@ -285,16 +289,20 @@ shape and the failure modes.
 
 ### Read parallelism
 
-A worker reads `units_held` units at once, one lane each, and the default is
-96. A lane is pinned to one pipeline thread, so no more pipeline threads do
-source work than there are lanes.
+A worker reads `units_held` units at once, one lane each. Unset, it holds two
+units per pipeline thread, so each thread has a second lane to read while the
+first opens its next object. A lane is pinned to one pipeline thread, so no
+more pipeline threads do source work than there are lanes. A unit naming
+several objects takes one of `units_held`, and its lane reads them in turn.
 
 On the ETag-pinned ranged path, read-ahead memory grows with active lanes,
-current GET windows and backing windows retained by queued chunks. As
+current GET windows and backing windows retained by queued chunks. A lane reads
+its next window while it hands on the current one, including the first window
+of the next object in a unit. As
 [`spate-s3/src/fetch.rs`](repo:crates/spate-s3/src/fetch.rs) shows, chunks share
-an entire GET buffer, so a previous full window and the next full window can
-coexist. That overlap uses about `2 × units_held × prefetch_bytes` across
-fully active lanes. This is an overlap estimate: short windows can leave
+an entire GET buffer, so the previous window, the current window and the next
+window can coexist. That overlap uses about `3 × units_held × prefetch_bytes`
+across fully active lanes. This is an overlap estimate: short windows can leave
 several distinct backing buffers queued, and byte-range boundary reads can
 add `chunk_bytes` to a GET window, as specified in
 [`spate-s3/src/trim.rs`](repo:crates/spate-s3/src/trim.rs). Framing,
@@ -326,12 +334,21 @@ describes, and a unit handed back at a [graceful stop](#a-graceful-stop).
 
 ### Work units
 
-A unit the lister publishes names one object or one byte range of one object, as
-an encoded `SplitDescriptor`, and a notification message is one unit with one
+The lister packs objects read whole into units of at most 16 objects and
+`split_target_bytes` bytes, in listing order, and publishes each larger object
+alone or cut into byte ranges. An object whose key the S3 client cannot
+address, whose key is longer than 1,024 bytes, or whose ETag `If-Match` cannot
+carry or is longer than 256 bytes, is a unit of its own. The
+largest body a lister unit carries is 48 KiB, under the message limit of the
+[SQS feed](../../feeds/sqs/README.mdx) and the
+[Kafka feed](../../feeds/kafka/README.mdx). Each unit is an encoded
+`SplitDescriptor`, and a notification message is one unit with one
 part per non-empty created object (see
-[Storage notifications](#storage-notifications)). A unit whose body is neither,
-or a descriptor naming more than one object, is failed back to the feed. A
-whole-object part is cut into byte ranges on the conditions in
+[Storage notifications](#storage-notifications)). A descriptor may name
+several whole objects, at most `MAX_UNIT_MEMBERS` (4,096), which one lane
+reads in order. A unit whose body is neither, or a descriptor naming no object
+or more than that, is failed back to the feed. A whole-object part over one
+object is cut into byte ranges on the conditions in
 [Large objects and byte ranges](#large-objects-and-byte-ranges), with the ETag
 taken from the descriptor or the notification, so a part with no ETag is read
 whole on one lane. A unit naming a byte range is failed back when its range is
@@ -355,23 +372,25 @@ every hold 12 hours after the receive, so a delivery still waiting then goes
 back to the queue unread, one receive closer to `maxReceiveCount`. On Kafka a
 waiting delivery's offset holds back its partition's commit point.
 
-`units_held` bounds the lanes the source reads at once, one per whole object or
-range, and with them its read parallelism. The default is 96.
+`units_held` bounds the lanes the source reads at once, one per unit or range in
+progress, and with them its read parallelism. The default is twice the pipeline
+thread count, the value `spate_pipeline_threads` reports. A source opened
+outside a pipeline, with no thread count, holds 96. At startup the source logs
+at `INFO` the units it holds and their `origin`: `explicit` for `units_held`,
+`derived` for the thread count and `fallback` for 96.
 
 The default has two costs. Read-ahead memory follows the
 [overlap estimate](#read-parallelism): about
-`2 × units_held × prefetch_bytes`, which is 2 × 96 × 8 MiB = 1,536 MiB at the
-defaults. This is arithmetic and has not been measured. A unit is acknowledged,
-and its slot freed, only after the sink has written its last row, so a batch of
-small units waits up to `batch.linger` for a seal. While the held units total
-fewer rows than `batch.max_rows` and fewer bytes than `batch.max_bytes`, a
-worker completes at most `units_held / batch.linger` units a second: 96 a
-second at the defaults. A batch that reaches either threshold seals without
-waiting for the linger.
-With 96 units held, 4,608 local objects of 64 KB and 20 ms of added GET
-latency on one laptop, a run read 93.4 objects a second at the default 1 s
-linger and 3,124 at 5 ms. A lower `batch.linger` or more units held raises the
-ceiling.
+`3 × units_held × prefetch_bytes`, which at the defaults is 48 MiB per pipeline
+thread: 2 units of 3 × 8 MiB each. This is arithmetic and has not been
+measured. A unit is acknowledged, and its slot freed, only after the sink has
+written its last row, so a batch of small units waits up to `batch.linger` for
+a seal. While the held units total fewer rows than `batch.max_rows` and fewer
+bytes than `batch.max_bytes`, a worker completes at most
+`units_held / batch.linger` units a second: twice the pipeline thread count a
+second at the defaults, each unit up to 16 small objects. A batch that reaches
+either threshold seals without waiting for the linger. A lower `batch.linger`
+or more units held raises the ceiling.
 
 On a durable
 feed the source lists nothing. It reads the units and storage notifications
@@ -449,9 +468,11 @@ Each record is decided on its own:
 - a record whose `eventName` is not `ObjectCreated:*`, with or without the
   `s3:` prefix, is dropped, whatever its bucket;
 - a created object of size 0 in the source's bucket, under its prefix and
-  with a key that decodes, is dropped, since it holds no records, even under a
-  key `object_store` cannot read under its own name;
+  with a key that decodes, or one read as written, is dropped, since it holds
+  no records, even under a key `object_store` cannot read under its own name;
 - every other created record is one part of the message's unit. Its key is
+  read as written when the record's `eventSource` is `ceph:s3`, as Ceph RGW
+  sends it. Any other key, and the key of a unit the source re-enqueued, is
   decoded as `application/x-www-form-urlencoded` (`+` is a space, then
   percent-decoding as UTF-8), so `%2F` and a raw `/` give the same key. Its
   ETag is sent quoted in `If-Match`.
@@ -465,7 +486,7 @@ any created record:
 - names a key outside the `url`'s prefix, taken with the `/` the listing
   appends;
 - has no size, or a size that is not a non-negative integer;
-- has a key that does not decode;
+- has a key that does not decode, when it is decoded;
 - has a key `object_store` cannot read under its own name, for an object of
   one byte or more: an empty, `.` or `..` segment, an ASCII control
   character, or a leading or trailing `/`;
@@ -494,10 +515,11 @@ so the feed dead-letters its message at the cap. An object overwritten before or
 during its read is re-enqueued at its current ETag when its notification carries
 an ETag, and is read in its new contents when the notification carries none. A
 notification's unit is a unit of its own, with the feed message's id (the SQS
-`MessageId`, or the Kafka message key), so an object that both a listing and a
-notification announce is read twice. A unit the source re-enqueues keeps the id
-of the unit it replaces. A store sends no notification for an object written
-before the bucket's notification configuration takes effect; on AWS S3 that
+`MessageId`, or the Kafka message key, or its position when it has none), so
+an object that both a listing and a notification announce is read twice. A
+unit the source re-enqueues keeps the id of the unit it replaces. A store sends
+no notification for an object written before the bucket's notification
+configuration takes effect; on AWS S3 that
 window lasted at least 181 seconds after the configuration was written, in one
 measured run
 ([ADR-0072](../../../../adr/0072-missed-storage-notifications-are-not-reconciled-by-re-listing.md)).
@@ -519,13 +541,28 @@ Each store needs its own settings for its notifications to arrive:
   RustFS writes each event with timestamp 0, so the work topic needs the
   setting the [Kafka feed](../../feeds/kafka/README.mdx#topics) page states,
   and the feed refuses a work topic without it.
-- **Ceph RGW.** The source does not read RGW's notifications. RGW sends them
-  over HTTP, AMQP or Kafka, never to SQS
-  ([Ceph](https://docs.ceph.com/en/latest/radosgw/notifications/)), and it
-  produces each Kafka message without a key, which the
-  [Kafka feed](../../feeds/kafka/README.mdx#counting-deliveries) dead-letters.
-  RGW also writes a record's key unencoded, and the source decodes every key,
-  so a key holding `+` or `%` decodes to another key.
+- **Ceph RGW.** RGW sends notifications over HTTP, AMQP or Kafka, never to SQS
+  ([Ceph](https://docs.ceph.com/en/latest/radosgw/notifications/)). It produces
+  each Kafka message without a key, and the [Kafka
+  feed](../../feeds/kafka/README.mdx#message-mapping) names that message's unit
+  by its position. Create the topic with `persistent=true` and leave
+  `kafka-ack-level` at `broker`; on a topic that is not persistent, an event
+  that fails to send is lost. The bucket's notification configuration sends
+  `s3:ObjectCreated:*` to that topic. On a persistent topic, RGW reserves 4 KB
+  of the topic's queue for each event before the write. An event carries the
+  object's key, its tags, its `x-amz-meta-*` metadata and the topic's
+  `OpaqueData`. An event larger than 4 KB is dropped, and its write still
+  succeeds, when the queue has room for the reservation but not for the whole
+  event. Once less than 4 KB is left, RGW refuses every write with 503
+  `SlowDown`. Keep the key, tags, metadata and `OpaqueData` short enough that
+  each event stays under 4 KB. RGW writes a record's key unencoded, and the
+  source reads it as written. RGW announces a multipart object at the sum of its
+  stored part sizes, which is the object's size only when the bucket's placement
+  neither compresses nor encrypts it. A notified bucket needs neither, since the
+  source reads an object up to its announced size.
+- **Garage.** Garage implements no bucket notification configuration
+  ([Garage](https://garagehq.deuxfleurs.fr/documentation/reference-manual/s3-compatibility/)),
+  so a source on a Garage bucket reads only the units a lister run publishes.
 
 #### Reading a notification's object
 
@@ -634,10 +671,10 @@ keeps no checkpoint and logs a WARN: every run lists the prefix from the start.
 Resume finds every key while the store lists keys in the same order in the run
 that wrote `checkpoint` and in the run that resumes from it. AWS S3
 general-purpose buckets list in UTF-8 byte order; the CI suite checks resume on
-RustFS only. Resume is unsupported on SeaweedFS, where it skips keys: SeaweedFS
-lists in directory-tree order, so a resume after a key that is also a
-directory prefix (`q/r` beside `q/r/s`) skips that directory. Its listings can
-also end early; see [Testing](#testing).
+RustFS, Ceph RGW and Garage. Resume is unsupported on SeaweedFS, where it skips
+keys: SeaweedFS lists in directory-tree order, so a resume after a key that is
+also a directory prefix (`q/r` beside `q/r/s`) skips that directory. Its
+listings can also end early; see [Testing](#testing).
 
 :::danger
 A run at a location that holds the job's fingerprint and a `checkpoint` never
@@ -708,7 +745,10 @@ absent, so a lister whose `store` sets `aws_conditional_put: disabled` fails.
 Run one lister per location: a second lister with another fingerprint is refused
 when it reads the first's fingerprint, and, when both read before either wrote
 one, by the conditional create on a store that honors `If-None-Match`, which the
-CI suite checks on RustFS only. The location needs read-after-write and
+CI suite checks on RustFS and Ceph RGW. Garage ignores `If-None-Match`, so there
+only the read refuses the later lister
+([Garage](https://garagehq.deuxfleurs.fr/documentation/reference-manual/known-issues/)).
+The location needs read-after-write and
 read-after-delete consistency, which means `consistency_mode = "consistent"` on
 Garage and one zone on Ceph RGW. A `file://` location serves the processes of
 one host.
@@ -777,8 +817,9 @@ and a call from a thread in a Tokio runtime context, such as async code or a
 A unit the feed rejects as retryable is published again, up to five attempts,
 after waits of 200 ms, 400 ms, 800 ms and 1.6 s. A unit the feed refuses, or
 still rejects after the fifth attempt, fails the run, and the error names its
-object. A failed run returns its error, so a binary that returns it from
-`main()` exits non-zero, and the next run resumes after the checkpoint.
+first object and, for a unit of several, how many it holds. A failed run returns
+its error, so a binary that returns it from `main()` exits non-zero, and the
+next run resumes after the checkpoint.
 
 The lister adds no timeout of its own. Each request to the store is bounded by
 `object_store`'s retries, about three minutes. A publish waits as long as its
@@ -808,9 +849,14 @@ version constant), and a byte-range unit's id also digests its range and
 delimiter. Every GET is pinned `If-Match` to the descriptor's ETag. What that
 buys:
 
-- **Publishing again is idempotent in identity.** The same listing gives the
-  same ids, so a lister that resumes republishes the units after its
-  checkpoint under the ids it used before.
+- **Publishing again is idempotent in identity.** On a store that lists keys
+  in order, where the lister keeps a checkpoint, a resumed lister packs the
+  keys after its checkpoint as the earlier run did and republishes them under
+  the same ids, unless an empty object listed between that checkpoint and the
+  next checkpoint write moved where the earlier run closed its units. Over a
+  store that does not, such as an S3 directory bucket or
+  `file://`, two listings can pack differently, and a unit already read is
+  read again under a new id.
 - **An overwritten object can never splice.** Under an in-flight unit the pin
   trips (a `Precondition` failure fails the unit); a later listing sees the new
   content under a *new* id, never a silent match against stale progress.
@@ -833,7 +879,8 @@ The source keeps no progress of its own. It acknowledges a unit to the feed once
 the sink has acknowledged every record in it, and a unit delivered again is read
 from its start. Everything in a unit not yet acknowledged replays after a crash
 or a stop; duplicates are possible, loss is not. A unit is as large as one
-object or one byte range, so a replay re-reads at most that.
+byte range, up to 16 small objects, or one object read whole, so a replay
+re-reads at most that.
 
 Limits: ~1.1 × 10¹² records per object or byte range (2⁴⁰ − 2); an object
 that overflows it fails its unit before any offset can be corrupted, as any
@@ -885,21 +932,23 @@ reads every object whole, and logs that at `INFO` when it opens.
 Object-level read problems are not record errors, and they are not instant
 pipeline failures either. Transient failures are retried inside the source
 (capped backoff, ranged re-reads pinned to the ETag). Anything object-terminal
-**fails the unit**: a key deleted after listing, an overwrite tripping the
-`If-Match` pin, corrupt or truncated content, or an exhausted retry budget. The
-unit is failed back to the feed (counted in
+**fails the unit**: a key deleted after it was listed or announced, an overwrite
+tripping the `If-Match` pin, corrupt or truncated content, or an exhausted retry
+budget. The unit is failed back to the feed (counted in
 `spate_s3_source_objects_failed_total{reason}`) and delivered again, until the
-feed dead-letters it at its
-cap. A bounded job with a dead-lettered unit ends **stalled**, which is fatal,
-so `run()` returns `ExitState::Failed` rather than a silently partial
-`Completed`, as [How a bounded job ends](#how-a-bounded-job-ends) describes.
+feed dead-letters it at its cap. A unit of several small objects fails back with
+all of them, and the feed dead-letters them together. A bounded job with a
+dead-lettered unit ends **stalled**, which is fatal, so `run()` returns
+`ExitState::Failed` rather than a silently partial `Completed`, as
+[How a bounded job ends](#how-a-bounded-job-ends) describes.
 
 A key the S3 client cannot address fails as well. The client rejects a key
 with an empty segment (`d//x.ndjson`), a `.` or `..` segment, or an ASCII
 control character, and reads a key that starts or ends with `/` under a
 different key. The listing still returns every other object. Each object with
-such a key is a unit of its own, which fails on its first read and names the
-key, and the objects listed beside it are read. An object with such a key and no
+such a key is a unit of its own, shared with no other object, which fails on
+its first read and names the key, and the objects listed beside it are
+read. An object with such a key and no
 bytes, such as a folder marker `dir/`, holds no records and gets no unit.
 
 There is no skip-an-object mode; the reasoning is in
@@ -909,12 +958,22 @@ unit lets the rest of the backfill finish first. An overwrite of a notification
 unit's object is re-enqueued instead, as
 [Reading a notification's object](#reading-a-notifications-object) describes.
 
+## Supported stores
+
+| Store | Basis |
+| --- | --- |
+| AWS S3 | AWS's documentation. CI does not run against AWS. |
+| RustFS | A CI lane runs the Docker-gated suites against the newest release. |
+| Ceph RGW | A CI lane runs the Docker-gated suites against the newest release. A [job location](#bounded-jobs-and-the-job-location) there needs one zone. |
+| Garage | A CI lane runs the Docker-gated suites against the newest release, except the notification suite, since Garage sends no bucket notifications. A [job location](#bounded-jobs-and-the-job-location) there needs `consistency_mode = "consistent"`. |
+
 ## Testing
 
 The whole feed path runs against `file://` URLs with no infrastructure, which
 is what [`s3_backfill.rs`](repo:crates/spate/examples/s3_backfill.rs) does.
-The Docker-gated suites run against a **RustFS** S3 store
-(`cargo test -p spate-s3 -- --ignored --test-threads=1`).
+The Docker-gated suites run against the store `SPATE_S3_LANE` selects, RustFS
+when it is unset (`SPATE_S3_LANE=rustfs cargo xtask integration-test`).
+[Supported stores](#supported-stores) lists which stores CI runs.
 
 The S3 source ends a listing at the first `ListObjectsV2` page that carries no
 continuation token. The store must return one on every page that has keys after
@@ -937,11 +996,11 @@ noted per family.
 | Metric | Type | Extra labels | Description |
 |---|---|---|---|
 | `spate_s3_source_objects_completed_total` | counter | | Objects fully framed and handed to the pipeline by this worker. A cut object counts once per range, so the count can exceed the number of objects. |
-| `spate_s3_source_objects_remaining` | gauge | | Objects not yet completed across **this worker's currently-held units** (rises when a lane opens, falls per completed object, settles when the lane closes). A cut object counts once per range. |
+| `spate_s3_source_objects_remaining` | gauge | | Objects not yet completed across **this worker's currently-held units** (rises by the objects a lane reads when it opens, falls per completed object, settles when the lane closes). A cut object counts once per range. |
 | `spate_s3_source_bytes_read_total` | counter | | Bytes read from the store, as stored (pre-decompression), including the bytes a byte range reads around its edges and drops. |
 | `spate_s3_source_bytes_decoded_total` | counter | | Bytes after decompression; for a byte range, the bytes of the records it owns. Equals `bytes_read` for uncompressed objects read whole; the ratio is the effective compression. |
 | `spate_s3_source_get_retries_total` | counter | | Object GET and HEAD attempts beyond the first (transient failures, resumed with ranged reads). A rising rate means a flaky store or network; an exhausted attempt budget fails the unit rather than the pipeline. |
-| `spate_s3_source_objects_failed_total` | counter | `reason` | Objects, or byte ranges of one, that failed their unit: `not_found` (deleted after listing, or a key that is not a valid object path), `etag_drift` (overwritten under the `If-Match` pin; a notification unit's re-enqueued overwrite is counted in `objects_overwritten_total` instead), `undecodable` (corrupt/truncated content, over the per-object record limit, or unverifiable without an ETag), `retries_exhausted`. Each report fails the unit back to the feed, which dead-letters it at its cap. |
+| `spate_s3_source_objects_failed_total` | counter | `reason` | Objects, or byte ranges of one, that failed their unit: `not_found` (a `404` for an object deleted after it was listed or announced, or a listed key that is not a valid object path), `etag_drift` (overwritten under the `If-Match` pin; a notification unit's re-enqueued overwrite is counted in `objects_overwritten_total` instead), `undecodable` (corrupt/truncated content, over the per-object record limit, or unverifiable without an ETag), `retries_exhausted`. Each report fails the unit back to the feed, which dead-letters it at its cap, with every other object the unit names. |
 | `spate_s3_source_objects_overwritten_total` | counter | | Objects a notification unit's read found overwritten under its ETag pin, once per object and delivery, whether re-enqueued or not. See [Reading a notification's object](#reading-a-notifications-object). |
 | `spate_s3_source_overwrites_dropped_total` | counter | | Of those, the objects whose unit was at the re-enqueue cap and was acknowledged without a re-enqueue. A non-zero value means an overwrite may have been dropped. |
 

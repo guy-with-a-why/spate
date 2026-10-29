@@ -84,14 +84,18 @@ pub struct S3SourceConfig {
     pub compression: Compression,
     /// Size above which an uncompressed object with an ETag, at most 50,000
     /// GiB, is cut into byte ranges of at most this size, one unit each, when
-    /// the framer declares a resync delimiter. Any other object is one unit.
-    /// Part of the bounded feed job fingerprint: every instance of a bounded
-    /// job must agree on it. Default 64 MiB.
+    /// the framer declares a resync delimiter. The lister packs objects read
+    /// whole into shared units of at most this many bytes and 16 objects, in
+    /// listing order; an object read whole above it is one unit. Part of the
+    /// bounded feed job fingerprint: every instance of a bounded job must
+    /// agree on it. Default 64 MiB.
     #[serde(default = "default_split_target_bytes")]
     pub split_target_bytes: ByteSize,
-    /// Target GET window size for ETag-pinned reads. Queued chunks retain
-    /// backing windows while a later GET is fetched; decoded records require
-    /// additional memory. Byte-range boundary windows can add `chunk_bytes`
+    /// Target GET window size for ETag-pinned reads. A lane reads its next
+    /// window while it hands on the current one, and queued chunks retain the
+    /// window before that, so a lane holds three windows when each spans at
+    /// least four `chunk_bytes`, and more when windows are shorter; decoded
+    /// records require additional memory. Byte-range boundary windows can add `chunk_bytes`
     /// to this size. Whole-object reads at or below this size use a single GET.
     ///
     /// Keep this modest. A large window is read as one long-held GET, which
@@ -102,7 +106,9 @@ pub struct S3SourceConfig {
     /// suits typical objects.
     #[serde(default = "default_prefetch_bytes")]
     pub prefetch_bytes: ByteSize,
-    /// Target size of a single buffered chunk.
+    /// Target size of a single buffered chunk. The next GET starts when a
+    /// window's chunks start moving, so read-ahead does not depend on this
+    /// size.
     #[serde(default = "default_chunk_bytes")]
     pub chunk_bytes: ByteSize,
     /// Raw `object_store` options, applied when building the store from

@@ -750,8 +750,14 @@ impl Feed for Observing {
     fn publish(&self, unit: Unit) -> Confirmation {
         self.first.lock().unwrap().get_or_insert_with(|| {
             (
-                self.location.join("end").exists(),
-                self.location.join("fingerprint").exists(),
+                self.location
+                    .join("end")
+                    .try_exists()
+                    .expect("stat the end marker"),
+                self.location
+                    .join("fingerprint")
+                    .try_exists()
+                    .expect("stat the fingerprint"),
             )
         });
         self.inner.publish(unit)
@@ -832,7 +838,7 @@ fn a_first_lister_run_on_an_empty_file_location_starts() {
         fs::read_to_string(path.join("fingerprint")).unwrap(),
         fingerprint(&data, "Auto", "0a")
     );
-    assert!(!path.join("checkpoint").exists());
+    assert!(!path.join("checkpoint").try_exists().unwrap());
 }
 
 /// Pins that a lister over a store given to `with_store` under a `file://`
@@ -852,8 +858,8 @@ fn a_lister_over_an_injected_store_under_a_file_url_keeps_no_checkpoint() {
         .list_once(&section("scripted", Some(&location)), Arc::new(feed))
         .unwrap();
     assert_eq!(script.published().len(), 1);
-    assert!(path.join("fingerprint").exists());
-    assert!(!path.join("checkpoint").exists());
+    assert!(path.join("fingerprint").try_exists().unwrap());
+    assert!(!path.join("checkpoint").try_exists().unwrap());
 }
 
 /// Pins that a lister finding another fingerprint, differing in the
@@ -1029,17 +1035,9 @@ fn resuming_source(
         .with_location_store(Arc::clone(location))
 }
 
-/// The key of each published unit, in publish order.
+/// The keys every published unit names, in publish order.
 fn published_keys(script: &spate_test::FeedScript) -> Vec<String> {
-    script
-        .published()
-        .iter()
-        .map(|u| {
-            SplitDescriptor::decode(&u.body).unwrap().objects[0]
-                .key
-                .clone()
-        })
-        .collect()
+    script.published().iter().flat_map(unit_keys).collect()
 }
 
 /// Pins resume end to end through `list_once`: a second run lists only the
@@ -1151,11 +1149,12 @@ fn a_lister_on_the_memory_feed_with_a_location_refuses() {
     assert_eq!(hooks.requests(), 0);
 }
 
-/// Pins the published units: one whole unit per small object and ranges
-/// tiling a large one, with the ids the public derivations mint, and
-/// nothing from the location.
+/// Pins the published units through `list_once`: each small object in
+/// exactly one whole unit, which it shares when the large object does not
+/// list between them, and ranges tiling the large one, with the ids the
+/// public derivations mint, and nothing from the location.
 #[test]
-fn a_lister_run_publishes_one_unit_per_listed_part() {
+fn a_lister_run_publishes_small_objects_together_and_ranges_alone() {
     let dir = tempfile::tempdir().unwrap();
     let data = data_dir(&dir);
     fs::write(data.join("a.ndjson"), lines_bytes(&recs("a", 5))).unwrap();
@@ -1176,52 +1175,50 @@ fn a_lister_run_publishes_one_unit_per_listed_part() {
         .list_once(&section("scripted", Some(&location)), Arc::new(feed))
         .unwrap();
 
-    let mut by_key: BTreeMap<String, Vec<(String, SplitDescriptor)>> = BTreeMap::new();
+    let mut whole: BTreeMap<String, usize> = BTreeMap::new();
+    let mut next = 0;
     for unit in script.published() {
         let descriptor = SplitDescriptor::decode(&unit.body).unwrap();
-        assert_eq!(descriptor.objects.len(), 1);
-        let key = descriptor.objects[0].key.clone();
-        by_key.entry(key).or_default().push((unit.id, descriptor));
-    }
-    let names: Vec<&str> = by_key
-        .keys()
-        .map(|k| k.rsplit('/').next().unwrap())
-        .collect();
-    assert_eq!(names, ["a.ndjson", "b.ndjson", "big.ndjson"]);
-    for (key, units) in &by_key {
-        let object = &units[0].1.objects[0];
-        let etag = object.etag.as_deref();
-        if key.ends_with("big.ndjson") {
-            let mut next = 0;
-            for (id, descriptor) in units {
-                let range = descriptor.range.expect("the big object is read in ranges");
-                assert_eq!(range.start, next);
-                assert_eq!(
-                    id,
-                    split_id_for_range(key, etag.unwrap(), range)
-                        .unwrap()
-                        .as_str()
-                );
-                next = range.end;
-            }
-            assert_eq!(next, big_size, "the ranges tile the object");
-            assert!(units.len() >= 2);
-        } else {
-            assert_eq!(units.len(), 1, "{key} is one whole unit");
-            let (id, descriptor) = &units[0];
-            assert_eq!(descriptor.range, None);
-            assert_eq!(id, split_id_for([(key.as_str(), etag)]).unwrap().as_str());
+        if let Some(range) = descriptor.range {
+            let object = &descriptor.objects[0];
+            assert!(object.key.ends_with("big.ndjson"));
+            assert_eq!(range.start, next);
+            let want =
+                split_id_for_range(&object.key, object.etag.as_deref().unwrap(), range).unwrap();
+            assert_eq!(unit.id, want);
+            next = range.end;
+            continue;
+        }
+        let want = split_id_for(
+            descriptor
+                .objects
+                .iter()
+                .map(|o| (o.key.as_str(), o.etag.as_deref())),
+        )
+        .unwrap();
+        assert_eq!(unit.id, want, "a whole unit's id is its member set's");
+        for object in &descriptor.objects {
+            *whole.entry(object.key.clone()).or_default() += 1;
         }
     }
+    assert_eq!(next, big_size, "the ranges tile the large object");
+    let names: Vec<(&str, usize)> = whole
+        .iter()
+        .map(|(k, n)| (k.rsplit('/').next().unwrap(), *n))
+        .collect();
+    assert_eq!(names, [("a.ndjson", 1), ("b.ndjson", 1)]);
 }
 
-/// Pins the store behaviour the lister's conditional create rests on: a
-/// second create of one key reports `AlreadyExists`.
+/// Pins each store's answer to a second conditional create of one key, the
+/// answer the lister's read-first fingerprint check rests on. Garage stores
+/// the second body and answers `Ok`, as `HookStore::creates_overwrite`
+/// models it.
 #[test]
 #[ignore = "requires Docker"]
-fn a_second_conditional_create_at_the_location_reports_already_exists() {
+fn a_second_conditional_create_at_the_location_ends_as_the_store_answers() {
     use object_store::{ObjectStoreExt as _, PutMode, PutPayload};
-    let gw = support::rustfs::Gateway::start("job-location");
+    use spate_test_support::Store;
+    let gw = support::store::Gateway::start("job-location");
     let key = object_store::path::Path::from("jobs/a/fingerprint");
     gw.rt.block_on(async {
         gw.client
@@ -1239,15 +1236,102 @@ fn a_second_conditional_create_at_the_location_reports_already_exists() {
                 PutPayload::from_static(b"second"),
                 PutMode::Create.into(),
             )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(second, object_store::Error::AlreadyExists { .. }),
-            "{second:?}"
-        );
+            .await;
         let stored = gw.client.get(&key).await.unwrap().bytes().await.unwrap();
-        assert_eq!(&stored[..], b"first");
+        match gw.store() {
+            Store::Rustfs | Store::Rgw => {
+                assert!(
+                    matches!(second, Err(object_store::Error::AlreadyExists { .. })),
+                    "{second:?}"
+                );
+                assert_eq!(&stored[..], b"first");
+            }
+            Store::Garage => {
+                assert!(second.is_ok(), "{second:?}");
+                assert_eq!(&stored[..], b"second");
+            }
+        }
     });
+}
+
+/// Pins what a lister does on each store when a rival writes another
+/// fingerprint between its read and its conditional create. A store that
+/// honors `If-None-Match` refuses the create, and the lister fails naming
+/// both fingerprints before it publishes. Garage stores the create over the
+/// rival's, and the lister publishes.
+#[test]
+#[ignore = "requires Docker"]
+fn a_lister_whose_create_follows_a_rivals_write_ends_as_the_store_answers() {
+    use object_store::ObjectStoreExt as _;
+    use spate_test_support::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    fs::write(data.join("a.ndjson"), lines_bytes(&recs("a", 5))).unwrap();
+    let gw = support::store::Gateway::start("rival-lister");
+    let (store, hooks) = support::location::location_store_over(Arc::clone(&gw.client));
+    let theirs = fingerprint(&data, "None", "0a");
+    let mine = fingerprint(&data, "Auto", "0a");
+    hooks.on_next_create(OnCreate::PutFirst(theirs.clone().into_bytes()));
+    let rt = runtime();
+    let (feed, script) = scripted_feed();
+    let location = format!("s3://{}/jobs/a/", gw.bucket);
+    let run = lister_source(&data, &rt, "")
+        .with_location_store(store)
+        .list_once(&section("scripted", Some(&location)), Arc::new(feed));
+    let stored = gw.rt.block_on(async {
+        let key = object_store::path::Path::from("jobs/a/fingerprint");
+        gw.client.get(&key).await.unwrap().bytes().await.unwrap()
+    });
+    assert_eq!(hooks.creates(), 1);
+    match gw.store() {
+        Store::Rustfs | Store::Rgw => {
+            let err = run.unwrap_err().to_string();
+            assert!(err.contains(&theirs), "{err}");
+            assert!(err.contains(&mine), "{err}");
+            assert!(script.published().is_empty());
+            assert_eq!(&stored[..], theirs.as_bytes());
+        }
+        Store::Garage => {
+            run.unwrap();
+            assert_eq!(script.published().len(), 1);
+            assert_eq!(&stored[..], mine.as_bytes());
+        }
+    }
+}
+
+/// Pins that a lister with another fingerprint is refused by its read of the
+/// stored one on a real store, before it publishes. On a store that ignores
+/// `If-None-Match` the read is the only guard.
+#[test]
+#[ignore = "requires Docker"]
+fn a_lister_with_another_fingerprint_is_refused_by_its_read_on_the_store() {
+    use object_store::ObjectStoreExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    fs::write(data.join("a.ndjson"), lines_bytes(&recs("a", 5))).unwrap();
+    let gw = support::store::Gateway::start("refused-lister");
+    let location = format!("s3://{}/jobs/a/", gw.bucket);
+    let rt = runtime();
+    let (feed, _) = scripted_feed();
+    lister_source(&data, &rt, "")
+        .with_location_store(Arc::clone(&gw.client))
+        .list_once(&section("scripted", Some(&location)), Arc::new(feed))
+        .unwrap();
+    let (feed, script) = scripted_feed();
+    let err = lister_source(&data, &rt, "compression: none\n")
+        .with_location_store(Arc::clone(&gw.client))
+        .list_once(&section("scripted", Some(&location)), Arc::new(feed))
+        .unwrap_err()
+        .to_string();
+    let first = fingerprint(&data, "Auto", "0a");
+    assert!(err.contains(&first), "{err}");
+    assert!(err.contains(&fingerprint(&data, "None", "0a")), "{err}");
+    assert!(script.published().is_empty());
+    let stored = gw.rt.block_on(async {
+        let key = object_store::path::Path::from("jobs/a/fingerprint");
+        gw.client.get(&key).await.unwrap().bytes().await.unwrap()
+    });
+    assert_eq!(&stored[..], first.as_bytes());
 }
 
 /// Pins resume against a real S3 API: after each chosen key the store
@@ -1262,7 +1346,7 @@ fn resume_after_each_returned_key_publishes_the_rest() {
     use object_store::list::{PaginatedListOptions, PaginatedListStore as _};
     use object_store::path::Path as StorePath;
     use object_store::{ObjectStoreExt as _, PutPayload};
-    let gw = support::rustfs::Gateway::start("lister-resume");
+    let gw = support::store::Gateway::start("lister-resume");
     let named = [
         "data/a-c",
         "data/a/b/y",
@@ -1291,7 +1375,7 @@ fn resume_after_each_returned_key_publishes_the_rest() {
                     PutPayload::from_static(b"row\n"),
                 )
                 .await
-                .unwrap_or_else(|e| panic!("RustFS refused {key}: {e}"));
+                .unwrap_or_else(|e| panic!("the store refused {key}: {e}"));
         }
     });
     gw.put_raw("data/x/", "");
@@ -1307,7 +1391,7 @@ fn resume_after_each_returned_key_publishes_the_rest() {
     assert_eq!(
         first.result.objects.len(),
         1000,
-        "RustFS pages hold 1,000 keys"
+        "the store pages hold 1,000 keys"
     );
     assert_eq!((last.location.as_ref(), last.size), ("data/x", 0));
     assert!(first.page_token.is_some());
@@ -1328,7 +1412,7 @@ fn resume_after_each_returned_key_publishes_the_rest() {
         .copied()
         .chain(fillers.iter().map(String::as_str))
     {
-        assert!(listed.iter().any(|k| k == key), "RustFS lists {key}");
+        assert!(listed.iter().any(|k| k == key), "the store lists {key}");
     }
     assert_eq!(listed.len(), named.len() + fillers.len());
 
@@ -1379,11 +1463,83 @@ fn resume_after_each_returned_key_publishes_the_rest() {
     assert_eq!(published_keys(&script), listed[at + 1..]);
 }
 
-/// The key a published unit names.
-fn unit_key(unit: &Unit) -> String {
-    SplitDescriptor::decode(&unit.body).unwrap().objects[0]
-        .key
-        .clone()
+/// Pins against a real S3 API that a lister run resumed at the checkpoint
+/// an uninterrupted run wrote packs the keys after it, across a page
+/// boundary, into the units and ids the uninterrupted run published, which
+/// holds only where the store lists keys in order.
+#[test]
+#[ignore = "requires Docker"]
+fn a_resumed_lister_run_publishes_the_ids_of_an_uninterrupted_one() {
+    use object_store::path::Path as StorePath;
+    use object_store::{ObjectStoreExt as _, PutPayload};
+    let gw = support::store::Gateway::start("lister-packed-resume");
+    let keys: Vec<String> = (0..1200).map(|i| format!("data/k{i:04}")).collect();
+    gw.rt.block_on(async {
+        for key in &keys {
+            gw.client
+                .put(
+                    &StorePath::from(key.as_str()),
+                    PutPayload::from_static(b"row\n"),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let section = section("scripted", Some(&format!("s3://{}/jobs/a/", gw.bucket)));
+    let rt = runtime();
+    let source = || {
+        let body = format!(
+            "url: \"s3://{}/data/\"\nsplit_target_bytes: 1MiB\nstore:\n{}\n",
+            gw.bucket,
+            gw.store_options_yaml()
+        );
+        let config = spate_test::component_config("s3", &body);
+        line_framer(S3Source::from_component_config(&config, rt.handle().clone()).unwrap())
+    };
+    let units = |script: &spate_test::FeedScript| -> Vec<(String, Vec<String>)> {
+        script
+            .published()
+            .iter()
+            .map(|u| (u.id.clone(), unit_keys(u)))
+            .collect()
+    };
+
+    let (feed, script) = scripted_feed();
+    source().list_once(&section, Arc::new(feed)).unwrap();
+    let whole = units(&script);
+    assert_eq!(
+        published_keys(&script),
+        keys,
+        "the store lists keys in order"
+    );
+    assert!(whole.iter().any(|(_, m)| m.len() >= 2), "{whole:?}");
+
+    // The checkpoint the uninterrupted run wrote after its first thousand
+    // keys.
+    let at = &keys[999];
+    gw.rt
+        .block_on(gw.client.put(
+            &StorePath::from("jobs/a/checkpoint"),
+            PutPayload::from(at.clone()),
+        ))
+        .unwrap();
+    let (feed, script) = scripted_feed();
+    source().list_once(&section, Arc::new(feed)).unwrap();
+    let after: Vec<(String, Vec<String>)> = whole
+        .into_iter()
+        .filter(|(_, m)| m.iter().all(|k| k > at))
+        .collect();
+    assert_eq!(units(&script), after);
+}
+
+/// The keys a published unit names, in order.
+fn unit_keys(unit: &Unit) -> Vec<String> {
+    SplitDescriptor::decode(&unit.body)
+        .unwrap()
+        .objects
+        .into_iter()
+        .map(|o| o.key)
+        .collect()
 }
 
 /// The end marker's body at a file location, if there is one.
@@ -1411,10 +1567,10 @@ fn client_error(err: &spate_core::error::SourceError) -> (spate_core::error::Err
     }
 }
 
-/// Pins a lister run end to end through `list_once`: it publishes one unit
-/// per listed object, receives nothing, writes an end marker of at most the
-/// location's object cap, and logs the marker with the location and the
-/// unit count.
+/// Pins a lister run end to end through `list_once`: it publishes two small
+/// listed objects as one unit, receives nothing, writes an end marker of at
+/// most the location's object cap, and logs the marker with the location
+/// and the unit and object counts.
 #[test]
 fn a_lister_run_publishes_every_unit_and_an_end_marker() {
     let dir = tempfile::tempdir().unwrap();
@@ -1430,7 +1586,8 @@ fn a_lister_run_publishes_every_unit_and_an_end_marker() {
             .list_once(&section("scripted", Some(&location)), Arc::new(feed))
             .unwrap();
     });
-    let mut keys: Vec<String> = script.published().iter().map(unit_key).collect();
+    assert_eq!(script.published().len(), 1);
+    let mut keys = published_keys(&script);
     keys.sort();
     assert_eq!(keys.len(), 2);
     assert!(
@@ -1448,14 +1605,15 @@ fn a_lister_run_publishes_every_unit_and_an_end_marker() {
         lines.iter().any(|l| l.contains("INFO")
             && l.contains("end marker")
             && l.contains(&location)
-            && l.contains("units=2")),
+            && l.contains("units=1")
+            && l.contains("objects=2")),
         "{lines:#?}"
     );
 }
 
 /// Pins that a lister run whose unit the feed refuses fails as fatal,
-/// naming the refused object, and leaves no end marker, though an earlier
-/// run at the location left one.
+/// naming the refused unit's first object, and leaves no end marker, though
+/// an earlier run at the location left one.
 #[test]
 fn a_refused_unit_withholds_the_end_marker() {
     let dir = tempfile::tempdir().unwrap();
@@ -1477,7 +1635,8 @@ fn a_refused_unit_withholds_the_end_marker() {
         .unwrap_err();
     let (class, reason) = client_error(&err);
     assert_eq!(class, spate_core::error::ErrorClass::Fatal, "{err}");
-    let refused = unit_key(&script.published()[2]);
+    // The first run published one unit.
+    let refused = unit_keys(&script.published()[1]).remove(0);
     assert!(reason.contains(&refused), "{reason}");
     assert_eq!(end_marker(&path), None);
 }
@@ -1656,17 +1815,20 @@ fn a_solo_run_warns_that_it_lists_from_the_beginning() {
 }
 
 /// Pins that a solo run reads a listed unit while its listing is still
-/// running, and reads every row once after the listing ends.
+/// running, the first sixteen small objects filling one unit, and reads
+/// every row once after the listing ends.
 #[test]
 fn a_solo_run_reads_while_it_lists() {
     let dir = tempfile::tempdir().unwrap();
     let data = data_dir(&dir);
-    let a = recs("a", 5);
-    let b = recs("b", 5);
-    fs::write(data.join("a.ndjson"), lines_bytes(&a)).unwrap();
-    fs::write(data.join("b.ndjson"), lines_bytes(&b)).unwrap();
+    let mut all = Vec::new();
+    for i in 0..17 {
+        let rows = recs(&format!("o{i}"), 2);
+        fs::write(data.join(format!("o{i:02}.ndjson")), lines_bytes(&rows)).unwrap();
+        all.extend(rows);
+    }
     let (store, spy) = spying_local_store(SpyOptions {
-        list_gate: Some(1),
+        list_gate: Some(16),
         ..SpyOptions::default()
     });
     let feed = MemoryFeed::new();
@@ -1683,15 +1845,55 @@ fn a_solo_run_reads_while_it_lists() {
     wait_until(
         DEADLINE,
         "the first unit is read while the listing is held",
-        || feed.counts().acknowledged == 1 && spy.held_lists() == 1,
+        || feed.counts().acknowledged >= 1 && spy.held_lists() == 1,
     );
     spy.release_lists();
     wait_until(DEADLINE, "both units are read", || {
         feed.counts().acknowledged == 2
     });
     stop(&l);
-    let both: Vec<String> = a.iter().chain(&b).cloned().collect();
-    assert_eq!(sorted(captured_rows(&l.script)), sorted(both));
+    assert_eq!(sorted(captured_rows(&l.script)), sorted(all));
+}
+
+/// Pins end to end that a solo run reads four small objects as one unit:
+/// the feed acknowledges one unit, every row arrives once, and each object
+/// is read in one GET.
+/// Regression for #1483.
+#[test]
+fn a_solo_run_reads_small_objects_as_one_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    let mut all = Vec::new();
+    for name in ["a", "b", "c", "d"] {
+        let rows = recs(name, 3);
+        fs::write(data.join(format!("{name}.ndjson")), lines_bytes(&rows)).unwrap();
+        all.extend(rows);
+    }
+    let (store, spy) = spying_local_store(SpyOptions::default());
+    let feed = MemoryFeed::new();
+    let yaml = PipelineYaml::file("s3-solo-packed", &data)
+        .section("feed:\n  memory: {}\n")
+        .build();
+    let l = launch_with_feed(
+        &yaml,
+        test_options(),
+        |_| {},
+        Arc::new(feed.clone()),
+        move |source, _io| line_framer(source).with_store(store),
+    );
+    wait_until(DEADLINE, "every row is written", || {
+        captured_rows(&l.script).len() == all.len() && feed.counts().acknowledged >= 1
+    });
+    stop(&l);
+    assert_eq!(
+        feed.counts().acknowledged,
+        1,
+        "one unit for the four objects"
+    );
+    assert_eq!(sorted(captured_rows(&l.script)), sorted(all));
+    let mut objects: Vec<String> = spy.gets().iter().map(|g| g.object().to_owned()).collect();
+    objects.sort();
+    assert_eq!(objects, ["a.ndjson", "b.ndjson", "c.ndjson", "d.ndjson"]);
 }
 
 /// A scripted feed that names itself `memory`, so a section naming the
@@ -1759,9 +1961,12 @@ fn a_stopping_solo_run_receives_nothing_more_from_its_lister() {
         StopClock::frozen(),
         |source, _io| line_framer(source),
     );
-    // The lister cuts `a.ndjson` into two range units.
+    // The lister cuts `a.ndjson` into two range units, and `b` and `c`
+    // share a unit unless `a` lists between them.
     wait_until(DEADLINE, "the lister publishes the prefix", || {
-        script.published().len() == 4
+        let keys = published_keys(&script);
+        let named = |name: &str| keys.iter().filter(|k| k.ends_with(name)).count();
+        named("a.ndjson") == 2 && named("b.ndjson") == 1 && named("c.ndjson") == 1
     });
     wait_until(DEADLINE, "the first write is held", || {
         l.script.held_writes() == 1

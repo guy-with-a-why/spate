@@ -176,6 +176,9 @@ pub struct PipelineRuntime<S: Source> {
     // Set when the drain begins; the drivers read it.
     shutdown: Arc<AtomicBool>,
     stop_clock: Arc<dyn Clock + Send + Sync>,
+    // Drives the commit tick, the fast-commit window, the stall check, the
+    // idle flush and the health probe.
+    clock: crate::clock::SharedClock,
     // How long a `CommitReady` partition keeps the tightened cadence; `None`
     // is one `checkpoint.interval`.
     chase_window: Option<Duration>,
@@ -214,6 +217,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             stop: Arc::new(StopRequest::new(Arc::new(SystemClock))),
             shutdown: Arc::new(AtomicBool::new(false)),
             stop_clock: Arc::new(SystemClock),
+            clock: Arc::new(SystemClock),
             chase_window: None,
             options: RuntimeOptions::default(),
             io: None,
@@ -276,14 +280,31 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         ShutdownHandle(Arc::clone(&self.stop))
     }
 
-    /// Read a graceful stop's reserve and deadlines on `clock`, so a test
-    /// moves them by hand.
+    /// Read a graceful stop's reserve and deadlines, the revocation drain
+    /// deadline, the startup-error grace and the sink's drain budget on
+    /// `clock`, so a test moves them by hand.
     #[cfg(any(test, feature = "testing"))]
     #[doc(hidden)]
     #[must_use]
     pub fn with_stop_clock(mut self, clock: Arc<dyn Clock + Send + Sync>) -> Self {
         *self.stop.clock.lock().expect("stop request lock") = Arc::clone(&clock);
         self.stop_clock = clock;
+        self
+    }
+
+    /// Read the commit tick, the fast-commit window, the stall check, the
+    /// idle flush, the health probe, the feed's dead-letter reads and its call
+    /// timings on `clock`, so a test moves them by hand. Every drain deadline is computed on the stop clock set by
+    /// `with_stop_clock`, and the sink pool counts its share down on its own
+    /// tokio clock.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_clock(
+        mut self,
+        clock: Arc<dyn Clock + Send + Sync + std::panic::RefUnwindSafe>,
+    ) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -447,7 +468,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                     feed.backend().to_owned(),
                 ))
                 .map_err(|e| StartError::Metrics(e.to_string()))?;
-                let feed = Arc::new(MeteredFeed::new(feed, metrics));
+                let feed = Arc::new(MeteredFeed::new(feed, metrics, Arc::clone(&self.clock)));
                 self.source
                     .configure_feed(section, Arc::clone(&feed) as Arc<dyn Feed>, origin)
                     .map_err(|e| StartError::Config(e.to_string()))?;
@@ -456,7 +477,11 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             None => None,
         };
 
-        let health = HealthState::new(threads, HealthThresholds::default());
+        let health = HealthState::with_clock(
+            threads,
+            HealthThresholds::default(),
+            Arc::clone(&self.clock),
+        );
 
         // I/O runtime: sink workers (spawned by the caller-built SinkPool
         // onto this runtime via its own handle), admin server, upkeep,
@@ -518,7 +543,8 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         let (events_tx, events_rx) = crossbeam_channel::unbounded::<DriverEvent>();
         let (to_main_tx, to_main_rx) = crossbeam_channel::unbounded::<ControllerSignal>();
         let (sink_drained_tx, sink_drained_rx) = crossbeam_channel::unbounded::<()>();
-        let checkpointer = Checkpointer::new();
+        let mut checkpointer = Checkpointer::new();
+        checkpointer.set_clock(Arc::clone(&self.clock));
 
         let bp_params = BackpressureParams::from_budget(
             usize::try_from(self.config.backpressure.max_inflight_bytes.as_u64())
@@ -594,6 +620,8 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                     source_ct.clone(),
                 )),
                 shutdown: Arc::clone(&self.shutdown),
+                clock: Arc::clone(&self.clock) as _,
+                stop_clock: Arc::clone(&self.stop_clock),
             };
             let core = core_ids.get(i).copied().flatten();
             let spawned = std::thread::Builder::new()
@@ -610,7 +638,13 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                 Ok(handle) => driver_handles.push(handle),
                 Err(e) => {
                     // Stop the drivers already spawned before bailing out.
-                    stop_drivers(&self.shutdown, &control_txs, driver_handles, drain_timeout);
+                    stop_drivers(
+                        &self.shutdown,
+                        &control_txs,
+                        driver_handles,
+                        drain_timeout,
+                        &*self.stop_clock,
+                    );
                     return Err(StartError::Io(e));
                 }
             }
@@ -640,6 +674,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                             &control_txs_for_stop,
                             driver_handles,
                             drain_timeout,
+                            &*self.stop_clock,
                         );
                         return Err(StartError::AdminBind { addr, source });
                     }
@@ -676,6 +711,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             stop: Arc::clone(&self.stop),
             shutdown: Arc::clone(&self.shutdown),
             stop_clock: Arc::clone(&self.stop_clock),
+            clock: Arc::clone(&self.clock) as _,
             close_share: if kept_feed.as_ref().is_some_and(|f| f.hands_back()) {
                 CLOSE_SHARE
             } else {
@@ -707,6 +743,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                     &control_txs_for_stop,
                     driver_handles,
                     drain_timeout,
+                    &*self.stop_clock,
                 );
                 return Err(StartError::Io(e));
             }
@@ -726,26 +763,27 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         let mut io_busy = IoBusySampler::new(
             self.io_busy_interval,
             self.io_busy_window,
-            Instant::now(),
+            // Real time, since the busy time it is divided into is real.
+            SystemClock.now(),
             metrics::io_busy_reading(&io_runtime_metrics).0,
         );
         let mut dead_letters = self
             .options
             .dead_letter_read_interval
-            .map(|interval| DeadLetterSampler::new(interval, Instant::now()));
+            .map(|interval| DeadLetterSampler::new(interval, self.clock.now()));
 
         let (mut state, final_watermarks, close_by) = loop {
             let (busy, workers) = metrics::io_busy_reading(&io_runtime_metrics);
             sample_io_busy(
                 &mut io_busy,
                 &io_busy_metrics,
-                Instant::now(),
+                SystemClock.now(),
                 busy,
                 workers,
                 &pipeline_name,
             );
             if let (Some(feed), Some(sampler)) = (&kept_feed, &mut dead_letters) {
-                sampler.sample(feed, Instant::now());
+                sampler.sample(feed, self.clock.now());
             }
             match to_main_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(ControllerSignal::LanesDrained { sink_deadline }) => {
@@ -783,6 +821,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                         &control_txs_for_stop,
                         std::mem::take(&mut driver_handles),
                         drain_timeout,
+                        &*self.stop_clock,
                     );
                     if let Some(drain) = drain_fn.take() {
                         sink_drain = Some(io.block_on(drain(drain_timeout)));
@@ -917,9 +956,10 @@ fn stop_drivers<L>(
     control_txs: &[crossbeam_channel::Sender<ThreadControl<L>>],
     driver_handles: Vec<std::thread::JoinHandle<DriverExit>>,
     grace: Duration,
+    stop_clock: &dyn Clock,
 ) {
     shutdown.store(true, Ordering::Relaxed);
-    let deadline = Instant::now() + grace;
+    let deadline = stop_clock.now() + grace;
     let barrier = DrainBarrier::new(control_txs.len());
     for tx in control_txs {
         let _ = tx.send(ThreadControl::Shutdown {
