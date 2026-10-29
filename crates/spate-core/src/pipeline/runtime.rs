@@ -457,12 +457,6 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         // handles bind to the recorder installed above.
         let kept_feed = match resolved_feed {
             Some((section, feed, origin)) => {
-                feed.attach_metrics(Meter::for_component(
-                    feed.backend(),
-                    MetricRole::Feed,
-                    pipeline_name.clone(),
-                    "feed",
-                ));
                 let metrics = FeedMetrics::try_new(&ComponentLabels::new(
                     pipeline_name.clone(),
                     "feed",
@@ -470,6 +464,12 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                 ))
                 .map_err(|e| StartError::Metrics(e.to_string()))?;
                 let feed = Arc::new(MeteredFeed::new(feed, metrics, Arc::clone(&self.clock)));
+                feed.attach_metrics(Meter::for_component(
+                    feed.backend(),
+                    MetricRole::Feed,
+                    pipeline_name.clone(),
+                    "feed",
+                ));
                 self.source
                     .configure_feed(section, Arc::clone(&feed) as Arc<dyn Feed>, origin)
                     .map_err(|e| StartError::Config(e.to_string()))?;

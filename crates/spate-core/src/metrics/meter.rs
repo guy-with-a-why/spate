@@ -220,17 +220,16 @@ impl Meter {
             super::names::PREFIX,
             self.prefix
         );
-        // A local name may not lead with a role segment (`source_`, `sink_`,
-        // `feed_`). The runtime injects those to separate a connector's
-        // families by role (`spate_<ns>_source_*`, `_sink_*`, `_feed_*`), so a
-        // hand-written name with one could otherwise alias a role-scoped
-        // family.
+        // A local name may not lead with a role segment. The runtime injects
+        // one between the namespace and the name (`spate_<ns>_<role>_*`), so a
+        // hand-written name leading with one could alias a role-scoped family.
         let first = name.split('_').next().unwrap_or_default();
         assert!(
             !super::names::ROLE_SEGMENTS.contains(&first),
             "metric local name `{name}` must not begin with the role segment \
-             `{first}_`; the runtime reserves `source_`/`sink_`/`feed_` to scope \
-             a component's families by role"
+             `{first}_`; the runtime reserves {:?} to scope a component's families \
+             by role",
+            super::names::ROLE_SEGMENTS
         );
         format!("{}{name}", self.prefix).into()
     }

@@ -179,10 +179,10 @@ component's `Meter` it derives the end from the source-vs-sink position and
 scopes the family `spate_<namespace>_source_*` / `spate_<namespace>_sink_*`, so
 its source `bytes_total` and its sink `bytes_total` land under distinct names.
 Your connector code is identical at either end. You never name the role, and a
-`Meter` local name may not itself begin with a role segment (`source_`, `sink_`,
-`feed_`), which the runtime reserves for scoping a component by role. Instance
-identity, such as two sinks of the same type, stays in the `component` label,
-where same-meaning series belong.
+`Meter` local name may not itself begin with a role segment, such as `source_`
+or `feed_`, which the runtime reserves for scoping a component by role.
+Instance identity, such as two sinks of the same type, stays in the `component`
+label, where same-meaning series belong.
 
 ### From a pipeline author's operators
 

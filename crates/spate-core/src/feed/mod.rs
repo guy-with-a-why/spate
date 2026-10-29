@@ -264,10 +264,9 @@ pub trait Feed: Send + Sync {
 
     /// Receive a [`Meter`] scoped `spate_<backend>_feed_*` for the backend's
     /// own metric families, pre-labeled with the pipeline, `component="feed"`
-    /// and the [`backend`](Feed::backend) key as `component_type`. The
-    /// runtime calls it when it runs a pipeline on the feed, before the source
-    /// is handed it, and again, with the new pipeline's labels, for each later
-    /// pipeline the feed is handed to. Resolve handles here and keep them,
+    /// and the [`backend`](Feed::backend) key as `component_type`. Called
+    /// before the source is handed the feed, once for each pipeline that runs
+    /// it, with that pipeline's labels. Resolve handles here and keep them,
     /// which `&self` leaves to interior mutability.
     ///
     /// The backend's own tasks until this call, the calls made before it, and

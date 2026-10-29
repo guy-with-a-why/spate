@@ -420,7 +420,8 @@ mod tests {
         rig.fake.deliver([7]);
 
         assert_eq!(rig.feed.backend(), "fake");
-        rig.feed.attach_metrics(Some(Meter::new("p", "feed", "fake")));
+        rig.feed
+            .attach_metrics(Some(Meter::new("p", "feed", "fake")));
         rig.feed.set_waker(waker);
         let delivered = rig.feed.receive(4).unwrap();
         assert_eq!(delivered[0].receipt, Receipt(7));

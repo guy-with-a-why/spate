@@ -854,31 +854,12 @@ mod tests {
         ));
     }
 
-    /// Pins the feed role's scope: a backend's families land under
-    /// `spate_<backend>_feed_*`.
-    #[test]
-    fn a_feed_backend_meter_is_scoped_by_the_feed_role() {
-        let rendered = render_local(|| {
-            Meter::for_component("kafka", MetricRole::Feed, "orders", "feed")
-                .expect("valid namespace")
-                .counter("attempts_total", &[])
-                .increment(3);
-        });
-        assert!(
-            rendered.contains(
-                r#"spate_kafka_feed_attempts_total{pipeline="orders",component="feed",component_type="kafka"} 3"#
-            ),
-            "{rendered}"
-        );
-    }
-
-    /// `feed_` is reserved to the feed role's scoping, so a hand-written name
-    /// starting with it can't alias a backend's family.
+    /// `feed_` is reserved to the feed role's scoping in every namespace, the
+    /// pipeline-author `custom` one included.
     #[test]
     #[should_panic(expected = "role segment")]
     fn a_local_name_may_not_lead_with_the_feed_role() {
-        let _ = Meter::with_namespace("kafka", "orders", "feed", "kafka")
-            .counter("feed_attempts_total", &[]);
+        let _ = Meter::new("p", "c", "t").counter("feed_items_total", &[]);
     }
 
     #[test]
