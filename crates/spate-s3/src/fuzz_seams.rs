@@ -119,7 +119,7 @@ pub fn read_range(
     Some(owned)
 }
 
-/// One part a delivery's body decodes to.
+/// One object of a part a delivery's body decodes to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedPart {
     /// The object key.
@@ -146,7 +146,8 @@ pub enum DecodedUnit {
 }
 
 /// Decode `body` as the source over `bucket` and `prefix` does, with no
-/// object cut into ranges, so the parts number at most one per record.
+/// object cut into ranges, one [`DecodedPart`] per object of each part, so a
+/// notification yields at most one per record.
 #[must_use]
 pub fn decode_unit(body: &[u8], bucket: &str, prefix: &str) -> DecodedUnit {
     let scope = crate::unit::Scope {
@@ -163,7 +164,7 @@ pub fn decode_unit(body: &[u8], bucket: &str, prefix: &str) -> DecodedUnit {
             cursors
                 .into_iter()
                 .flatten()
-                .map(|part| {
+                .flat_map(|part| {
                     let (version, re_enqueues) = match part.origin {
                         crate::unit::Origin::Notification {
                             version,
@@ -171,13 +172,17 @@ pub fn decode_unit(body: &[u8], bucket: &str, prefix: &str) -> DecodedUnit {
                         } => (version, re_enqueues),
                         crate::unit::Origin::Lister => (None, 0),
                     };
-                    DecodedPart {
-                        key: part.object[0].key.clone(),
-                        etag: part.object[0].etag.clone(),
-                        range: part.range.map(|r| (r.start, r.end)),
-                        version,
-                        re_enqueues,
-                    }
+                    let range = part.range.map(|r| (r.start, r.end));
+                    part.object
+                        .iter()
+                        .map(|object| DecodedPart {
+                            key: object.key.clone(),
+                            etag: object.etag.clone(),
+                            range,
+                            version: version.clone(),
+                            re_enqueues,
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect(),
         ),
@@ -218,6 +223,7 @@ pub fn quoted(etag: &str) -> String {
 #[must_use]
 pub fn notification_body(
     bucket: &str,
+    event_source: Option<&str>,
     key: &str,
     size: Option<u64>,
     etag: Option<&str>,
@@ -241,6 +247,9 @@ pub fn notification_body(
     if let Some(n) = re_enqueues {
         record["spateReEnqueues"] = n.into();
     }
+    if let Some(source) = event_source {
+        record["eventSource"] = source.into();
+    }
     serde_json::to_vec(&serde_json::json!({ "Records": [record] }))
         .expect("a JSON value always serialises")
 }
@@ -250,4 +259,33 @@ pub fn notification_body(
 #[must_use]
 pub fn addressable(key: &str) -> bool {
     crate::listing::addressable(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::split::{DescriptorObject, SplitDescriptor};
+
+    /// Pins that every member of a descriptor naming several reaches the
+    /// fuzz targets as its own part, in order.
+    #[test]
+    fn decode_unit_yields_every_member_of_a_descriptor() {
+        let member = |key: &str, etag: &str| DescriptorObject {
+            key: key.into(),
+            size: 10,
+            etag: Some(etag.into()),
+            last_modified_ms: 1,
+        };
+        let body = SplitDescriptor::new(vec![
+            member("data/a.ndjson", "\"a\""),
+            member("data/b.ndjson", "\"b\""),
+        ])
+        .encode()
+        .unwrap();
+        let DecodedUnit::Read(parts) = decode_unit(&body, "bucket", "data") else {
+            panic!("the unit is read");
+        };
+        let keys: Vec<&str> = parts.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, ["data/a.ndjson", "data/b.ndjson"]);
+    }
 }

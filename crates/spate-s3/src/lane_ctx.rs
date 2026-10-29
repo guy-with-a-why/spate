@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
 /// Fetcher→lane channel depth, in messages. Queued zero-copy chunks can retain
-/// earlier GET buffers while the fetcher buffers the next window.
+/// an earlier GET buffer while the fetcher hands on the current window and
+/// reads the next.
 pub(crate) const LANE_HANDOFF_CHUNKS: usize = 4;
 
 /// Names the work a lane reads in failure reports and logs.
@@ -82,8 +83,8 @@ impl SplitTracker {
 /// `reason` label of `spate_s3_source_objects_failed_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PoisonKind {
-    /// A planned object no longer exists (deleted after planning), or its key
-    /// is not a valid object path.
+    /// A read of an object the unit names answered `404` (deleted after it
+    /// was listed or announced), or a listed key is not a valid object path.
     NotFound,
     /// The object's content changed under its pin: a failed `If-Match`
     /// precondition, or content that no longer matches committed progress.

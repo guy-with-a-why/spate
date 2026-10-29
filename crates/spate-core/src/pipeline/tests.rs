@@ -66,6 +66,8 @@ struct Harness {
     warnings: Warnings,
     /// The budget each sink drain was given.
     sink_budgets: Arc<Mutex<Vec<Duration>>>,
+    /// Where the admin server bound, once `run` logs it.
+    admin_addr: AdminAddr,
     join: std::thread::JoinHandle<Result<ExitReport, super::runtime::StartError>>,
 }
 
@@ -140,10 +142,12 @@ fn start_prepared(
     let shutdown = runtime.shutdown_handle();
     let warnings = Warnings::default();
     let layer = warnings.clone();
+    let admin_addr = AdminAddr::default();
+    let admin_layer = admin_addr.clone();
     std::sync::LazyLock::force(&BYSTANDER);
     let join = std::thread::spawn(move || {
         use tracing_subscriber::layer::SubscriberExt;
-        let subscriber = tracing_subscriber::registry().with(layer);
+        let subscriber = tracing_subscriber::registry().with(layer).with(admin_layer);
         tracing::subscriber::with_default(subscriber, || runtime.run())
     });
     Harness {
@@ -156,6 +160,7 @@ fn start_prepared(
         shutdown,
         warnings,
         sink_budgets,
+        admin_addr,
         join,
     }
 }
@@ -169,6 +174,65 @@ fn assign_one_lane(h: &Harness, ranges: &[std::ops::Range<i64>]) {
             partition: PartitionId(0),
             batches: batches(ranges),
         }]));
+}
+
+/// [`start_prepared`] with `clock` as both the pipeline clock and the stop
+/// clock, and `customize` applied after.
+fn start_on_clock(
+    config: PipelineConfig,
+    clock: &Arc<crate::clock::TestClock>,
+    customize: impl FnOnce(PipelineRuntime<FakeSource>) -> PipelineRuntime<FakeSource>,
+    mode_factory: impl Fn(Arc<ChainShared>, Arc<Mutex<SourceLog>>) -> FakeChain + Send + 'static,
+) -> Harness {
+    start_on_clock_with(config, test_options(), clock, customize, mode_factory)
+}
+
+/// [`start_on_clock`] with `options`.
+fn start_on_clock_with(
+    config: PipelineConfig,
+    options: RuntimeOptions,
+    clock: &Arc<crate::clock::TestClock>,
+    customize: impl FnOnce(PipelineRuntime<FakeSource>) -> PipelineRuntime<FakeSource>,
+    mode_factory: impl Fn(Arc<ChainShared>, Arc<Mutex<SourceLog>>) -> FakeChain + Send + 'static,
+) -> Harness {
+    let clock = Arc::clone(clock);
+    start_prepared(
+        config,
+        options,
+        |_| {},
+        move |runtime, _| {
+            customize(
+                runtime
+                    .with_clock(Arc::clone(&clock) as _)
+                    .with_stop_clock(clock),
+            )
+        },
+        mode_factory,
+    )
+}
+
+/// The controller's passes so far, one `poll_events` call each.
+fn controller_passes(h: &Harness) -> usize {
+    h.shared.lock().unwrap().poll_timeouts.len()
+}
+
+/// Wait for `n` more controller passes.
+fn passes(h: &Harness, n: usize) {
+    let target = controller_passes(h) + n;
+    wait_for("controller passes", Duration::from_secs(5), || {
+        controller_passes(h) >= target
+    });
+}
+
+/// Advance `clock` by `by` and wait for the commit tick it fires: the tick's
+/// `FlushNow` reaching the chain, and the controller finishing that pass.
+fn tick(h: &Harness, clock: &crate::clock::TestClock, by: Duration) {
+    let flushed = flushes(h);
+    let target = controller_passes(h) + 2;
+    clock.advance(by);
+    wait_for("the commit tick", Duration::from_secs(5), || {
+        flushes(h) > flushed && controller_passes(h) >= target
+    });
 }
 
 // ---------------------------------------------------------------- tests --
@@ -266,12 +330,18 @@ fn revocation_drains_flushes_and_commits_in_order() {
     // No commit tick fires during the test, so only the revocation drain can
     // commit.
     config.checkpoint.interval = Duration::from_secs(60);
-    let h = start_with_config(config, |shared, log| FakeChain {
-        shared,
-        log,
-        mode: ChainMode::Ok,
-        batches_seen: 0,
-    });
+    let h = start_prepared(
+        config,
+        test_options(),
+        |log| log.log_lane_drops = true,
+        |runtime, _| runtime,
+        |shared, log| FakeChain {
+            shared,
+            log,
+            mode: ChainMode::Ok,
+            batches_seen: 0,
+        },
+    );
     assign_one_lane(&h, &[0..10, 10..20, 20..30]);
     wait_for("first batch consumed", Duration::from_secs(5), || {
         h.chain.consumed.load(Ordering::Relaxed) >= 10
@@ -289,7 +359,11 @@ fn revocation_drains_flushes_and_commits_in_order() {
         log.log.iter().any(|e| e == "revoke-delivered") && log.flush_commits >= 1
     });
     let consumed_at_revoke = h.chain.consumed.load(Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(80));
+    wait_for("the revoked lane dropped", Duration::from_secs(5), || {
+        let log = h.shared.lock().unwrap();
+        let revoke_at = log.log.iter().position(|e| e == "revoke-delivered");
+        revoke_at.is_some_and(|at| log.log[at..].iter().any(|e| e == "lane-dropped"))
+    });
     assert_eq!(
         h.chain.consumed.load(Ordering::Relaxed),
         consumed_at_revoke,
@@ -486,22 +560,42 @@ fn panicking_chain_fails_pipeline() {
 }
 
 /// A watermark permanently stalled behind a failed batch (as a fatal sink
-/// write produces) must fail the pipeline once it has been stalled past
-/// `stalled_fail_after`. Otherwise a broken sink leg leaves the pipeline
-/// Running forever, consuming the source but committing nothing.
+/// write produces) fails the pipeline as `checkpoint` once it has been stalled
+/// longer than `stalled_fail_after` on the pipeline's clock, and not at the
+/// limit itself. The tracker stamps the stall and the controller ages it on
+/// the clock the runtime hands both.
 #[test]
-fn permanent_watermark_stall_fails_pipeline_as_checkpoint() {
+fn a_stall_fails_only_past_its_limit_on_the_injected_clock() {
+    let clock = crate::clock::TestClock::frozen();
+    // An hour ahead of real time, so a stall stamped on any other clock
+    // reads an hour old.
+    clock.advance(Duration::from_secs(3600));
     let mut cfg = test_config(1);
-    cfg.checkpoint.stalled_fail_after = Duration::from_millis(50);
-    let h = start_with_config(cfg, |shared, log| FakeChain {
-        shared,
-        log,
-        mode: ChainMode::FailAckAtBatch(1),
-        batches_seen: 0,
-    });
+    cfg.checkpoint.interval = Duration::from_secs(60);
+    cfg.checkpoint.stalled_fail_after = Duration::from_secs(600);
+    let h = start_on_clock(
+        cfg,
+        &clock,
+        |runtime| runtime,
+        |shared, log| FakeChain {
+            shared,
+            log,
+            mode: ChainMode::FailAckAtBatch(1),
+            batches_seen: 0,
+        },
+    );
     // The first batch's ack fails, stalling the partition; later batches
     // deliver but their watermark can never pass the failure.
     assign_one_lane(&h, &[0..10, 10..20, 20..30]);
+    wait_for("every batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 30
+    });
+    passes(&h, 3);
+
+    tick(&h, &clock, Duration::from_secs(600));
+    assert!(!h.join.is_finished(), "a stall at its limit must not fail");
+
+    clock.advance(Duration::from_secs(60));
     let report = h.join.join().unwrap().unwrap();
     let ExitState::Failed(failure) = report.state else {
         panic!("a permanent stall must fail the pipeline");
@@ -521,26 +615,35 @@ fn pending_batch_ceiling_is_a_hard_bound() {
     let release = Arc::new(AtomicBool::new(false));
     let held_c = Arc::clone(&held);
     let release_c = Arc::clone(&release);
+    let clock = crate::clock::TestClock::frozen();
     let mut cfg = test_config(1);
     cfg.checkpoint.max_pending_batches = 3;
-    let h = start_with_config(cfg, move |shared, log| FakeChain {
-        shared,
-        log,
-        mode: ChainMode::HoldAcks {
-            held: Arc::clone(&held_c),
-            release: Arc::clone(&release_c),
+    let interval = cfg.checkpoint.interval;
+    let h = start_on_clock(
+        cfg,
+        &clock,
+        |runtime| runtime,
+        move |shared, log| FakeChain {
+            shared,
+            log,
+            mode: ChainMode::HoldAcks {
+                held: Arc::clone(&held_c),
+                release: Arc::clone(&release_c),
+            },
+            batches_seen: 0,
         },
-        batches_seen: 0,
-    });
+    );
     // Six batches whose acks are all withheld. The gate closes after the
     // third and the remaining three never leave the lane.
     assign_one_lane(&h, &[0..10, 10..20, 20..30, 30..40, 40..50, 50..60]);
     wait_for("the ceiling fills", Duration::from_secs(5), || {
         held.lock().unwrap().len() == 3
     });
-    // Many commit ticks later (20ms interval), the count has not moved.
-    // The bound holds instead of overshooting on the next tick's slack.
-    std::thread::sleep(Duration::from_millis(400));
+    // Ten commit ticks later the count has not moved. The bound holds
+    // instead of overshooting on the next tick's slack.
+    for _ in 0..10 {
+        tick(&h, &clock, interval);
+    }
     assert_eq!(
         held.lock().unwrap().len(),
         3,
@@ -556,7 +659,9 @@ fn pending_batch_ceiling_is_a_hard_bound() {
     // the remainder flows to completion.
     release.store(true, Ordering::Relaxed);
     held.lock().unwrap().clear();
+    // Commits ride the tick, so each check moves the clock one interval.
     wait_for("everything commits", Duration::from_secs(5), || {
+        clock.advance(interval);
         h.shared
             .lock()
             .unwrap()
@@ -575,21 +680,30 @@ fn pending_batch_ceiling_is_a_hard_bound() {
 /// `stalled_fail_after`.
 #[test]
 fn a_stalled_partition_plateaus_at_the_ceiling() {
+    let clock = crate::clock::TestClock::frozen();
     let mut cfg = test_config(1);
     cfg.checkpoint.max_pending_batches = 3;
-    let h = start_with_config(cfg, move |shared, log| FakeChain {
-        shared,
-        log,
-        mode: ChainMode::FailAckAtBatch(1),
-        batches_seen: 0,
-    });
+    let interval = cfg.checkpoint.interval;
+    let h = start_on_clock(
+        cfg,
+        &clock,
+        |runtime| runtime,
+        move |shared, log| FakeChain {
+            shared,
+            log,
+            mode: ChainMode::FailAckAtBatch(1),
+            batches_seen: 0,
+        },
+    );
     assign_one_lane(&h, &[0..10, 10..20, 20..30, 30..40, 40..50, 50..60]);
     // The failed head blocks advancement forever; the gate lets exactly
     // the ceiling through and the other three batches stay in the lane.
     wait_for("the ceiling fills", Duration::from_secs(5), || {
         h.chain.consumed.load(Ordering::Relaxed) == 30
     });
-    std::thread::sleep(Duration::from_millis(400));
+    for _ in 0..10 {
+        tick(&h, &clock, interval);
+    }
     assert_eq!(
         h.chain.consumed.load(Ordering::Relaxed),
         30,
@@ -3071,6 +3185,32 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
     }
 }
 
+/// The address the admin server logged when it bound.
+#[derive(Clone, Default)]
+struct AdminAddr(Arc<Mutex<Option<std::net::SocketAddr>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdminAddr {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Addr(Option<std::net::SocketAddr>);
+        impl tracing::field::Visit for Addr {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "addr" {
+                    self.0 = format!("{value:?}").parse().ok();
+                }
+            }
+        }
+        let mut addr = Addr(None);
+        event.record(&mut addr);
+        if let Some(addr) = addr.0 {
+            *self.0.lock().unwrap() = Some(addr);
+        }
+    }
+}
+
 /// Feeds `sample_io_busy` a sample every 5 s for ten minutes from a
 /// three-worker runtime busy `share` of the time, under a captured subscriber,
 /// and returns the fields of every warning it logged.
@@ -3408,6 +3548,34 @@ fn an_unset_thread_count_starts_the_derived_number_of_drivers() {
             built.load(Ordering::Relaxed),
             default_thread_count(cores, io_threads),
             "{cores} cores, io_threads: {io_threads}"
+        );
+    }
+}
+
+/// Pins that the source is opened with the thread count the runtime
+/// resolved, whether `pipeline.threads` sets it or the host derives it.
+#[test]
+fn the_source_is_opened_with_the_pipeline_thread_count() {
+    // 3 differs from the `io_threads` of 2 set below, so a count taken
+    // from the wrong setting fails.
+    let cores = std::thread::available_parallelism().map_or(2, usize::from);
+    for (threads, expected) in [(Some(3), 3), (None, default_thread_count(cores, 2))] {
+        let mut cfg = test_config(1);
+        cfg.pipeline.threads = threads;
+        cfg.pipeline.io_threads = 2;
+        let h = start_with_config(cfg, |shared, log| FakeChain {
+            shared,
+            log,
+            mode: ChainMode::Ok,
+            batches_seen: 0,
+        });
+        h.script.lock().unwrap().push_back(Script::Drained);
+        let report = h.join.join().unwrap().unwrap();
+        assert_eq!(report.state, ExitState::Completed);
+        assert_eq!(
+            h.shared.lock().unwrap().threads,
+            std::num::NonZeroUsize::new(expected),
+            "pipeline.threads: {threads:?}"
         );
     }
 }
@@ -3905,6 +4073,75 @@ fn a_stop_during_a_blocked_revocation_drains_at_once() {
     assert_revoked_while_blocked(&h.shared);
 }
 
+/// Pins that while a revocation waits on a driver held by a blocked batch,
+/// the controller lets the source renew what it holds on more than one pass.
+/// Regression for #1278.
+#[test]
+fn a_revocation_waiting_on_its_drain_lets_the_source_renew() {
+    let clock = crate::clock::TestClock::frozen();
+    let h = start_stopping(
+        stop_config(Duration::from_secs(600)),
+        false,
+        &clock,
+        |_| None,
+        blocked_chain,
+    );
+    revoke_a_blocked_lane(&h);
+    wait_for(
+        "the source renews during the wait",
+        Duration::from_secs(5),
+        || h.shared.lock().unwrap().renew_held_calls >= 2,
+    );
+    h.shutdown.trigger();
+    joined(&h);
+    assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
+    assert_revoked_while_blocked(&h.shared);
+}
+
+/// Pins that a revocation waiting on its drain during a stop's read phase
+/// lets the source renew on each pass, the passes counted by the
+/// `reading_on_stop` the same wait asks on each one.
+#[test]
+fn a_revocation_during_the_read_phase_renews_on_each_pass() {
+    let drain_timeout = Duration::from_secs(600);
+    let clock = crate::clock::TestClock::frozen();
+    let h = start_stopping(
+        stop_config(drain_timeout),
+        true,
+        &clock,
+        |_| None,
+        blocked_chain,
+    );
+    h.shutdown.trigger();
+    wait_for("the read phase", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().reading_on_stop_calls > 0
+    });
+    revoke_a_blocked_lane(&h);
+    let (asked, renewed) = {
+        let log = h.shared.lock().unwrap();
+        (log.reading_on_stop_calls, log.renew_held_calls)
+    };
+    wait_for("five passes of the wait", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().reading_on_stop_calls >= asked + 5
+    });
+    let (passes, renews) = {
+        let log = h.shared.lock().unwrap();
+        (
+            log.reading_on_stop_calls - asked,
+            log.renew_held_calls - renewed,
+        )
+    };
+    // One `reading_on_stop` may precede the wait's first pass.
+    assert!(
+        renews + 1 >= passes,
+        "{renews} renewals over {passes} passes"
+    );
+    clock.advance(drain_timeout - crate::feed::STOP_RESERVE);
+    joined(&h);
+    assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
+    assert_revoked_while_blocked(&h.shared);
+}
+
 /// The lane's batch blocked and its revocation reached the controller.
 fn assert_revoked_while_blocked(shared: &SharedLog) {
     let log = shared.lock().unwrap();
@@ -4178,4 +4415,798 @@ fn a_sigterm_stops_the_run() {
     let report = h.join.join().unwrap().unwrap();
     assert_eq!(report.state, ExitState::Completed);
     assert_eq!(report.final_watermarks, vec![(PartitionId(0), 10)]);
+}
+
+// ------------------------------------------------------- finished lanes --
+
+const FINISH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Options whose lane-poll and idle-flush waits outlast any test, so a
+/// parked thread turns only on the control messages a test sends.
+fn parked_options() -> RuntimeOptions {
+    RuntimeOptions {
+        poll_timeout: Duration::from_secs(3600),
+        idle_flush: Duration::from_secs(3600),
+        ..test_options()
+    }
+}
+
+/// One pipeline thread whose `finishing` lanes report `finished` from the
+/// empty poll after their last batch, with no commit tick inside the test.
+fn start_finishing(
+    options: RuntimeOptions,
+    max_pending_batches: Option<usize>,
+    finishing: &[u32],
+    mode: impl Fn() -> ChainMode + Send + 'static,
+) -> Harness {
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = Duration::from_secs(60);
+    if let Some(limit) = max_pending_batches {
+        cfg.checkpoint.max_pending_batches = limit;
+    }
+    let finishing: Vec<LaneId> = finishing.iter().map(|&id| LaneId(id)).collect();
+    start_prepared(
+        cfg,
+        options,
+        move |log| log.finishing.extend(finishing),
+        |runtime, _| runtime,
+        move |shared, log| FakeChain {
+            shared,
+            log,
+            mode: mode(),
+            batches_seen: 0,
+        },
+    )
+}
+
+/// `count` batches of ten records each, from offset 0.
+fn tens(count: i64) -> Vec<Vec<(i64, Vec<u8>)>> {
+    let ranges: Vec<std::ops::Range<i64>> = (0..count).map(|i| i * 10..i * 10 + 10).collect();
+    batches(&ranges)
+}
+
+/// Assign one lane per `(id, batches)` pair, each on partition `id`, with
+/// `batches` batches of ten records.
+fn assign(h: &Harness, lanes: &[(u32, i64)]) {
+    let specs = lanes
+        .iter()
+        .map(|&(id, count)| LaneSpec {
+            id: LaneId(id),
+            partition: PartitionId(id),
+            batches: tens(count),
+        })
+        .collect();
+    h.script.lock().unwrap().push_back(Script::Assign(specs));
+}
+
+fn polls_of(h: &Harness, id: u32) -> usize {
+    let log = h.shared.lock().unwrap();
+    log.lane_polls
+        .iter()
+        .filter(|(l, _)| *l == LaneId(id))
+        .count()
+}
+
+fn finished_calls(h: &Harness) -> usize {
+    h.shared.lock().unwrap().finished_calls.values().sum()
+}
+
+fn flushes(h: &Harness) -> usize {
+    h.chain.flushes.load(Ordering::Relaxed)
+}
+
+/// Wake the parked thread `times` times with a `CommitReady` for partition
+/// 0, each answered by the `FlushNow` it sends, and return the flushes the
+/// wakes added.
+fn wake(h: &Harness, times: usize) -> usize {
+    let before = flushes(h);
+    for i in 1..=times {
+        h.script
+            .lock()
+            .unwrap()
+            .push_back(Script::CommitReady(vec![PartitionId(0)]));
+        wait_for("the thread serves the wake", FINISH_DEADLINE, || {
+            flushes(h) >= before + i
+        });
+    }
+    flushes(h) - before
+}
+
+fn shut_down(h: Harness) {
+    h.shutdown.trigger();
+    wait_for("the driver exits", FINISH_DEADLINE, || h.join.is_finished());
+    let report = h.join.join().unwrap().unwrap();
+    assert_eq!(report.state, ExitState::Completed);
+}
+
+/// Pins that a thread whose lanes have all finished stops polling them and
+/// parks on its control channel, serving each `FlushNow` from the park.
+/// Regression for #1478.
+#[test]
+fn a_thread_whose_lanes_are_all_finished_parks() {
+    let h = start_finishing(parked_options(), None, &[0, 1], || ChainMode::Ok);
+    assign(&h, &[(0, 1), (1, 1)]);
+    wait_for("both lanes finish", FINISH_DEADLINE, || {
+        polls_of(&h, 0) == 2 && polls_of(&h, 1) == 2
+    });
+    let calls = finished_calls(&h);
+    let wakes = wake(&h, 5);
+    let asked = finished_calls(&h) - calls;
+    assert!(wakes >= 5, "{wakes} wakes");
+    // Each wake turns the loop at least once and parks again within a pass.
+    assert!(
+        (wakes..=2 * wakes + 2).contains(&asked),
+        "{asked} reads over {wakes} wakes"
+    );
+    assert_eq!((polls_of(&h, 0), polls_of(&h, 1)), (2, 2));
+    shut_down(h);
+}
+
+/// Pins that a finished lane is not polled again while a sibling on its
+/// thread still produces, and that the sibling is never handed a blocking
+/// timeout while it has data.
+#[test]
+fn a_finished_lane_is_skipped_while_its_sibling_flows() {
+    let h = start_finishing(parked_options(), None, &[0], || ChainMode::Ok);
+    assign(&h, &[(0, 1), (1, 50)]);
+    wait_for("every batch is consumed", FINISH_DEADLINE, || {
+        h.chain.consumed.load(Ordering::Relaxed) == 510
+    });
+    assert_eq!(polls_of(&h, 0), 2);
+    let log = h.shared.lock().unwrap();
+    let flowing_polls: Vec<Duration> = log
+        .lane_polls
+        .iter()
+        .filter(|(l, _)| *l == LaneId(1))
+        .map(|(_, t)| *t)
+        .take(50)
+        .collect();
+    drop(log);
+    assert!(
+        flowing_polls.iter().all(Duration::is_zero),
+        "{flowing_polls:?}"
+    );
+    shut_down(h);
+}
+
+/// Pins that a finished lane does not stop an empty sibling's pass from
+/// reaching the blocking poll timeout.
+#[test]
+fn a_finished_lane_beside_an_empty_one_lets_the_pass_block() {
+    let h = start_finishing(test_options(), None, &[0], || ChainMode::Ok);
+    assign(&h, &[(0, 0), (1, 0)]);
+    wait_for("the empty lane is polled 20 times", FINISH_DEADLINE, || {
+        polls_of(&h, 1) >= 20
+    });
+    assert_eq!(polls_of(&h, 0), 1);
+    let log = h.shared.lock().unwrap();
+    let timeouts: Vec<Duration> = log
+        .lane_polls
+        .iter()
+        .filter(|(l, _)| *l == LaneId(1))
+        .skip(1)
+        .map(|(_, t)| *t)
+        .collect();
+    drop(log);
+    assert!(
+        timeouts.iter().all(|t| *t == test_options().poll_timeout),
+        "{timeouts:?}"
+    );
+    shut_down(h);
+}
+
+/// Pins that a thread whose lanes are each gated or finished parks, and that
+/// the gated lane flows again once its acknowledgments retire.
+#[test]
+fn a_finished_lane_beside_a_gated_one_parks() {
+    let held: Arc<Mutex<Vec<crate::checkpoint::AckRef>>> = Arc::new(Mutex::new(Vec::new()));
+    let release = Arc::new(AtomicBool::new(false));
+    let (held_c, release_c) = (Arc::clone(&held), Arc::clone(&release));
+    let h = start_finishing(parked_options(), Some(3), &[1], move || {
+        ChainMode::HoldAcks {
+            held: Arc::clone(&held_c),
+            release: Arc::clone(&release_c),
+        }
+    });
+    assign(&h, &[(0, 6), (1, 0)]);
+    wait_for(
+        "the gate closes and the empty lane finishes",
+        FINISH_DEADLINE,
+        || held.lock().unwrap().len() == 3 && polls_of(&h, 1) == 1,
+    );
+    let calls = finished_calls(&h);
+    let wakes = wake(&h, 5);
+    let asked = finished_calls(&h) - calls;
+    assert!(wakes >= 5, "{wakes} wakes");
+    // Each wake turns the loop at least once and parks again within a pass.
+    assert!(
+        (wakes..=2 * wakes + 2).contains(&asked),
+        "{asked} reads over {wakes} wakes"
+    );
+    assert_eq!(polls_of(&h, 1), 1);
+    release.store(true, Ordering::Relaxed);
+    held.lock().unwrap().clear();
+    wake(&h, 1);
+    wait_for("the gated lane drains", FINISH_DEADLINE, || {
+        h.chain.consumed.load(Ordering::Relaxed) == 60
+    });
+    shut_down(h);
+}
+
+/// Pins that a thread parked on its finished lanes still flushes its chain
+/// once its lull outlasts the idle flush, so the tail's acknowledgments
+/// resolve.
+#[test]
+fn a_finished_thread_still_flushes_its_tail_when_idle() {
+    let held: Arc<Mutex<Vec<crate::checkpoint::AckRef>>> = Arc::new(Mutex::new(Vec::new()));
+    let held_c = Arc::clone(&held);
+    let h = start_finishing(test_options(), None, &[0], move || {
+        ChainMode::HoldAcksUntilFlush {
+            held: Arc::clone(&held_c),
+        }
+    });
+    assign(&h, &[(0, 1)]);
+    wait_for("the tail is flushed", FINISH_DEADLINE, || {
+        polls_of(&h, 0) == 2 && held.lock().unwrap().is_empty() && flushes(&h) >= 1
+    });
+    assert_eq!(polls_of(&h, 0), 2);
+    shut_down(h);
+}
+
+/// Pins that a thread parked on a finished lane takes a lane handed to it.
+#[test]
+fn a_finished_thread_takes_a_new_lane() {
+    let h = start_finishing(parked_options(), None, &[0], || ChainMode::Ok);
+    assign(&h, &[(0, 1)]);
+    wait_for("the lane finishes", FINISH_DEADLINE, || {
+        polls_of(&h, 0) >= 2
+    });
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::Add(vec![LaneSpec {
+            id: LaneId(1),
+            partition: PartitionId(1),
+            batches: tens(1),
+        }]));
+    wait_for("the new lane is read", FINISH_DEADLINE, || {
+        h.chain.consumed.load(Ordering::Relaxed) == 20
+    });
+    shut_down(h);
+}
+
+/// Pins that a thread parked on a finished lane stops it on a revocation and
+/// arrives at the revocation's barrier.
+#[test]
+fn a_finished_thread_stops_a_revoked_lane() {
+    let h = start_finishing(parked_options(), None, &[0], || ChainMode::Ok);
+    assign(&h, &[(0, 1)]);
+    wait_for("the lane finishes", FINISH_DEADLINE, || {
+        polls_of(&h, 0) >= 2
+    });
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::Revoke(vec![LaneId(0)]));
+    wait_for("the revocation commits", FINISH_DEADLINE, || {
+        logged(&h, "revoke-delivered")
+            && h.shared.lock().unwrap().committed.get(&PartitionId(0)) == Some(&10)
+    });
+    shut_down(h);
+}
+
+/// Pins that a thread parked on a finished lane drops it when it retires.
+#[test]
+fn a_finished_thread_drops_a_retired_lane() {
+    let h = start_finishing(parked_options(), None, &[0], || ChainMode::Ok);
+    h.shared.lock().unwrap().log_lane_drops = true;
+    assign(&h, &[(0, 1)]);
+    wait_for("the lane finishes", FINISH_DEADLINE, || {
+        polls_of(&h, 0) >= 2
+    });
+    wake(&h, 1);
+    wait_for("partition 0 commits", FINISH_DEADLINE, || {
+        h.shared.lock().unwrap().committed.get(&PartitionId(0)) == Some(&10)
+    });
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::Retire(vec![LaneId(0)]));
+    wait_for("the lane is dropped", FINISH_DEADLINE, || {
+        logged(&h, "lane-dropped")
+    });
+    shut_down(h);
+}
+
+/// Pins that a lane-set change between skipped lanes does not carry the skip
+/// streak into the smaller rotation and park the thread while a sibling lane
+/// still holds batches.
+#[test]
+fn a_retire_between_skips_does_not_park_a_flowing_thread() {
+    let h = start_finishing(parked_options(), None, &[0, 1], || ChainMode::Ok);
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    h.shared.lock().unwrap().finished_hook = Some(FinishedHook {
+        polled: LaneId(2),
+        after: LaneId(0),
+        lane: LaneId(1),
+        reached: reached_tx,
+        go: go_rx,
+    });
+    // One lane per message, each read before the next is sent, so the
+    // thread holds the lanes in the order 0, 1, 2.
+    assign(&h, &[(0, 1)]);
+    for (id, count) in [(1, 1), (2, 200)] {
+        wait_for("the previous lane is read", FINISH_DEADLINE, || {
+            polls_of(&h, id - 1) >= 1
+        });
+        h.script
+            .lock()
+            .unwrap()
+            .push_back(Script::Add(vec![LaneSpec {
+                id: LaneId(id),
+                partition: PartitionId(id),
+                batches: tens(count),
+            }]));
+    }
+    // The driver is inside lane 1's read straight after skipping finished
+    // lane 0, so the streak counts lane 0.
+    reached_rx.recv_timeout(FINISH_DEADLINE).unwrap();
+    assert!(h.chain.consumed.load(Ordering::Relaxed) < 2020);
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::Retire(vec![LaneId(0)]));
+    wait_for("the retire is delivered", FINISH_DEADLINE, || {
+        logged(&h, "retire-delivered")
+    });
+    // A `poll_events` call after the delivering one means the retire's
+    // `DropLanes` is on the control channel.
+    let calls = h.shared.lock().unwrap().poll_timeouts.len();
+    wait_for("the retire is sent to the thread", FINISH_DEADLINE, || {
+        h.shared.lock().unwrap().poll_timeouts.len() > calls
+    });
+    go_tx.send(()).unwrap();
+    wait_for("lane 2 is read to its end", FINISH_DEADLINE, || {
+        h.chain.consumed.load(Ordering::Relaxed) == 2020
+    });
+    shut_down(h);
+}
+
+/// Pins that a thread parked on its finished lanes reads a lane added after
+/// a wake, so the pass after each park starts its skip count afresh.
+#[test]
+fn a_lane_added_after_a_wake_is_read() {
+    let h = start_finishing(parked_options(), None, &[0, 1], || ChainMode::Ok);
+    assign(&h, &[(0, 1), (1, 1)]);
+    wait_for("both lanes finish", FINISH_DEADLINE, || {
+        polls_of(&h, 0) == 2 && polls_of(&h, 1) == 2
+    });
+    wake(&h, 1);
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::Add(vec![LaneSpec {
+            id: LaneId(2),
+            partition: PartitionId(2),
+            batches: tens(1),
+        }]));
+    wait_for("the new lane is read", FINISH_DEADLINE, || {
+        h.chain.consumed.load(Ordering::Relaxed) == 30
+    });
+    shut_down(h);
+}
+
+// ------------------------------------------------------- injected clock --
+
+fn blocked_flush_chain(shared: Arc<ChainShared>, log: Arc<Mutex<SourceLog>>) -> FakeChain {
+    FakeChain {
+        shared,
+        log,
+        mode: ChainMode::FlushBlocked,
+        batches_seen: 0,
+    }
+}
+
+/// Options whose idle flush never fires within a test's advances.
+fn no_idle_flush() -> RuntimeOptions {
+    RuntimeOptions {
+        idle_flush: Duration::from_secs(3600),
+        ..test_options()
+    }
+}
+
+/// Whether the log holds a `commit` after the revocation was delivered.
+fn committed_after_revoke(h: &Harness) -> bool {
+    let log = h.shared.lock().unwrap();
+    log.log
+        .iter()
+        .position(|e| e == "revoke-delivered")
+        .is_some_and(|at| log.log[at..].iter().any(|e| e == "commit"))
+}
+
+/// The commit tick fires once `checkpoint.interval` has passed on the
+/// pipeline's clock, and not a millisecond before.
+#[test]
+fn the_commit_tick_fires_at_the_interval_on_the_injected_clock() {
+    let clock = crate::clock::TestClock::frozen();
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = Duration::from_secs(600);
+    let h = start_on_clock_with(cfg, no_idle_flush(), &clock, |runtime| runtime, ok_chain);
+    assign_one_lane(&h, std::slice::from_ref(&(0..10)));
+    wait_for("the batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 10
+    });
+    let flushed = flushes(&h);
+
+    clock.advance(Duration::from_secs(600) - Duration::from_millis(1));
+    passes(&h, 3);
+    assert_eq!(flushes(&h), flushed, "the tick fired early");
+    assert!(h.shared.lock().unwrap().committed.is_empty());
+
+    clock.advance(Duration::from_millis(1));
+    wait_for("the tick commits", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().committed.get(&PartitionId(0)) == Some(&10)
+    });
+    wait_for("the tick's FlushNow", Duration::from_secs(5), || {
+        flushes(&h) > flushed
+    });
+    h.shutdown.trigger();
+    h.join.join().unwrap().unwrap();
+}
+
+/// A hinted partition is chased at the tightened cadence until its window
+/// ends on the pipeline's clock, and at the ordinary cadence after.
+#[test]
+fn a_chase_window_closes_at_its_end_on_the_injected_clock() {
+    let held: Arc<Mutex<Vec<crate::checkpoint::AckRef>>> = Arc::new(Mutex::new(Vec::new()));
+    let release = Arc::new(AtomicBool::new(false));
+    let held_c = Arc::clone(&held);
+    let release_c = Arc::clone(&release);
+    let clock = crate::clock::TestClock::frozen();
+    let window = Duration::from_secs(600);
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = Duration::from_secs(3600);
+    let h = start_on_clock_with(
+        cfg,
+        no_idle_flush(),
+        &clock,
+        |runtime| runtime.with_chase_window(window),
+        move |shared, log| FakeChain {
+            shared,
+            log,
+            mode: ChainMode::HoldAcks {
+                held: Arc::clone(&held_c),
+                release: Arc::clone(&release_c),
+            },
+            batches_seen: 0,
+        },
+    );
+    assign_one_lane(&h, std::slice::from_ref(&(0..10)));
+    wait_for("the batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 10
+    });
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::CommitReady(vec![PartitionId(0)]));
+    wait_for("the hint delivered", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().hinted_at.is_some()
+    });
+    let last_poll = |h: &Harness| *h.shared.lock().unwrap().poll_timeouts.last().unwrap();
+
+    clock.advance(window - Duration::from_millis(1));
+    passes(&h, 3);
+    assert_eq!(last_poll(&h), super::controller::FAST_COMMIT_POLL);
+
+    clock.advance(Duration::from_millis(1));
+    passes(&h, 3);
+    assert_eq!(last_poll(&h), test_options().event_poll_timeout);
+
+    release.store(true, Ordering::Relaxed);
+    held.lock().unwrap().clear();
+    h.shutdown.trigger();
+    h.join.join().unwrap().unwrap();
+}
+
+/// A watermark stuck past `watermark_stuck` on the pipeline's clock turns
+/// `/healthz` to 503 while data is pending, and not at the threshold itself.
+#[test]
+fn a_stuck_watermark_turns_liveness_on_the_injected_clock() {
+    let clock = crate::clock::TestClock::frozen();
+    let interval = Duration::from_secs(60);
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = interval;
+    cfg.checkpoint.stalled_fail_after = Duration::from_secs(3600);
+    let h = start_on_clock_with(
+        cfg,
+        no_idle_flush(),
+        &clock,
+        |runtime| runtime,
+        |shared, log| FakeChain {
+            shared,
+            log,
+            mode: ChainMode::FailAckAtBatch(1),
+            batches_seen: 0,
+        },
+    );
+    assign_one_lane(&h, &[0..10, 10..20, 20..30]);
+    wait_for("every batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 30
+    });
+    passes(&h, 3);
+    let addr = h.admin_addr.0.lock().unwrap().expect("admin server bound");
+    let healthz = || {
+        // A lane poll after the advance beats the driver's heart on the
+        // moved clock, so only the watermark decides the answer.
+        let polled = polls_of(&h, 0);
+        wait_for("a lane poll", Duration::from_secs(5), || {
+            polls_of(&h, 0) > polled
+        });
+        http_status(addr, "/healthz")
+    };
+
+    // The default `watermark_stuck` is 300 s.
+    for _ in 0..5 {
+        tick(&h, &clock, interval);
+    }
+    assert_eq!(healthz(), 200, "a watermark at the threshold is not stuck");
+    tick(&h, &clock, interval);
+    assert_eq!(healthz(), 503);
+    h.shutdown.trigger();
+    let _ = h.join.join().unwrap();
+}
+
+/// The status code of a `GET path` to the admin server at `addr`.
+fn http_status(addr: std::net::SocketAddr, path: &str) -> u16 {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect to admin");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in {response:?}"))
+}
+
+/// A revocation whose flush stays blocked is waited on until its drain
+/// deadline on the stop clock, then completes with the run still running,
+/// and the driver abandons the flush there so the run can stop.
+#[test]
+fn a_blocked_revocation_flush_ends_at_its_deadline_on_the_stop_clock() {
+    let clock = crate::clock::TestClock::frozen();
+    let drain = Duration::from_secs(600);
+    let mut cfg = stop_config(drain);
+    cfg.checkpoint.interval = Duration::from_secs(3600);
+    let stop_clock = Arc::clone(&clock);
+    let h = start_prepared(
+        cfg,
+        no_idle_flush(),
+        |_| {},
+        move |runtime, _| runtime.with_stop_clock(stop_clock),
+        blocked_flush_chain,
+    );
+    assign_one_lane(&h, std::slice::from_ref(&(0..10)));
+    wait_for("the batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 10
+    });
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::Revoke(vec![LaneId(0)]));
+    wait_for(
+        "the revocation flush running",
+        Duration::from_secs(5),
+        || {
+            h.shared
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .any(|e| e == "revoke-delivered")
+                && flushes(&h) >= 3
+        },
+    );
+
+    clock.advance(drain - Duration::from_millis(1));
+    let flushed = flushes(&h);
+    wait_for("the flush still retrying", Duration::from_secs(5), || {
+        flushes(&h) >= flushed + 3
+    });
+    assert!(!committed_after_revoke(&h), "the revocation ended early");
+
+    clock.advance(Duration::from_millis(1));
+    wait_for("the revocation completes", Duration::from_secs(5), || {
+        committed_after_revoke(&h)
+    });
+    assert!(
+        !h.join.is_finished(),
+        "a lapsed revocation must not end the run"
+    );
+    h.shutdown.trigger();
+    // The stop's flush blocks too, until its own deadline on the same clock.
+    wait_for("run() to return", Duration::from_secs(10), || {
+        clock.advance(drain);
+        h.join.is_finished()
+    });
+}
+
+/// A stop's blocked flush ends at the lanes' deadline on the stop clock, so
+/// the run returns once that clock reaches it.
+#[test]
+fn a_blocked_flush_ends_at_the_lanes_deadline_on_the_stop_clock() {
+    let clock = crate::clock::TestClock::frozen();
+    let drain = Duration::from_secs(600);
+    let mut cfg = stop_config(drain);
+    cfg.checkpoint.interval = Duration::from_secs(3600);
+    let stop_clock = Arc::clone(&clock);
+    let h = start_prepared(
+        cfg,
+        no_idle_flush(),
+        |_| {},
+        move |runtime, _| runtime.with_stop_clock(stop_clock),
+        blocked_flush_chain,
+    );
+    assign_one_lane(&h, std::slice::from_ref(&(0..10)));
+    wait_for("the batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 10
+    });
+    let flushed = flushes(&h);
+    h.shutdown.trigger();
+    wait_for("the drain's flush retrying", Duration::from_secs(5), || {
+        flushes(&h) >= flushed + 3
+    });
+    clock.advance(drain);
+    joined(&h);
+}
+
+/// The idle flush fires once a lull reaches `idle_flush` on the pipeline's
+/// clock, and once per lull.
+#[test]
+fn idle_flush_fires_once_at_its_lull_on_the_injected_clock() {
+    let clock = crate::clock::TestClock::frozen();
+    let lull = Duration::from_secs(600);
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = Duration::from_secs(3600);
+    let options = RuntimeOptions {
+        idle_flush: lull,
+        ..test_options()
+    };
+    let h = start_on_clock_with(cfg, options, &clock, |runtime| runtime, ok_chain);
+    assign_one_lane(&h, std::slice::from_ref(&(0..10)));
+    wait_for("the batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 10
+    });
+    let lane_polls = |n: usize| {
+        let target = polls_of(&h, 0) + n;
+        wait_for("lane polls", Duration::from_secs(5), || {
+            polls_of(&h, 0) >= target
+        });
+    };
+
+    clock.advance(lull - Duration::from_millis(1));
+    lane_polls(3);
+    assert_eq!(flushes(&h), 0, "the idle flush fired early");
+
+    clock.advance(Duration::from_millis(1));
+    wait_for("the idle flush", Duration::from_secs(5), || {
+        flushes(&h) == 1
+    });
+
+    clock.advance(lull);
+    lane_polls(3);
+    assert_eq!(flushes(&h), 1, "one idle flush per lull");
+    h.shutdown.trigger();
+    h.join.join().unwrap().unwrap();
+}
+
+/// A startup error after the drivers spawn stops them with a flush deadline
+/// on the stop clock, so a blocked flush ends once that clock reaches the
+/// drain grace.
+#[test]
+fn a_startup_error_ends_a_blocked_flush_at_the_grace_on_the_stop_clock() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe port");
+    let clock = crate::clock::TestClock::frozen();
+    let drain = Duration::from_secs(600);
+    let mut cfg = stop_config(drain);
+    cfg.admin.listen = Some(occupied.local_addr().unwrap());
+    let stop_clock = Arc::clone(&clock);
+    let h = start_prepared(
+        cfg,
+        no_idle_flush(),
+        |_| {},
+        move |runtime, _| runtime.with_stop_clock(stop_clock),
+        blocked_flush_chain,
+    );
+    wait_for("the stop's flush retrying", Duration::from_secs(5), || {
+        flushes(&h) >= 3
+    });
+    assert!(!h.join.is_finished(), "the flush ended before the grace");
+    clock.advance(drain);
+    joined(&h);
+    let result = h.join.join().unwrap();
+    assert!(
+        matches!(result, Err(super::runtime::StartError::AdminBind { .. })),
+        "{result:?}"
+    );
+    drop(occupied);
+}
+
+/// Start one pipeline thread on the pipeline clock `clock`, with an idle
+/// flush after `lull`, no commit tick within the test's advances, and the
+/// lanes in `finishing` reporting finished once they run dry.
+fn start_idle_on_clock(
+    clock: &Arc<crate::clock::TestClock>,
+    lull: Duration,
+    finishing: &[u32],
+) -> Harness {
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = Duration::from_secs(3600);
+    let options = RuntimeOptions {
+        idle_flush: lull,
+        ..test_options()
+    };
+    let finishing: Vec<LaneId> = finishing.iter().map(|&id| LaneId(id)).collect();
+    let clock = Arc::clone(clock);
+    start_prepared(
+        cfg,
+        options,
+        move |log| log.finishing.extend(finishing),
+        move |runtime, _| runtime.with_clock(clock),
+        ok_chain,
+    )
+}
+
+/// A thread whose every lane is finished flushes once its lull reaches
+/// `idle_flush` on the pipeline's clock.
+#[test]
+fn a_finished_thread_flushes_at_its_lull_on_the_injected_clock() {
+    let clock = crate::clock::TestClock::frozen();
+    let lull = Duration::from_secs(600);
+    let h = start_idle_on_clock(&clock, lull, &[0]);
+    assign(&h, &[(0, 1)]);
+    wait_for("the lane finishes", Duration::from_secs(5), || {
+        polls_of(&h, 0) == 2
+    });
+    let flushed = flushes(&h);
+    clock.advance(lull);
+    wait_for("the idle flush", Duration::from_secs(5), || {
+        flushes(&h) > flushed
+    });
+    h.shutdown.trigger();
+    h.join.join().unwrap().unwrap();
+}
+
+/// A thread left with no lanes flushes once its lull reaches `idle_flush` on
+/// the pipeline's clock.
+#[test]
+fn a_thread_with_no_lanes_flushes_at_its_lull_on_the_injected_clock() {
+    let clock = crate::clock::TestClock::frozen();
+    let lull = Duration::from_secs(600);
+    let h = start_idle_on_clock(&clock, lull, &[]);
+    assign_one_lane(&h, std::slice::from_ref(&(0..10)));
+    wait_for("the batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 10
+    });
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::Revoke(vec![LaneId(0)]));
+    // The commit after the revocation follows the drain's own flush.
+    wait_for("the revocation commits", Duration::from_secs(5), || {
+        committed_after_revoke(&h)
+    });
+    let flushed = flushes(&h);
+    clock.advance(lull);
+    wait_for("the idle flush", Duration::from_secs(5), || {
+        flushes(&h) > flushed
+    });
+    h.shutdown.trigger();
+    h.join.join().unwrap().unwrap();
 }

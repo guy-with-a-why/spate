@@ -32,6 +32,11 @@ Issue threads, pull request descriptions and review discussion work best with a
 person behind them. Polishing your grammar with a tool is fine. The ideas, the
 judgement, and the answers to review questions should be yours.
 
+A pull request or issue whose review questions go unanswered by a person may be
+closed without further review. An account that keeps opening them may be
+blocked from the organization. If you think one was closed in error, say so on
+it and a maintainer will take another look.
+
 ## Quality over volume
 
 One clear problem and one clear solution per pull request gets read and merged
@@ -60,6 +65,15 @@ useful thing you can attach.
 
 The same applies to performance claims: numbers are re-measured on reference
 hardware under the published protocol before they are acted on.
+
+## Good first issues
+
+Don't use AI tools to fix an issue labelled `good first issue`. These issues are
+rarely urgent, and they are kept for a new contributor to learn the codebase by
+working one through. Handing the fix to a tool spends that opportunity, whether
+or not you are new here. Asking an assistant to explain the code around the
+issue is fine, as [Getting oriented](#getting-oriented) describes; the change
+itself should be yours.
 
 ## Agentic contributions
 

@@ -3,6 +3,7 @@ use crate::queue::BoxFuture;
 use crate::scripted::{Failure, Message, ScriptedQueue};
 use spate_core::feed::{FeedPark, wake_channel};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::oneshot;
 
 const MINUTE: Duration = Duration::from_secs(60);
 const QUEUE_URL: &str = "https://sqs.eu-west-2.amazonaws.com/111122223333/jobs";
@@ -841,6 +842,263 @@ async fn a_unit_handed_out_before_a_tick_is_kept_by_its_first_renew() {
     );
 }
 
+/// Renew each of `receipts` every 100 ms for `d`, asserting every renew is
+/// accepted.
+async fn renew_through(feed: &SqsFeed, receipts: &[Receipt], d: Duration, what: &str) {
+    let start = Instant::now();
+    for _ in 0..d.as_millis() / 100 {
+        for &receipt in receipts {
+            assert_eq!(
+                feed.renew(receipt).map_err(|e| e.kind),
+                Ok(()),
+                "{what}: the unit lapsed {:?} in, renewed every 100 ms",
+                Instant::now() - start
+            );
+        }
+        step(Duration::from_millis(100)).await;
+    }
+}
+
+/// Pins that a held unit the reader keeps renewing survives one extension
+/// call SQS does not answer, at visibilities either side of the 45 s edge:
+/// the call is given up after one renewal period and sent once more at once,
+/// with half the time left, and the next tick, with three periods left, is
+/// bounded by one period. Regression for #1446.
+#[tokio::test(start_paused = true)]
+async fn a_renewed_unit_survives_one_slow_extension_call() {
+    let ms = Duration::from_millis;
+    for (visibility, first, second) in [
+        (3, ms(1_000), ms(500)),
+        (30, ms(10_000), ms(5_000)),
+        (45, ms(15_000), ms(7_500)),
+        (60, ms(20_000), ms(10_000)),
+    ] {
+        let visibility = Duration::from_secs(visibility);
+        let (feed, queue) = start(visibility);
+        let (waker, park) = wake_channel();
+        feed.set_waker(waker);
+        queue.ready(Message::new("u"));
+        let held = receive_n(&feed, &park, 1).await.remove(0);
+        queue.delay_next_visibility_call(MINUTE);
+        renew_through(
+            &feed,
+            &[held.receipt],
+            2 * visibility,
+            &format!("visibility {visibility:?}"),
+        )
+        .await;
+        assert_eq!(
+            queue.visibility_within()[..3],
+            [Some(first), Some(second), Some(first)],
+            "visibility {visibility:?}"
+        );
+    }
+}
+
+/// Pins the running bound of an extension call: one renewal period, or half
+/// the time left to the batch's earliest deadline when that is shorter.
+/// Regression for #1446.
+#[tokio::test(start_paused = true)]
+async fn a_running_extension_is_bounded_by_the_period_and_the_time_left() {
+    let secs = Duration::from_secs;
+    // The 12 h hold ends 12 h − 30 s after the receive, so 8 h − 30 s is left
+    // at the first tick.
+    for (visibility, within) in [
+        (secs(3), secs(1)),
+        (MINUTE, secs(20)),
+        (HOLD, HOLD / 3 - secs(15)),
+    ] {
+        let (feed, queue) = start(visibility);
+        let (waker, park) = wake_channel();
+        feed.set_waker(waker);
+        queue.ready(Message::new("u"));
+        let held = receive_n(&feed, &park, 1).await.remove(0);
+        feed.renew(held.receipt).unwrap();
+        tokio::time::advance(visibility / 3).await;
+        until("the tick extends the unit", || {
+            queue.visibility().len() == 1
+        })
+        .await;
+        assert_eq!(
+            queue.visibility_within(),
+            [Some(within)],
+            "visibility {visibility:?}"
+        );
+    }
+
+    let (feed, queue) = start(MINUTE);
+    let started = Instant::now();
+    let held = hand_out_one_period_from_its_deadline(&feed, &queue).await;
+    let deadline = feed.deadline_of(held.receipt).unwrap();
+    let calls = queue.visibility_within().len();
+    step(Duration::from_millis(600)).await;
+    let tick = started + MINUTE;
+    assert_eq!(
+        queue.visibility_within()[calls..],
+        [Some((deadline - tick) / 2)],
+        "the tick near 60 s, {:?} before the deadline",
+        deadline - tick
+    );
+}
+
+/// Buffer one unit about 19.5 s into a feed at a one-minute visibility, and
+/// hand it out at about 59.5 s, one renewal period from its deadline and
+/// just before the tick near 60 s.
+async fn hand_out_one_period_from_its_deadline(feed: &SqsFeed, queue: &ScriptedQueue) -> Delivery {
+    let (waker, _park) = wake_channel();
+    feed.set_waker(waker);
+    settle_tasks().await;
+    step(Duration::from_millis(19_500)).await;
+    queue.ready(Message::new("u"));
+    assert!(feed.receive(1).unwrap().is_empty());
+    until("buffered", || feed.buffered() == 1).await;
+    step(Duration::from_secs(40)).await;
+    let mut got = feed.receive(1).unwrap();
+    assert_eq!(
+        got.len(),
+        1,
+        "a unit one period from its deadline is handed out"
+    );
+    got.remove(0)
+}
+
+/// Pins that a unit handed out with one renewal period left survives one
+/// extension call SQS does not answer at the tick that follows.
+/// Regression for #1446.
+#[tokio::test(start_paused = true)]
+async fn a_unit_handed_out_one_period_from_its_deadline_survives_one_slow_extension_call() {
+    let (feed, queue) = start(MINUTE);
+    let held = hand_out_one_period_from_its_deadline(&feed, &queue).await;
+    queue.delay_next_visibility_call(MINUTE);
+    renew_through(&feed, &[held.receipt], 2 * MINUTE, "handed out").await;
+}
+
+/// Pins that a batch is sent at most twice in a tick, so a call SQS keeps
+/// failing does not loop on ever shorter bounds until its unit lapses.
+#[tokio::test(start_paused = true)]
+async fn a_batch_is_sent_at_most_twice_in_a_tick() {
+    let (feed, queue) = start(MINUTE);
+    let held = hand_out_one_period_from_its_deadline(&feed, &queue).await;
+    feed.renew(held.receipt).unwrap();
+    let calls = queue.visibility_within().len();
+    for _ in 0..5 {
+        queue.delay_next_visibility_call(MINUTE);
+    }
+    step(Duration::from_secs(19)).await;
+    assert_eq!(
+        queue.visibility_within()[calls..].len(),
+        2,
+        "{:?}",
+        queue.visibility_within()
+    );
+}
+
+/// Pins that the units of a later chunk survive a slow call for an earlier
+/// chunk in the same tick, and a slow call of their own.
+/// Regression for #1446.
+#[tokio::test(start_paused = true)]
+async fn units_after_a_slow_chunk_survive_it() {
+    let visibility = Duration::from_secs(30);
+    let (feed, queue) = start(visibility);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    for i in 0..21 {
+        queue.ready(Message::new(&format!("u{i}")));
+    }
+    let got = receive_n(&feed, &park, 21).await;
+    let receipts: Vec<Receipt> = got.iter().map(|d| d.receipt).collect();
+    queue.delay_next_visibility_call(MINUTE);
+    queue.delay_next_visibility_call(Duration::ZERO);
+    queue.delay_next_visibility_call(MINUTE);
+    renew_through(&feed, &receipts, 2 * visibility, "21 units").await;
+}
+
+/// Pins that a unit one renewal period from its deadline at a tick survives
+/// one extension call SQS does not answer when another batch of the same
+/// tick takes most of a period to answer, since a batch is sent once more as
+/// soon as its own call is given up.
+#[tokio::test(start_paused = true)]
+async fn a_unit_survives_one_unanswered_call_beside_a_slow_batch() {
+    let (feed, queue) = start(MINUTE); // ticks near 20, 40, 60, 80
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    settle_tasks().await;
+    step(Duration::from_millis(19_500)).await;
+    queue.ready(Message::new("u"));
+    assert!(feed.receive(1).unwrap().is_empty());
+    until("buffered", || feed.buffered() == 1).await; // deadline near 79.5 s
+    // SQS refuses the extension of `u` at the tick near 20 s, so its
+    // deadline stays near 79.5 s.
+    queue.fail_next_visibility(vec![failure(0, "InvalidParameterValue")]);
+    step(Duration::from_secs(40)).await; // t near 59.5 s, 20 s left
+    let mut held: Vec<Receipt> = feed.receive(1).unwrap().iter().map(|d| d.receipt).collect();
+    assert_eq!(held.len(), 1);
+    for i in 0..10 {
+        queue.ready(Message::new(&format!("f{i}")));
+    }
+    held.extend(receive_n(&feed, &park, 10).await.iter().map(|d| d.receipt));
+    // At the tick near 60 s, SQS does not answer the call for the batch
+    // holding `u`, and answers the other batch's call after 19.9 s.
+    queue.delay_next_visibility_call(MINUTE);
+    queue.delay_next_visibility_call(Duration::from_millis(19_900));
+    renew_through(&feed, &held, Duration::from_secs(40), "beside a slow batch").await;
+}
+
+/// Pins that every chunk of a tick survives extension calls that each take
+/// most of a renewal period, since no chunk waits behind another.
+#[tokio::test(start_paused = true)]
+async fn every_chunk_survives_uniformly_slow_extension_calls() {
+    let (feed, queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    for i in 0..11 {
+        queue.ready(Message::new(&format!("u{i}")));
+    }
+    let got = receive_n(&feed, &park, 11).await;
+    let receipts: Vec<Receipt> = got.iter().map(|d| d.receipt).collect();
+    for _ in 0..64 {
+        queue.delay_next_visibility_call(Duration::from_secs(15));
+    }
+    renew_through(&feed, &receipts, 3 * MINUTE, "11 units, 15 s calls").await;
+}
+
+/// Pins that a buffered unit survives one extension call SQS does not answer
+/// and is still handed out, since the call sent once more keeps it one
+/// renewal period from its deadline. Regression for #1446.
+#[tokio::test(start_paused = true)]
+async fn a_buffered_unit_survives_one_slow_extension_call() {
+    let (feed, queue) = start(Duration::from_secs(30));
+    let taken = one_taken_one_buffered(&feed, &queue).await;
+    queue.delay_next_visibility_call(MINUTE);
+    renew_through(&feed, &[taken.receipt], Duration::from_secs(25), "taken").await;
+    let got = feed.receive(1).unwrap();
+    assert_eq!(
+        got.iter().map(|d| d.unit.id.as_str()).collect::<Vec<_>>(),
+        ["u1"],
+        "the buffered unit is handed out at 25 s: {:?}",
+        queue.visibility_within()
+    );
+}
+
+/// Pins that an extension answered just before its bound counts from when
+/// it was sent, as SQS counts it.
+#[tokio::test(start_paused = true)]
+async fn an_extension_answered_just_before_its_bound_counts_from_when_it_was_sent() {
+    let (feed, queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("u"));
+    let started = Instant::now();
+    let held = receive_n(&feed, &park, 1).await.remove(0);
+    queue.delay_next_visibility_call(Duration::from_millis(19_900));
+    step(Duration::from_millis(39_900)).await;
+    assert_eq!(queue.visibility().len(), 1, "one extension, answered");
+    assert_eq!(
+        feed.deadline_of(held.receipt),
+        Some(started + Duration::from_secs(20) + MINUTE)
+    );
+}
+
 /// Pins the drop rule at its boundary: a buffered unit exactly one renewal
 /// period from its deadline is handed out, and one a millisecond closer is
 /// dropped unread.
@@ -978,7 +1236,8 @@ async fn a_publish_retry_stops_once_the_feed_stops() {
 }
 
 /// Pins that a fail call is bounded by the time left to the earliest
-/// deadline in its batch, and that an extension call is not bounded.
+/// deadline in its batch, and that an extension call carries the running
+/// bound.
 #[tokio::test(start_paused = true)]
 async fn a_fail_call_is_bounded_by_the_earliest_deadline_in_its_batch() {
     let (feed, queue) = start(MINUTE);
@@ -1007,7 +1266,14 @@ async fn a_fail_call_is_bounded_by_the_earliest_deadline_in_its_batch() {
     feed.fail(got[1].receipt, "unreadable").unwrap();
     until("the fails are sent", || queue.visibility().len() == 3).await;
     assert_eq!(queue.visibility()[2].len(), 2, "one batch");
-    assert_eq!(queue.visibility_within(), [None, None, Some(b - failed_at)]);
+    assert_eq!(
+        queue.visibility_within(),
+        [
+            Some(Duration::from_secs(20)),
+            Some(Duration::from_secs(20)),
+            Some(b - failed_at)
+        ]
+    );
 }
 
 /// Pins that a send failed Fatal after the same batch failed Retryable
@@ -1632,7 +1898,8 @@ async fn an_sqs_feed_hands_back() {
 }
 
 /// Pins that a handed-back unit is set visible at once, with no tick, bounded
-/// by its deadline, and that its receipt is gone afterwards.
+/// by one renewal period or its deadline, and that its receipt is gone
+/// afterwards.
 #[tokio::test(start_paused = true)]
 async fn a_handed_back_unit_is_set_visible_at_once() {
     let (feed, queue) = start(MINUTE);
@@ -1640,14 +1907,13 @@ async fn a_handed_back_unit_is_set_visible_at_once() {
     feed.set_waker(waker);
     queue.ready(Message::new("u"));
     let d = receive_n(&feed, &park, 1).await.remove(0);
-    let deadline = feed.deadline_of(d.receipt).unwrap();
     feed.hand_back(d.receipt).unwrap();
     let at = Instant::now();
     settle_tasks().await;
     assert_eq!(Instant::now(), at, "no time moved");
     assert_eq!(handed_back(&queue.visibility()), ["h0"]);
     assert_eq!(queue.visibility().len(), 1, "one call");
-    assert_eq!(queue.visibility_within(), [Some(deadline - at)]);
+    assert_eq!(queue.visibility_within(), [Some(MINUTE / 3)]);
     assert_eq!(feed.renew(d.receipt).unwrap_err().kind, FeedErrorKind::Gone);
     assert_eq!(
         feed.acknowledge(d.receipt).unwrap_err().kind,
@@ -1728,12 +1994,16 @@ async fn a_hand_back_whose_deadline_passes_while_queued_is_dropped_unsent() {
     feed.set_waker(waker);
     queue.inner.ready(Message::new("b"));
     let b = receive_n(&feed, &park, 1).await.remove(0);
+    // SQS refuses the tick's extension of `b`, so `b` lapses at 60 s, before
+    // the held extension of `a` and `c` below gives up at 61 s.
+    queue
+        .inner
+        .fail_next_visibility(vec![failure(0, "InvalidParameterValue")]);
     tokio::time::advance(Duration::from_secs(21)).await;
-    until("the tick extends `b`", || {
+    until("the tick tries to extend `b`", || {
         queue.inner.visibility().len() == 1
     })
     .await;
-    // `a` and `c` hold until 5 s after `b`.
     tokio::time::advance(Duration::from_secs(5)).await;
     queue.inner.ready(Message::new("a"));
     queue.inner.ready(Message::new("c"));
@@ -1750,16 +2020,14 @@ async fn a_hand_back_whose_deadline_passes_while_queued_is_dropped_unsent() {
     assert!(b_deadline < c_deadline);
     feed.hand_back(b.receipt).unwrap();
     feed.hand_back(c).unwrap();
-    tokio::time::advance(b_deadline - Instant::now()).await;
-    queue.release_visibility();
-    settle_tasks().await;
+    step(b_deadline - Instant::now() + Duration::from_secs(2)).await;
     assert_eq!(handed_back(&queue.inner.visibility()), ["h2"]);
 }
 
-/// Pins that hand-backs queued together go out in one batch, bounded by the
-/// earliest deadline among them.
+/// Pins that hand-backs queued together go out in one batch, in the order
+/// they were queued.
 #[tokio::test(start_paused = true)]
-async fn a_hand_back_batch_is_bounded_by_its_earliest_deadline() {
+async fn hand_backs_queued_together_go_out_in_one_batch() {
     let (feed, queue) = start(MINUTE);
     let (waker, park) = wake_channel();
     feed.set_waker(waker);
@@ -1768,15 +2036,12 @@ async fn a_hand_back_batch_is_bounded_by_its_earliest_deadline() {
     tokio::time::advance(Duration::from_secs(10)).await;
     queue.ready(Message::new("b"));
     let b = receive_n(&feed, &park, 1).await.remove(0);
-    let earlier = feed.deadline_of(a.receipt).unwrap();
-    assert!(earlier < feed.deadline_of(b.receipt).unwrap());
     feed.hand_back(b.receipt).unwrap();
     feed.hand_back(a.receipt).unwrap();
-    let at = Instant::now();
     settle_tasks().await;
     assert_eq!(queue.visibility().len(), 1, "one batch");
     assert_eq!(handed_back(&queue.visibility()), ["h1", "h0"]);
-    assert_eq!(queue.visibility_within(), [Some(earlier - at)]);
+    assert_eq!(queue.visibility_within(), [Some(MINUTE / 3)]);
 }
 
 /// Pins that a hand-back entry SQS refuses is dropped, never sent again, and
@@ -1955,8 +2220,8 @@ async fn held_units_are_extended_from_the_stop_until_close() {
 
 /// Pins that a hand-back waits for an extension of the same unit already in
 /// flight, and that no extension of it follows: within one chunk, and when
-/// the unit is in the last of three chunks of the same tick, where the
-/// hand-back goes out right after the chunk in flight.
+/// the unit is in the last of three chunks of the same tick, all in flight
+/// together, where the hand-back goes out once every chunk is answered.
 #[tokio::test(start_paused = true)]
 async fn a_hand_back_is_sent_after_an_extension_of_the_same_receipt_in_flight() {
     for units in [1, 21] {
@@ -1969,15 +2234,20 @@ async fn a_hand_back_is_sent_after_an_extension_of_the_same_receipt_in_flight() 
         let got = receive_n(&feed, &park, units).await;
         let r = got.last().unwrap().receipt;
         let handle = format!("h{}", units - 1);
+        let chunks = units.div_ceil(BATCH_ENTRIES);
         queue.hold_visibility();
         step(Duration::from_secs(20)).await;
-        until("the first chunk is held", || {
-            queue.inner.visibility().len() == 1
+        until("every chunk is held", || {
+            queue.inner.visibility().len() == chunks
         })
         .await;
         feed.hand_back(r).unwrap();
         settle_tasks().await;
-        assert_eq!(queue.inner.visibility().len(), 1, "sent behind the chunk");
+        assert_eq!(
+            queue.inner.visibility().len(),
+            chunks,
+            "sent behind the chunks"
+        );
         queue.release_visibility();
         settle_tasks().await;
         step(Duration::from_secs(40)).await;
@@ -1986,7 +2256,7 @@ async fn a_hand_back_is_sent_after_an_extension_of_the_same_receipt_in_flight() 
             .iter()
             .position(|c| c.iter().any(|e| e.handle == handle && e.seconds == 0))
             .expect("the hand-back was sent");
-        assert_eq!(back, 1, "{units} units: {calls:?}");
+        assert_eq!(back, chunks, "{units} units: {calls:?}");
         assert!(
             !extended(&calls[back..]).contains(&handle),
             "{units} units: extended after its hand-back: {calls:?}"
@@ -2468,9 +2738,9 @@ async fn a_hand_back_queued_as_the_feed_stops_is_not_sent() {
     assert!(queue.inner.visibility().is_empty());
 }
 
-/// Pins that an extension chunk sent after a stop, in a tick that began
-/// before it, is bounded by the stop bound, so a hand-back queued behind it
-/// waits at most that long.
+/// Pins that a batch sent once more after a stop, in a tick that began
+/// before it, is bounded by the stop bound, while the tick's own calls keep
+/// the running bound.
 #[tokio::test(start_paused = true)]
 async fn an_extension_sent_after_a_stop_in_a_tick_begun_before_it_is_bounded() {
     let (feed, queue) = start_gated(MINUTE);
@@ -2479,31 +2749,31 @@ async fn an_extension_sent_after_a_stop_in_a_tick_begun_before_it_is_bounded() {
     for i in 0..21 {
         queue.inner.ready(Message::new(&format!("u{i}")));
     }
-    let got = receive_n(&feed, &park, 21).await;
+    receive_n(&feed, &park, 21).await;
     queue.hold_visibility();
     step(Duration::from_secs(20)).await;
-    until("the first chunk is held", || {
-        queue.inner.visibility().len() == 1
+    until("every chunk is held", || {
+        queue.inner.visibility().len() == 3
     })
     .await;
     feed.stop_receiving();
-    // Answer the first chunk and keep holding later calls.
-    queue.release.notify_waiters();
-    until("the second chunk is sent", || {
-        queue.inner.visibility().len() == 2
+    // The tick's calls are given up at 40 s, with 20 s left, and sent once
+    // more under the stop.
+    step(Duration::from_secs(20)).await;
+    until("every chunk is sent once more", || {
+        queue.inner.visibility().len() == 6
     })
     .await;
-    feed.hand_back(got[20].receipt).unwrap();
-    step(Duration::from_secs(2)).await;
+    let within = queue.inner.visibility_within();
     assert_eq!(
-        queue.inner.visibility_within()[1],
-        Some(STOP_EXTENSION_BOUND),
-        "the extension sent after the stop is unbounded"
+        within[..3],
+        [Some(Duration::from_secs(20)); 3],
+        "the extensions sent before the stop do not take the running bound"
     );
     assert_eq!(
-        handed_back(&queue.inner.visibility()),
-        ["h20"],
-        "the hand-back still waits behind the extension"
+        within[3..],
+        [Some(STOP_EXTENSION_BOUND); 3],
+        "the extensions sent after the stop do not take the stop bound"
     );
 }
 
@@ -2779,4 +3049,626 @@ async fn an_extension_during_a_stop_is_bounded_at_one_second() {
     feed.stop_receiving();
     step(Duration::from_secs(20)).await;
     assert_eq!(queue.visibility_within(), [Some(Duration::from_secs(1))]);
+}
+
+/// Pins that a Fatal visibility extension is returned by every later call.
+#[tokio::test(start_paused = true)]
+async fn a_fatal_renewal_is_sticky() {
+    let (feed, queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("u"));
+    let delivery = receive_n(&feed, &park, 1).await.remove(0);
+    feed.renew(delivery.receipt).unwrap();
+    queue.fail_next_visibility_call(CallError::fatal("InvalidAction"));
+    tokio::time::advance(Duration::from_secs(20)).await;
+    until("the extension is sent", || queue.visibility().len() == 1).await;
+    until("the failure wakes the reader", || park.park(Duration::ZERO)).await;
+    for _ in 0..2 {
+        assert_eq!(feed.receive(1).unwrap_err().kind, FeedErrorKind::Fatal);
+    }
+}
+
+/// Pins that `connect` refuses a queue whose attribute read SQS answers
+/// with a coded 400, in AWS's wire shape and ElasticMQ's. Regression for
+/// #1188.
+#[test]
+fn an_unlisted_sender_error_refuses_connect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let io = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let shapes = [
+        (
+            "x-amzn-query-error: InvalidAction;Sender",
+            r#"{"__type":"com.amazon.coral.service#InvalidAction","message":"bad"}"#,
+        ),
+        (
+            "X-Amzn-Query-Error: com.amazonaws.sqs#InvalidAction",
+            r#"{"__type":"com.amazonaws.sqs#InvalidAction","message":"bad"}"#,
+        ),
+    ];
+    for (header, body) in shapes {
+        let listener = io
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        io.spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = tcp.read(&mut buf).await;
+                    let reply = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/x-amz-json-1.0\r\n\
+                         {header}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = tcp.write_all(reply.as_bytes()).await;
+                    let _ = tokio::io::copy(&mut tcp, &mut tokio::io::sink()).await;
+                });
+            }
+        });
+        let section: FeedSection = serde_yaml::from_str(&format!(
+            "sqs: {{ queue_url: \"http://{addr}/000000000000/jobs\", \
+             region: eu-west-2, endpoint: \"http://{addr}\" }}"
+        ))
+        .unwrap();
+        match SqsFeed::connect_with_static_credentials(&section, io.handle(), "x", "x") {
+            Err(SqsError::Refused(m)) => assert!(m.contains("InvalidAction"), "{header}: {m}"),
+            Err(e) => panic!("{header}: {e}"),
+            Ok(_) => panic!("{header}: connected"),
+        }
+    }
+}
+
+/// The bound each hand-back call was given, in call order.
+fn hand_back_within(queue: &ScriptedQueue) -> Vec<Option<Duration>> {
+    queue
+        .visibility()
+        .iter()
+        .zip(queue.visibility_within())
+        .filter(|(call, _)| call.iter().all(|e| e.seconds == 0))
+        .map(|(_, within)| within)
+        .collect()
+}
+
+/// Receive a kept unit and one to hand back, and renew the kept one for
+/// nine tenths of a renewal period, just short of the first tick.
+async fn kept_and_other(
+    feed: &SqsFeed,
+    queue: &ScriptedQueue,
+    visibility: Duration,
+) -> [Receipt; 2] {
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("kept"));
+    queue.ready(Message::new("handed back"));
+    let got = receive_n(feed, &park, 2).await;
+    renew_through(feed, &[got[0].receipt], visibility * 3 / 10, "before").await;
+    [got[0].receipt, got[1].receipt]
+}
+
+/// Pins that a held unit the reader keeps renewing survives one hand-back
+/// call SQS is slow to answer, sent from the renewal task just before a
+/// tick. Regression for #1452.
+#[tokio::test(start_paused = true)]
+async fn a_renewed_unit_survives_one_slow_hand_back_call() {
+    for visibility in [3, 30, 60] {
+        let visibility = Duration::from_secs(visibility);
+        let (feed, queue) = start(visibility);
+        let [kept, other] = kept_and_other(&feed, &queue, visibility).await;
+        queue.delay_next_visibility_call(MINUTE);
+        feed.hand_back(other).unwrap();
+        let what = format!("visibility {visibility:?}, after the hand-back");
+        renew_through(&feed, &[kept], 2 * visibility, &what).await;
+    }
+}
+
+/// Pins that a held unit the reader keeps renewing survives hand-back calls
+/// SQS never answers, each followed by a retry that is slow again.
+/// Regression for #1452.
+#[tokio::test(start_paused = true)]
+async fn a_renewed_unit_survives_hand_back_calls_sqs_keeps_slow() {
+    for visibility in [3, 30] {
+        let visibility = Duration::from_secs(visibility);
+        let (feed, queue) = start(visibility);
+        let [kept, other] = kept_and_other(&feed, &queue, visibility).await;
+        queue.slow_hand_backs(Some(MINUTE));
+        feed.hand_back(other).unwrap();
+        let what = format!("visibility {visibility:?}, after the hand-back");
+        renew_through(&feed, &[kept], 2 * visibility, &what).await;
+    }
+}
+
+/// Pins that a held unit the reader keeps renewing survives a hand-back
+/// whose every call SQS fails at once, retried with backoff until a
+/// deadline later than the held unit's. Regression for #1452.
+#[tokio::test(start_paused = true)]
+async fn a_renewed_unit_survives_a_hand_back_sqs_keeps_failing() {
+    let visibility = Duration::from_secs(30);
+    let (feed, queue) = start(visibility);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("kept"));
+    let kept = receive_n(&feed, &park, 1).await.remove(0).receipt;
+    renew_through(&feed, &[kept], Duration::from_secs(4), "before").await;
+    queue.ready(Message::new("handed back"));
+    let other = receive_n(&feed, &park, 1).await.remove(0).receipt;
+    renew_through(&feed, &[kept], Duration::from_secs(5), "before").await;
+    queue.fail_hand_backs(Some(CallError::retryable("InternalError")));
+    feed.hand_back(other).unwrap();
+    renew_through(&feed, &[kept], 2 * visibility, "after the hand-back").await;
+    assert!(handed_back(&queue.visibility()).len() > 2, "retried");
+}
+
+/// Pins that a held unit survives more hand-backs than one batch carries,
+/// queued over a renewal period while SQS answers none of them, and that a
+/// batch given up is sent again first. Regression for #1452.
+#[tokio::test(start_paused = true)]
+async fn held_units_survive_many_slow_hand_backs() {
+    let visibility = Duration::from_secs(30);
+    let (feed, queue) = start(visibility);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    for i in 0..22 {
+        queue.ready(Message::new(&format!("u{i}")));
+    }
+    let got = receive_n(&feed, &park, 22).await;
+    let kept = got[0].receipt;
+    renew_through(&feed, &[kept], Duration::from_secs(9), "before").await;
+    queue.slow_hand_backs(Some(MINUTE));
+    for d in &got[1..12] {
+        feed.hand_back(d.receipt).unwrap();
+    }
+    for d in &got[12..] {
+        renew_through(&feed, &[kept], Duration::from_secs(1), "handing back").await;
+        feed.hand_back(d.receipt).unwrap();
+    }
+    renew_through(&feed, &[kept], 2 * visibility, "after the hand-backs").await;
+    let calls: Vec<Vec<String>> = queue
+        .visibility()
+        .iter()
+        .filter(|call| call.iter().all(|e| e.seconds == 0))
+        .map(|call| call.iter().map(|e| e.handle.clone()).collect())
+        .collect();
+    assert!(calls.len() > 1, "{calls:?}");
+    assert_eq!(calls[1], calls[0], "the batch given up goes first");
+}
+
+/// Pins that a unit the worker holds through a stop keeps its lease while
+/// SQS answers none of the hand-backs of the units still buffered, and that
+/// those hand-backs carry only the buffered units, each before its deadline.
+/// Regression for #1452.
+#[tokio::test(start_paused = true)]
+async fn a_held_unit_survives_a_slow_hand_back_at_the_stop() {
+    let visibility = Duration::from_secs(30);
+    let (feed, queue) = start_gated(visibility);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    for i in 0..11 {
+        queue.inner.ready(Message::new(&format!("u{i}")));
+    }
+    assert!(feed.receive(11).unwrap().is_empty());
+    until("the units are buffered", || feed.buffered() == 11).await;
+    assert!(park.park(Duration::ZERO));
+    let taken = feed.receive(1).unwrap().remove(0);
+    let start = Instant::now();
+    queue.inner.slow_hand_backs(Some(MINUTE));
+    step(Duration::from_secs(9)).await;
+    feed.stop_receiving();
+    let mut deadline = feed.deadline_of(taken.receipt).unwrap();
+    let mut moved = 0;
+    for _ in 0..(2 * visibility).as_millis() / 100 {
+        step(Duration::from_millis(100)).await;
+        let now = feed.deadline_of(taken.receipt).unwrap();
+        assert!(
+            now > Instant::now(),
+            "lapsed {:?} in",
+            Instant::now() - start
+        );
+        moved += usize::from(now != deadline);
+        deadline = now;
+    }
+    assert!(moved >= 5, "extended on {moved} ticks");
+    feed.acknowledge(taken.receipt).unwrap();
+    let at = queue.visibility_at.lock().unwrap().clone();
+    let buffered: Vec<String> = (1..11).map(|i| format!("h{i}")).collect();
+    let hand_backs: Vec<_> = queue
+        .inner
+        .visibility()
+        .into_iter()
+        .zip(at)
+        .filter(|(call, _)| call.iter().all(|e| e.seconds == 0))
+        .collect();
+    assert!(!hand_backs.is_empty());
+    for (call, sent) in hand_backs {
+        assert!(sent < start + visibility, "sent {:?} in", sent - start);
+        for e in call {
+            assert!(buffered.contains(&e.handle), "{}", e.handle);
+        }
+    }
+}
+
+/// Pins the bound of a hand-back call: one renewal period from the start of
+/// its pass, or the time left to its batch's earliest deadline, or a
+/// close's bound, if that is shorter. A batch left when a pass ends waits
+/// for the next one. Regression for #1452.
+#[tokio::test(start_paused = true)]
+async fn a_hand_back_call_is_bounded_by_the_period_and_the_time_left() {
+    let s = Duration::from_secs;
+    // Hand back one unit `at` into its visibility, after SQS refuses the
+    // tick's extension so the deadline stays at 60 s.
+    for (at, within) in [(0, s(20)), (40, s(20)), (45, s(15))] {
+        let (feed, queue) = start(MINUTE);
+        let (waker, park) = wake_channel();
+        feed.set_waker(waker);
+        queue.ready(Message::new("u"));
+        let d = receive_n(&feed, &park, 1).await.remove(0);
+        queue.fail_next_visibility(vec![failure(0, "InvalidParameterValue")]);
+        step(s(at)).await;
+        feed.hand_back(d.receipt).unwrap();
+        settle_tasks().await;
+        assert_eq!(hand_back_within(&queue), [Some(within)], "at {at} s");
+    }
+    // A second unit, later in the batch, does not lengthen the bound.
+    let (feed, queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("a"));
+    let a = receive_n(&feed, &park, 1).await.remove(0);
+    queue.fail_next_visibility(vec![failure(0, "InvalidParameterValue")]);
+    step(s(26)).await;
+    queue.ready(Message::new("b"));
+    let b = receive_n(&feed, &park, 1).await.remove(0);
+    step(s(19)).await;
+    feed.hand_back(b.receipt).unwrap();
+    feed.hand_back(a.receipt).unwrap();
+    settle_tasks().await;
+    assert_eq!(handed_back(&queue.visibility()), ["h1", "h0"]);
+    assert_eq!(hand_back_within(&queue), [Some(s(15))], "earliest deadline");
+    // A close's bound past the period does not lengthen it.
+    let (feed, queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("u"));
+    receive_n(&feed, &park, 1).await;
+    let _closed = feed.close(s(30)).unwrap();
+    settle_tasks().await;
+    assert_eq!(hand_back_within(&queue), [Some(s(20))], "close");
+    // Eleven hand-backs: the second batch gets what is left of the pass,
+    // and none once the first takes all of it.
+    for (first, second) in [(s(5), s(15)), (s(20), s(20))] {
+        let (feed, queue) = start(MINUTE);
+        let (waker, park) = wake_channel();
+        feed.set_waker(waker);
+        for i in 0..11 {
+            queue.ready(Message::new(&format!("u{i}")));
+        }
+        let got = receive_n(&feed, &park, 11).await;
+        queue.delay_next_visibility_call(first);
+        for d in &got {
+            feed.hand_back(d.receipt).unwrap();
+        }
+        step(s(21)).await;
+        assert_eq!(
+            hand_back_within(&queue),
+            [Some(s(20)), Some(second)],
+            "first call {first:?}"
+        );
+    }
+}
+
+/// Pins that a hand-back call given up at the end of its pass is sent again
+/// at once, after the tick that is due by then.
+#[tokio::test(start_paused = true)]
+async fn a_hand_back_given_up_at_the_period_is_sent_again_at_once() {
+    let (feed, queue) = start_gated(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.inner.ready(Message::new("u"));
+    let d = receive_n(&feed, &park, 1).await.remove(0);
+    let start = Instant::now();
+    queue.inner.delay_next_visibility_call(MINUTE);
+    feed.hand_back(d.receipt).unwrap();
+    settle_tasks().await;
+    step(Duration::from_secs(21)).await;
+    assert_eq!(handed_back(&queue.inner.visibility()), ["h0", "h0"]);
+    let at: Vec<Duration> = queue
+        .visibility_at
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| *t - start)
+        .collect();
+    assert_eq!(at, [Duration::ZERO, Duration::from_secs(20)]);
+}
+
+/// Pins that a close waits for a hand-back given up at the end of its pass
+/// and sent again, and counts it once when it is never answered.
+#[tokio::test(start_paused = true)]
+async fn a_close_waits_for_a_hand_back_given_up_at_the_period() {
+    let (feed, queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("u"));
+    let d = receive_n(&feed, &park, 1).await.remove(0);
+    queue.delay_next_visibility_call(MINUTE);
+    feed.hand_back(d.receipt).unwrap();
+    step(Duration::from_secs(10)).await;
+    let mut closed = feed.close(Duration::from_secs(30)).unwrap();
+    step(Duration::from_millis(9_900)).await;
+    assert!(closed.try_outcome().is_none(), "settled before the resend");
+    step(Duration::from_millis(200)).await;
+    assert!(closed.try_outcome().unwrap().is_ok());
+
+    let (feed, queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("u"));
+    let d = receive_n(&feed, &park, 1).await.remove(0);
+    queue.slow_hand_backs(Some(MINUTE));
+    feed.hand_back(d.receipt).unwrap();
+    step(Duration::from_secs(10)).await;
+    let mut closed = feed.close(Duration::from_secs(30)).unwrap();
+    step(Duration::from_secs(31)).await;
+    let e = closed.try_outcome().unwrap().unwrap_err().reason;
+    assert!(
+        e.starts_with("the close reached its bound with 1 deletes, fails or hand-backs unsent")
+            || e.starts_with("the close gave up 1 of"),
+        "{e}"
+    );
+}
+
+/// Pins that a hand-back given up at the end of its pass and queued again
+/// is not sent once its unit's deadline passes behind a held extension.
+#[tokio::test(start_paused = true)]
+async fn a_requeued_hand_back_is_not_sent_past_its_deadline() {
+    let s = Duration::from_secs;
+    let (feed, queue) = start_gated(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.inner.ready(Message::new("kept"));
+    queue.inner.ready(Message::new("other"));
+    let got = receive_n(&feed, &park, 2).await;
+    let kept = got[0].receipt;
+    // SQS refuses the 20 s tick's extension of the other unit, so its
+    // deadline stays at 60 s.
+    queue
+        .inner
+        .fail_next_visibility(vec![failure(1, "InvalidParameterValue")]);
+    renew_through(&feed, &[kept], s(38), "before").await;
+    let other = feed.deadline_of(got[1].receipt).unwrap();
+    queue.inner.slow_hand_backs(Some(MINUTE));
+    feed.hand_back(got[1].receipt).unwrap();
+    renew_through(&feed, &[kept], s(12), "during the pass").await;
+    // The tick due at 40 s runs once the pass ends at 58 s, and its
+    // extension is held past the other unit's deadline.
+    queue.hold_visibility();
+    renew_through(&feed, &[kept], s(8), "the pass ends").await;
+    assert!(Instant::now() < other);
+    renew_through(&feed, &[kept], other - Instant::now() + s(2), "held").await;
+    queue.release_visibility();
+    renew_through(&feed, &[kept], s(10), "after").await;
+    assert_eq!(handed_back(&queue.inner.visibility()), ["h1"]);
+}
+
+/// Pins that a held unit the reader keeps renewing survives one slow
+/// hand-back and, at the tick it delays, one slow extension. Regression for
+/// #1452.
+#[tokio::test(start_paused = true)]
+async fn a_renewed_unit_survives_a_slow_hand_back_and_a_slow_extension() {
+    let visibility = Duration::from_secs(30);
+    let (feed, queue) = start(visibility);
+    let [kept, other] = kept_and_other(&feed, &queue, visibility).await;
+    queue.slow_hand_backs(Some(MINUTE));
+    queue.delay_next_visibility_call(MINUTE);
+    feed.hand_back(other).unwrap();
+    renew_through(&feed, &[kept], 2 * visibility, "after the hand-back").await;
+}
+
+/// Pins that a hand-back given up at the end of its pass and queued again
+/// is not sent once a close's bound has passed behind a slow extension.
+#[tokio::test(start_paused = true)]
+async fn a_requeued_hand_back_is_not_sent_past_a_close_bound() {
+    let s = Duration::from_secs;
+    let (feed, queue) = start_gated(MINUTE);
+    let start = Instant::now();
+    let [_kept, other] = kept_and_other(&feed, &queue.inner, MINUTE).await;
+    queue.inner.slow_hand_backs(Some(MINUTE));
+    queue.inner.delay_next_visibility_call(MINUTE);
+    feed.hand_back(other).unwrap();
+    step(s(22)).await;
+    let closed_at = Instant::now();
+    let _closed = feed.close(s(5)).unwrap();
+    step(s(60)).await;
+    let at = queue.visibility_at.lock().unwrap().clone();
+    let calls: Vec<(bool, Duration)> = queue
+        .inner
+        .visibility()
+        .into_iter()
+        .zip(at)
+        .map(|(call, t)| (call.iter().all(|e| e.seconds == 0), t - start))
+        .collect();
+    let bound = closed_at + s(5) - start;
+    assert!(
+        calls.iter().all(|&(zero, t)| !zero || t < bound),
+        "bound {bound:?}, calls (hand-back, at) {calls:?}"
+    );
+}
+
+/// Pins that a hand-back SQS fails with a transient error on every call,
+/// given up at the end of its pass and queued again, is logged with the
+/// error SQS returned.
+#[test]
+fn a_hand_back_given_up_at_the_period_is_logged_with_its_error() {
+    let lines = spate_test::capture_logs(tracing::Level::DEBUG, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (feed, queue) = start(MINUTE);
+            let (waker, park) = wake_channel();
+            feed.set_waker(waker);
+            queue.ready(Message::new("u"));
+            let d = receive_n(&feed, &park, 1).await.remove(0);
+            queue.fail_hand_backs(Some(CallError::retryable("InternalError")));
+            feed.hand_back(d.receipt).unwrap();
+            step(Duration::from_secs(25)).await;
+            assert!(handed_back(&queue.visibility()).len() > 2, "retried");
+        });
+    });
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("sending it again") && l.contains("InternalError")),
+        "{lines:#?}"
+    );
+}
+
+/// A feed over a real [`SdkQueue`](crate::queue::SdkQueue) against the
+/// answering stub, loading credentials through `credentials`, with the
+/// reader holding the one unit the stub hands out. Tokio time is paused
+/// once the client is built.
+async fn holding_one_unit(
+    visibility: Duration,
+    credentials: &Arc<crate::test_stub::ScriptedCredentials>,
+) -> (SqsFeed, Delivery, Arc<crate::test_stub::Answered>) {
+    let (endpoint, answered) = crate::test_stub::sqs_stub().await;
+    let (queue, cfg) =
+        crate::test_stub::queue_with(&endpoint, visibility, credentials.provider()).await;
+    // Paused only now: building the client reads the trust store on a
+    // blocking thread.
+    tokio::time::pause();
+    let feed = SqsFeed::start(
+        Arc::new(queue) as Arc<dyn Queue>,
+        Arc::new(ScriptedQueue::default()) as Arc<dyn startup::QueueAttributes>,
+        DEAD_URL.to_owned(),
+        &cfg,
+        &tokio::runtime::Handle::current(),
+    );
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    let held = receive_n(&feed, &park, 1).await.remove(0);
+    (feed, held, answered)
+}
+
+/// Renews `held` every 100 ms for `d`, asserting every renew is accepted,
+/// with the extensions SQS answered and the provider's loads in the message.
+async fn renew_with_counts(
+    feed: &SqsFeed,
+    held: &Delivery,
+    d: Duration,
+    answered: &crate::test_stub::Answered,
+    credentials: &crate::test_stub::ScriptedCredentials,
+) {
+    let start = Instant::now();
+    for _ in 0..d.as_millis() / 100 {
+        assert_eq!(
+            feed.renew(held.receipt).map_err(|e| e.kind),
+            Ok(()),
+            "the unit lapsed {:?} in: extensions answered {}, credential loads started {}, \
+             finished {}",
+            Instant::now() - start,
+            answered.extended.load(Ordering::SeqCst),
+            credentials.started(),
+            credentials.finished(),
+        );
+        step(Duration::from_millis(100)).await;
+    }
+    assert!(
+        answered.extended.load(Ordering::SeqCst) > 0,
+        "no extension reached SQS"
+    );
+}
+
+/// Pins that a renewed unit survives a credentials load slower than the
+/// running extension bound while no receive runs. At a 3 s visibility the
+/// tick at 1 s starts a 1.2 s load and gives up at 2 s; with 1 s left the
+/// batch is sent once more with 0.5 s, and that call is handed the load at
+/// 2.2 s. A 200 ms load is the control. Regression for #1455.
+#[tokio::test]
+async fn a_renewed_unit_outlives_a_credentials_load_slower_than_its_extension_bound() {
+    for reload in [Duration::from_millis(200), Duration::from_millis(1_200)] {
+        let credentials = crate::test_stub::ScriptedCredentials::slow_reloads(reload);
+        let (feed, held, answered) = holding_one_unit(Duration::from_secs(3), &credentials).await;
+        renew_with_counts(
+            &feed,
+            &held,
+            Duration::from_secs(4),
+            &answered,
+            &credentials,
+        )
+        .await;
+        drop(feed);
+        tokio::time::resume();
+    }
+}
+
+/// Pins that a unit held through a stop survives a credentials load slower
+/// than [`STOP_EXTENSION_BOUND`]. At a one-minute visibility the tick near
+/// 20 s starts a 1.2 s load and gives up after 1 s; the load finishes with
+/// no call waiting, and the tick near 40 s is handed it. Regression for
+/// #1455.
+#[tokio::test]
+async fn a_held_unit_outlives_a_credentials_load_slower_than_the_stop_bound() {
+    let credentials =
+        crate::test_stub::ScriptedCredentials::slow_reloads(Duration::from_millis(1_200));
+    let (feed, held, answered) = holding_one_unit(MINUTE, &credentials).await;
+    feed.stop_receiving();
+    renew_with_counts(
+        &feed,
+        &held,
+        Duration::from_secs(70),
+        &answered,
+        &credentials,
+    )
+    .await;
+}
+
+/// Pins that dropping the feed ends a credentials load under way.
+#[tokio::test]
+async fn dropping_the_feed_ends_a_credentials_load_in_flight() {
+    let (ended, mut dropped) = oneshot::channel::<()>();
+    let guard = std::sync::Mutex::new(Some(ended));
+    struct OnDrop(Option<oneshot::Sender<()>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            if let Some(ended) = self.0.take() {
+                let _ = ended.send(());
+            }
+        }
+    }
+    let credentials = crate::test_stub::ScriptedCredentials::new(move |n| {
+        let on_drop = OnDrop(if n == 0 {
+            None
+        } else {
+            guard.lock().unwrap().take()
+        });
+        Box::pin(async move {
+            if n == 0 {
+                return Ok(crate::test_stub::stale_keys());
+            }
+            let _on_drop = on_drop;
+            std::future::pending::<()>().await;
+            unreachable!()
+        })
+    });
+    let (feed, _held, _) = holding_one_unit(Duration::from_secs(3), &credentials).await;
+    for _ in 0..100 {
+        if credentials.started() >= 2 {
+            break;
+        }
+        step(Duration::from_millis(100)).await;
+    }
+    assert_eq!(credentials.started(), 2, "a tick started a reload");
+    assert!(dropped.try_recv().is_err(), "the load is under way");
+    drop(feed);
+    tokio::time::timeout(MINUTE, dropped)
+        .await
+        .expect("the load ended")
+        .unwrap();
 }

@@ -2,7 +2,8 @@
 //! acknowledges each under the feed's ack rule.
 //!
 //! A unit's body is a [`SplitDescriptor`](crate::split::SplitDescriptor)
-//! naming one object, whole or one byte range of it, or a storage
+//! naming one object, whole or one byte range of it, or several objects read
+//! whole in turn on one lane, or a storage
 //! notification, which [`decode`](crate::unit::decode) reads into one part per
 //! created object. A notification with no object to read is acknowledged, and
 //! one the source cannot read is failed back. A whole-object part over an
@@ -74,9 +75,10 @@ use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Units held at once when the `feed:` section sets no `units_held`. The
-/// reader receives only while it holds fewer.
-const UNITS_HELD: usize = 96;
+/// Units held at once when neither the `feed:` section's `units_held` nor a
+/// pipeline thread count gives one. The reader receives only while it holds
+/// fewer.
+pub(crate) const UNITS_HELD: NonZeroUsize = NonZeroUsize::new(96).expect("non-zero");
 
 /// What the reader needs to open a lane, fixed at `open`.
 pub(crate) struct LaneParts {
@@ -168,6 +170,8 @@ struct LaneState {
     /// The re-enqueue count of the lane's notification unit, 0 for a
     /// lister's.
     re_enqueues: u32,
+    /// The objects the lane reads, its count in `objects_remaining`.
+    members: u64,
 }
 
 /// Reads work units from a feed, one lane per part in progress.
@@ -194,6 +198,9 @@ pub(crate) struct UnitReader {
     /// Lanes to stop through a drain barrier: records they emitted may be
     /// in flight.
     revoked: Vec<LaneId>,
+    /// A fatal answer to a renewal from [`renew_held`](Self::renew_held),
+    /// returned by the next `poll_events` or `stop_reading`.
+    renew_error: Option<SourceError>,
     /// Lanes whose records are all committed, leaving with nothing in
     /// flight.
     retired: Vec<LaneId>,
@@ -244,13 +251,14 @@ impl UnitReader {
             waker,
             parts,
             scope,
-            units_held: units_held.map_or(UNITS_HELD, NonZeroUsize::get),
+            units_held: units_held.unwrap_or(UNITS_HELD).get(),
             started: false,
             next_delivery: 0,
             next_lane: 0,
             deliveries: BTreeMap::new(),
             lanes: BTreeMap::new(),
             revoked: Vec::new(),
+            renew_error: None,
             retired: Vec::new(),
             unsent_fails: Vec::new(),
             poison_tx,
@@ -387,7 +395,7 @@ impl UnitReader {
     /// yet handed back held, for the feed's close.
     pub(crate) fn stop_reading(&mut self) -> Result<(), SourceError> {
         if !self.hands_back {
-            return Ok(());
+            return self.renew_error.take().map_or(Ok(()), Err);
         }
         self.begin_stop();
         let ended = self.ended_then_reports();
@@ -527,8 +535,13 @@ impl UnitReader {
 
     /// Settle what the lanes and the feed left since the last poll (poison
     /// reports, refused fails, finished lanes and units), then renew every
-    /// unit still held.
+    /// unit still held. A fatal renewal kept by
+    /// [`renew_held`](Self::renew_held) is returned first, before anything
+    /// is settled.
     fn settle(&mut self) -> Result<(), SourceError> {
+        if let Some(e) = self.renew_error.take() {
+            return Err(e);
+        }
         self.read_reports();
         self.check_re_enqueues()?;
         let failing: Vec<u32> = self
@@ -587,7 +600,24 @@ impl UnitReader {
         for delivery in finished {
             self.acknowledge(delivery)?;
         }
+        self.renew_each()
+    }
 
+    /// Renew every unit held, from a revocation's wait for its drain.
+    ///
+    /// Settles and acknowledges nothing, so no position moves before the
+    /// revocation's commit. A unit answered `Gone` is let go, and its lanes
+    /// leave on the next `poll_events`. A fatal answer is kept, and the next
+    /// `poll_events` or `stop_reading` returns it before it acknowledges
+    /// anything.
+    pub(crate) fn renew_held(&mut self) {
+        if self.renew_error.is_none() {
+            self.renew_error = self.renew_each().err();
+        }
+    }
+
+    /// Renew every unit held, letting go of each one answered `Gone`.
+    fn renew_each(&mut self) -> Result<(), SourceError> {
         let receipts: Vec<(u32, Receipt)> = self
             .deliveries
             .iter()
@@ -598,7 +628,13 @@ impl UnitReader {
                 Ok(()) => {}
                 // The feed delivered the unit again or settled it, so this
                 // reading is no longer the unit's.
-                Err(e) if e.kind == FeedErrorKind::Gone => self.release(delivery),
+                Err(e) if e.kind == FeedErrorKind::Gone => {
+                    tracing::warn!(
+                        %receipt,
+                        "a held unit's lease lapsed or the feed delivered it again; letting it go"
+                    );
+                    self.release(delivery);
+                }
                 Err(e) if e.kind == FeedErrorKind::Retryable => {
                     tracing::warn!(%receipt, error = %e, "renewing a held unit failed; retrying");
                 }
@@ -771,13 +807,13 @@ impl UnitReader {
         }
     }
 
-    /// Take back the lane's count in `objects_remaining`, less the object
+    /// Take back the lane's count in `objects_remaining`, less the objects
     /// it finished.
     fn settle_remaining(&self, lane: &LaneState) {
         if let Some(m) = &self.parts.metrics {
             let done = u64::from(lane.tracker.close());
             m.objects_remaining
-                .decrement(1u64.saturating_sub(done) as f64);
+                .decrement(lane.members.saturating_sub(done) as f64);
         }
     }
 
@@ -883,6 +919,12 @@ impl UnitReader {
             Origin::Notification { re_enqueues, .. } => *re_enqueues,
             Origin::Lister => 0,
         };
+        // A range reads one object; a whole part reads every member.
+        let members = if part.range.is_some() {
+            1
+        } else {
+            part.object.len() as u64
+        };
         // Detached: the fetcher exits when the lane drops its receiver.
         drop(parts.handle.spawn(run_fetcher(FetcherParams {
             split: label.clone(),
@@ -901,7 +943,7 @@ impl UnitReader {
             origin: part.origin,
         })));
         if let Some(m) = &parts.metrics {
-            m.objects_remaining.increment(1.0);
+            m.objects_remaining.increment(members as f64);
         }
         let s3_lane = S3Lane::new(
             lane,
@@ -927,6 +969,7 @@ impl UnitReader {
                 last_committed: None,
                 hinted: false,
                 re_enqueues,
+                members,
             },
         );
         self.deliveries
@@ -1222,6 +1265,7 @@ mod tests {
                 last_committed: None,
                 hinted: false,
                 re_enqueues: 0,
+                members: 1,
             },
         );
         (partition, receipt, tracker)
@@ -1501,6 +1545,118 @@ mod tests {
         assert_eq!(script.acknowledged(), vec![at_receipt]);
     }
 
+    /// Pins that renewing from a revocation's wait renews every held unit
+    /// and acknowledges none, though one has reached its terminal watermark,
+    /// and that the next sweep acknowledges it. Regression for #1278.
+    #[test]
+    fn renewing_during_a_drain_renews_every_held_unit_and_settles_nothing() {
+        let (mut reader, script, _rt) = reader();
+        start(&mut reader);
+        let (_, open, _) = hold_one(&mut reader, &script);
+        let (at, at_receipt, at_tracker) = hold_one(&mut reader, &script);
+        reader.commit(&[(at, 5)]).unwrap();
+        at_tracker.set_terminal(5);
+
+        reader.renew_held();
+        assert_eq!(script.renewed(), vec![open, at_receipt]);
+        assert_eq!(script.acknowledged(), vec![], "acknowledged by the hook");
+
+        reader.settle().unwrap();
+        assert_eq!(script.acknowledged(), vec![at_receipt]);
+    }
+
+    /// Pins that a unit answered `Gone` while renewing from a revocation's
+    /// wait leaves through a revocation on the next poll. Regression for
+    /// #1278.
+    #[test]
+    fn a_unit_gone_during_a_drain_is_revoked_at_the_next_poll() {
+        let (mut reader, script, _rt) = reader();
+        start(&mut reader);
+        let (p, receipt, _) = hold_one(&mut reader, &script);
+        script.redeliver(receipt);
+
+        reader.renew_held();
+        assert!(script.gone().contains(&receipt));
+        assert_eq!(lanes_revoked(poll(&mut reader)), vec![LaneId(p.0)]);
+    }
+
+    /// Pins that a fatal answer to a renewal from a revocation's wait fails
+    /// the next poll before it settles anything, and that a later renewal
+    /// does not clear it. Regression for #1278.
+    #[test]
+    fn a_renew_error_during_a_drain_fails_the_next_poll() {
+        let (mut reader, script, _rt) = reader();
+        start(&mut reader);
+        let (at, _, at_tracker) = hold_one(&mut reader, &script);
+        reader.commit(&[(at, 5)]).unwrap();
+        at_tracker.set_terminal(5);
+        script.refuse_next_renew(FeedErrorKind::Fatal);
+
+        reader.renew_held();
+        reader.renew_held();
+        let Err(SourceError::Client { reason, .. }) = reader.poll_events(Duration::ZERO) else {
+            panic!("a fatal renewal did not fail the poll");
+        };
+        assert!(reason.contains("renewing a held unit"), "{reason}");
+        assert_eq!(script.acknowledged(), vec![], "settled before failing");
+    }
+
+    /// Pins that a fatal answer to a renewal from a revocation's wait fails a
+    /// stop that follows it, before the stop acknowledges anything.
+    #[test]
+    fn a_renew_error_during_a_drain_fails_the_stop() {
+        let (mut reader, script, _rt) = stopping_reader();
+        start(&mut reader);
+        let (at, _, at_tracker) = hold_one(&mut reader, &script);
+        reader.commit(&[(at, 5)]).unwrap();
+        at_tracker.set_terminal(5);
+        script.refuse_next_renew(FeedErrorKind::Fatal);
+
+        reader.renew_held();
+        let Err(SourceError::Client { reason, .. }) = reader.stop_reading() else {
+            panic!("a fatal renewal did not fail the stop");
+        };
+        assert!(reason.contains("renewing a held unit"), "{reason}");
+        assert_eq!(script.acknowledged(), vec![], "settled before failing");
+    }
+
+    /// Pins that a fatal answer to a renewal from a revocation's wait fails a
+    /// stop on a feed that does not hand back.
+    #[test]
+    fn a_renew_error_during_a_drain_fails_a_stop_that_hands_nothing_back() {
+        let (mut reader, script, _rt) = reader();
+        start(&mut reader);
+        hold_one(&mut reader, &script);
+        script.refuse_next_renew(FeedErrorKind::Fatal);
+
+        reader.renew_held();
+        let Err(SourceError::Client { reason, .. }) = reader.stop_reading() else {
+            panic!("a fatal renewal did not fail the stop");
+        };
+        assert!(reason.contains("renewing a held unit"), "{reason}");
+    }
+
+    /// Pins that a held unit answered `Gone` on renewal logs one warning
+    /// naming its receipt.
+    #[test]
+    fn a_unit_answered_gone_is_logged_once() {
+        let (mut reader, script, _rt) = reader();
+        start(&mut reader);
+        let (_, receipt, _) = hold_one(&mut reader, &script);
+        script.redeliver(receipt);
+
+        let logs = spate_test::capture_logs(tracing::Level::WARN, || {
+            reader.renew_held();
+            poll(&mut reader);
+            poll(&mut reader);
+        });
+        let named: Vec<_> = logs
+            .iter()
+            .filter(|l| l.contains(&receipt.to_string()))
+            .collect();
+        assert_eq!(named.len(), 1, "{logs:?}");
+    }
+
     /// A unit whose body is a descriptor naming one object, `object-{i}`.
     fn descriptor_unit(i: usize) -> Unit {
         let object = DescriptorObject {
@@ -1580,9 +1736,9 @@ mod tests {
         reader.lanes[&partition].delivery
     }
 
-    /// Pins the cap on units held: the reader holds at most 96 units,
-    /// leaves the rest queued, and receives only into the room a settled
-    /// unit frees.
+    /// Pins the cap on units held when no section value or thread count is
+    /// given: the reader holds at most 96 units, leaves the rest queued, and
+    /// receives only into the room a settled unit frees.
     #[test]
     fn the_reader_holds_at_most_96_units() {
         let (mut reader, script, _rt) = reader();
@@ -2211,13 +2367,13 @@ mod tests {
 
     // ------------------------------------------------------------ stop --
 
-    /// A poison report for the lane on `partition`.
-    fn report_poison(reader: &UnitReader, partition: PartitionId) {
+    /// A poison report of `kind` for the lane on `partition`.
+    fn report_poison(reader: &UnitReader, partition: PartitionId, kind: PoisonKind) {
         reader
             .poison_tx
             .send(PoisonReport {
                 partition,
-                kind: PoisonKind::NotFound,
+                kind,
                 reason: "gone".into(),
                 overwrite: None,
             })
@@ -2482,6 +2638,117 @@ mod tests {
         assert_eq!(run(false), 0.0, "each retired lane takes its count back");
     }
 
+    /// Pins that a unit read in two ranges counts one object failure per
+    /// range that reports one, and is failed back to the feed once.
+    #[test]
+    fn a_poisoned_range_counts_once_per_report() {
+        let pipeline = unique_name("reader");
+        let rendered = render_local(|| {
+            let metrics =
+                S3Metrics::new(&Meter::with_namespace("s3", pipeline.clone(), "src", "s3"));
+            let (feed, script) = scripted_feed();
+            let (mut reader, _rt) = reader_over(Arc::new(feed), Some(2), Some(metrics));
+            script.deliver(ranged_unit("a", 2));
+            start(&mut reader);
+            let lanes = partitions(&lanes_added(poll(&mut reader)));
+            assert_eq!(lanes.len(), 2);
+            for p in &lanes {
+                report_poison(&reader, *p, PoisonKind::NotFound);
+            }
+            poll(&mut reader);
+            assert_eq!(script.failed().len(), 1);
+        });
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "spate_s3_objects_failed_total",
+                &[("pipeline", &pipeline), ("reason", "not_found")],
+            ),
+            Some(2.0),
+            "{rendered}"
+        );
+    }
+
+    /// Pins that each poison kind counts under its own `reason` label. Each
+    /// kind sends a different number of reports, so two kinds that swap
+    /// handles or labels move a count to the wrong series.
+    #[test]
+    fn each_poison_kind_counts_under_its_own_reason() {
+        let kinds = [
+            (PoisonKind::NotFound, "not_found", 1),
+            (PoisonKind::EtagDrift, "etag_drift", 2),
+            (PoisonKind::Undecodable, "undecodable", 3),
+            (PoisonKind::RetriesExhausted, "retries_exhausted", 4),
+        ];
+        let pipeline = unique_name("reader");
+        let rendered = render_local(|| {
+            let metrics =
+                S3Metrics::new(&Meter::with_namespace("s3", pipeline.clone(), "src", "s3"));
+            let (feed, script) = scripted_feed();
+            let (mut reader, _rt) = reader_over(Arc::new(feed), Some(1), Some(metrics));
+            script.deliver(ranged_unit("a", 1));
+            start(&mut reader);
+            let lanes = partitions(&lanes_added(poll(&mut reader)));
+            assert_eq!(lanes.len(), 1);
+            for (kind, _, n) in kinds {
+                for _ in 0..n {
+                    report_poison(&reader, lanes[0], kind);
+                }
+            }
+            poll(&mut reader);
+            assert_eq!(script.failed().len(), 1);
+        });
+        for (_, reason, n) in kinds {
+            assert_eq!(
+                metric_value(
+                    &rendered,
+                    "spate_s3_objects_failed_total",
+                    &[("pipeline", &pipeline), ("reason", reason)],
+                ),
+                Some(f64::from(n)),
+                "{reason}: {rendered}"
+            );
+        }
+    }
+
+    /// Pins that a notification naming a key that cannot be read under its
+    /// own name fails its message at decode and counts no object failure
+    /// under any reason.
+    #[test]
+    fn an_unaddressable_notification_key_fails_uncounted() {
+        let pipeline = unique_name("reader");
+        let rendered = render_local(|| {
+            let metrics =
+                S3Metrics::new(&Meter::with_namespace("s3", pipeline.clone(), "src", "s3"));
+            let (feed, script) = scripted_feed();
+            let (mut reader, _rt) = reader_over(Arc::new(feed), None, Some(metrics));
+            let receipt = script.deliver(Unit::new(
+                "unaddressable",
+                pinned_notification(&[("/x.ndjson", 10)], 0),
+            ));
+            start(&mut reader);
+            poll(&mut reader);
+            assert_eq!(script.failed().len(), 1);
+            assert_eq!(script.failed()[0].0, receipt);
+        });
+        for reason in [
+            "not_found",
+            "etag_drift",
+            "undecodable",
+            "retries_exhausted",
+        ] {
+            assert_eq!(
+                metric_value(
+                    &rendered,
+                    "spate_s3_objects_failed_total",
+                    &[("pipeline", &pipeline), ("reason", reason)],
+                ),
+                Some(0.0),
+                "{reason}: {rendered}"
+            );
+        }
+    }
+
     /// Pins that a hand-back takes its lanes' counts out of
     /// `objects_remaining` at once, and a kept unit's at its commit.
     #[test]
@@ -2509,6 +2776,74 @@ mod tests {
         };
         assert_eq!(run(false), 1.0, "the kept unit's lane");
         assert_eq!(run(true), 0.0);
+    }
+
+    /// A unit whose descriptor names `members` objects, `object-0` onwards.
+    fn multi_member_unit(members: usize) -> Unit {
+        let objects = (0..members)
+            .map(|i| DescriptorObject {
+                key: format!("object-{i}"),
+                size: 1,
+                etag: None,
+                last_modified_ms: 1,
+            })
+            .collect();
+        let body = SplitDescriptor::new(objects).encode().unwrap();
+        Unit::new("multi", body)
+    }
+
+    /// Pins that a descriptor of two objects opens one lane over both, in
+    /// order, and is acknowledged once when that lane's terminal watermark
+    /// is committed.
+    #[test]
+    fn a_two_member_unit_is_read_in_one_lane() {
+        let (mut reader, script, _rt) = reader();
+        let receipt = script.deliver(multi_member_unit(2));
+        start(&mut reader);
+        let lanes = partitions(&lanes_added(poll(&mut reader)));
+        assert_eq!(lanes.len(), 1);
+        assert!(script.failed().is_empty(), "{:?}", script.failed());
+        reader.lanes[&lanes[0]].tracker.set_terminal(5);
+        reader.commit(&[(lanes[0], 5)]).unwrap();
+        reader.settle().unwrap();
+        assert_eq!(script.acknowledged(), vec![receipt]);
+    }
+
+    /// Pins that `objects_remaining` counts every object of a lane's unit
+    /// when the lane opens, and that a hand-back takes back all but the
+    /// objects the lane finished, whose counts the lane takes back itself.
+    #[test]
+    fn objects_remaining_counts_every_member_of_a_lane() {
+        // `done` objects framed, then a hand-back when `stop` is set.
+        let run = |done: usize, stop: bool| {
+            let pipeline = unique_name("reader");
+            let rendered = render_local(|| {
+                let metrics =
+                    S3Metrics::new(&Meter::with_namespace("s3", pipeline.clone(), "src", "s3"));
+                let gauge = metrics.objects_remaining.clone();
+                let (feed, script) = scripted_feed();
+                script.hand_back_on_stop();
+                let (mut reader, _rt) = reader_over(Arc::new(feed), Some(2), Some(metrics));
+                script.deliver(multi_member_unit(3));
+                start(&mut reader);
+                let lanes = partitions(&lanes_added(poll(&mut reader)));
+                for _ in 0..done {
+                    // As the lane does for each object it frames.
+                    if reader.lanes[&lanes[0]].tracker.object_done() {
+                        gauge.decrement(1.0);
+                    }
+                }
+                if stop {
+                    reader.stop_reading().unwrap();
+                    assert_eq!(script.handed_back().len(), 1);
+                }
+            });
+            objects_remaining(&rendered, &pipeline)
+        };
+        assert_eq!(run(0, false), 3.0, "opened");
+        assert_eq!(run(1, false), 2.0, "one object framed");
+        assert_eq!(run(0, true), 0.0, "handed back unread");
+        assert_eq!(run(1, true), 0.0, "handed back after one object");
     }
 
     /// Pins how `stop_reading` settles each state a held unit can be in:
@@ -2558,7 +2893,7 @@ mod tests {
         let r = script.deliver(descriptor_unit(0));
         start(&mut reader);
         let lanes = partitions(&lanes_added(poll(&mut reader)));
-        report_poison(&reader, lanes[0]);
+        report_poison(&reader, lanes[0], PoisonKind::NotFound);
         reader.stop_reading().unwrap();
         assert_eq!(script.failed().len(), 1);
         assert_eq!(script.failed()[0].0, r);
@@ -2573,7 +2908,7 @@ mod tests {
         start(&mut reader);
         let lanes = partitions(&lanes_added(poll(&mut reader)));
         *feed.fail.lock().unwrap() = Some(FeedErrorKind::Retryable);
-        report_poison(&reader, lanes[0]);
+        report_poison(&reader, lanes[0], PoisonKind::NotFound);
         reader.stop_reading().unwrap();
         assert!(script.handed_back().is_empty());
         assert!(reader.lanes.is_empty(), "its lane is still held");
@@ -2749,7 +3084,7 @@ mod tests {
         start(&mut reader);
         let lanes = partitions(&lanes_added(poll(&mut reader)));
         reader.lanes[&lanes[0]].tracker.set_terminal(5);
-        report_poison(&reader, lanes[1]);
+        report_poison(&reader, lanes[1], PoisonKind::NotFound);
         let logs = spate_test::capture_logs(tracing::Level::INFO, || {
             reader.stop_reading().unwrap();
         });

@@ -103,7 +103,8 @@ Container-backed tests use testcontainers and are `#[ignore]`d, so a normal run
 skips them. `cargo xtask integration-test` is what selects them.
 
 A suite that boots a real server runs it at a pinned version, one lane per
-release line the vendor still supports, selected by a `SPATE_<SERVICE>_LANE`
+release line the vendor still supports, or per store for the S3 source,
+selected by a `SPATE_<SERVICE>_LANE`
 variable and pinned by tag and digest under `ci/<service>/`. CI runs the primary
 lane for the whole tier and gives every other lane a job of its own.
 [`ci/`](ci/README.md) is the account, and the services it covers are listed
@@ -189,6 +190,11 @@ A test that branches on `cfg!(feature = …)` runs its feature-on arm under
 `cargo xtask test`, which passes `--all-features`, and its feature-off arm under
 `cargo xtask hack`, which runs the suite on default features. The feature-off
 arm of a default feature, or of one a dev-dependency enables, runs in neither.
+
+A test's doc says what the test pins. Add `Regression for #N.` when issue #N
+reports a defect in the code the test exercises and the test fails without its
+fix. A change that fixes the test itself, such as a flaky setup, adds no such
+line.
 
 ## Fuzzing
 

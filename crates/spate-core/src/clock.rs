@@ -1,26 +1,35 @@
 //! Injectable time, so a test controls the clock that time-dependent code
 //! reads.
 //!
-//! [`Clock`] reads [`std::time::Instant`] for synchronous code. Code whose
-//! deadlines run on the tokio timer uses [`tokio`].
+//! Code whose behaviour depends on time reads it from an injected clock:
+//! [`Clock`] on OS threads, and [`tokio::Clock`] on the tokio runtime, whose
+//! deadlines run on the tokio timer. A read that must stay on the real clock
+//! names [`SystemClock`] at the site and says why. A duration that is only
+//! measured goes through the `Stopwatch` of the clock module the code reads,
+//! [`Stopwatch`] or [`tokio::Stopwatch`], and a wall-clock timestamp through
+//! [`wall_now`].
 
 pub mod tokio;
 
-use std::time::Instant;
 #[cfg(any(test, feature = "testing"))]
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant, SystemTime};
 
 /// A monotonic time source.
 pub trait Clock {
     /// Current monotonic instant.
     fn now(&self) -> Instant;
 }
+
+/// A clock shared by the types that hold one.
+///
+/// `RefUnwindSafe`, so a public type holding it stays `UnwindSafe` and
+/// `RefUnwindSafe`.
+#[cfg(not(loom))]
+pub(crate) type SharedClock = std::sync::Arc<dyn Clock + Send + Sync + std::panic::RefUnwindSafe>;
 
 /// The production clock, over [`Instant::now`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -31,6 +40,43 @@ impl Clock for SystemClock {
     fn now(&self) -> Instant {
         Instant::now()
     }
+}
+
+/// Measures how far a [`Clock`] moves between two reads.
+///
+/// It exposes no [`Instant`], so a measurement cannot feed a deadline. Pass
+/// the same clock to [`start`](Self::start) and [`elapsed`](Self::elapsed).
+#[derive(Clone, Copy, Debug)]
+pub struct Stopwatch {
+    started: Instant,
+}
+
+impl Stopwatch {
+    /// Starts measuring at `clock`'s current instant.
+    #[inline]
+    #[must_use]
+    pub fn start<C: Clock + ?Sized>(clock: &C) -> Self {
+        Self {
+            started: clock.now(),
+        }
+    }
+
+    /// Time `clock` has moved since [`start`](Self::start), zero if it reads
+    /// earlier.
+    #[inline]
+    #[must_use]
+    pub fn elapsed<C: Clock + ?Sized>(&self, clock: &C) -> Duration {
+        clock.now().saturating_duration_since(self.started)
+    }
+}
+
+/// The system's wall-clock time.
+///
+/// For timestamps and identifiers only: wall-clock time can step backwards,
+/// so it never feeds a deadline.
+#[must_use]
+pub fn wall_now() -> SystemTime {
+    SystemTime::now()
 }
 
 /// A clock that only moves when a test moves it.
@@ -109,6 +155,15 @@ mod tests {
             [10, 20, 25].map(Duration::from_millis),
             "one reading per step, the last one short"
         );
+    }
+
+    /// A stopwatch reports exactly how far its clock moved.
+    #[test]
+    fn a_stopwatch_reports_the_time_its_clock_moved() {
+        let clock = TestClock::frozen();
+        let watch = Stopwatch::start(&*clock);
+        clock.advance(Duration::from_millis(250));
+        assert_eq!(watch.elapsed(&*clock), Duration::from_millis(250));
     }
 
     #[test]

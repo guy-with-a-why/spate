@@ -1,6 +1,8 @@
 //! Work units of the feed path and their parts: a unit a lister publishes
-//! names one object, or one byte range of one object, and a storage
+//! names one object, one byte range of one object, or up to
+//! [`PACK_MEMBERS`] small objects read whole on one lane, and a storage
 //! notification is one unit with one part per non-empty created object.
+//! [`Packer`] packs a listing's small objects into shared units.
 //!
 //! [`parts_of`] decides whether an object is read whole or cut, by the rule
 //! the lister applies to a listing ([`Packing::delimiter_for`] and
@@ -15,8 +17,8 @@ use crate::fetch::{ObjectEntry, Overwrite};
 use crate::framer::Codec;
 use crate::listing::addressable;
 use crate::split::{
-    DescriptorObject, Packing, SplitDescriptor, SplitError, SplitRange, split_id_for,
-    split_id_for_range, tile,
+    DescriptorObject, MAX_UNIT_MEMBERS, PACK_ETAG_MAX_BYTES, PACK_KEY_MAX_BYTES, PACK_MEMBERS,
+    Packing, SplitDescriptor, SplitError, SplitRange, split_id_for, split_id_for_range, tile,
 };
 use object_store::path::Path;
 use serde::Deserialize;
@@ -41,9 +43,9 @@ pub(crate) enum Origin {
     },
 }
 
-/// One part of a unit: the object, whole or in one byte range.
+/// One part of a unit: its objects read whole, or one byte range of one object.
 pub(crate) struct Part {
-    /// The one object the part reads, shared by every part of the object.
+    /// The objects the part reads, shared by every part of the unit.
     pub(crate) object: Arc<Vec<ObjectEntry>>,
     /// The byte range read, or `None` for the whole object.
     pub(crate) range: Option<SplitRange>,
@@ -51,10 +53,10 @@ pub(crate) struct Part {
     pub(crate) origin: Origin,
 }
 
-/// The parts of one object, yielded lazily so an object cut into many
+/// The parts of a unit's objects, yielded lazily so an object cut into many
 /// ranges holds one range at a time.
 pub(crate) struct Cursor {
-    /// The one object every part clones.
+    /// The objects every part clones.
     pub(crate) object: Arc<Vec<ObjectEntry>>,
     /// The ranges still to yield, or `None` when the object is read whole.
     ranges: Option<Peekable<Box<dyn Iterator<Item = SplitRange> + Send>>>,
@@ -93,7 +95,8 @@ impl Cursor {
         }
     }
 
-    /// The key of the one object the cursor reads.
+    /// The key of the cursor's first object, its only one unless a
+    /// descriptor names several.
     pub(crate) fn key(&self) -> &str {
         &self.object[0].key
     }
@@ -128,7 +131,8 @@ impl Iterator for Cursor {
     }
 }
 
-/// The parts of the one object in `object`: the ranges [`tile`] cuts when
+/// The parts of the one object in `object`, a notification's object or a
+/// one-member descriptor's: the ranges [`tile`] cuts when
 /// [`Packing::delimiter_for`] accepts the object and its key is
 /// [`addressable`], and the whole object otherwise. Every part carries
 /// `origin`.
@@ -190,6 +194,152 @@ pub(crate) fn units(
     })
 }
 
+/// A unit the lister publishes, with the first object it names and how many
+/// it names.
+#[derive(Debug)]
+pub(crate) struct Minted {
+    pub(crate) unit: Unit,
+    pub(crate) first_key: String,
+    pub(crate) objects: usize,
+    /// The objects this unit is the first to name: its members, or one for
+    /// an object's first range and none for its later ones.
+    pub(crate) listed: usize,
+}
+
+/// Packs listed objects read whole into shared units, in listing order, with
+/// one unit open at a time.
+///
+/// An object shares a unit when it is read whole, its key is
+/// [`addressable`] and at most [`PACK_KEY_MAX_BYTES`], and its ETag is absent
+/// or can be sent in `If-Match`. The open unit closes before an object whose
+/// bytes would take it past the split target, and once it holds
+/// [`PACK_MEMBERS`] objects. Any other object closes the open unit and is
+/// minted by [`units`] alone. Which objects share a unit depends only on the
+/// sequence of keys, sizes and ETags pushed, so the same listing packs the
+/// same way.
+pub(crate) struct Packer {
+    packing: Packing,
+    open: Vec<ObjectEntry>,
+    open_bytes: u64,
+}
+
+impl Packer {
+    pub(crate) fn new(packing: Packing) -> Packer {
+        Packer {
+            packing,
+            open: Vec::new(),
+            open_bytes: 0,
+        }
+    }
+
+    /// Add `entry` and return the units it closes or mints, in listing
+    /// order. A cut object's ranges are minted as the iterator is drawn.
+    ///
+    /// # Errors
+    ///
+    /// An item is an error when a descriptor or an id cannot be built, which
+    /// no listed object causes.
+    pub(crate) fn push(
+        &mut self,
+        entry: ObjectEntry,
+    ) -> impl Iterator<Item = Result<Minted, SplitError>> + use<> {
+        let shared = self.shares(&entry);
+        let before =
+            if !shared || self.open_bytes.saturating_add(entry.size) > self.packing.target_bytes {
+                self.close()
+            } else {
+                None
+            };
+        let (alone, after) = if shared {
+            self.open_bytes = self.open_bytes.saturating_add(entry.size);
+            self.open.push(entry);
+            let full = if self.open.len() == PACK_MEMBERS {
+                self.close()
+            } else {
+                None
+            };
+            (None, full)
+        } else {
+            (Some(entry), None)
+        };
+        let packing = self.packing;
+        before.into_iter().chain(after).chain(
+            alone
+                .into_iter()
+                .flat_map(move |entry| alone_units(entry, packing)),
+        )
+    }
+
+    /// Mint the open unit, or `None` when no object is waiting in it.
+    ///
+    /// # Errors
+    ///
+    /// An error when a descriptor or an id cannot be built, which no listed
+    /// object causes.
+    pub(crate) fn close(&mut self) -> Option<Result<Minted, SplitError>> {
+        if self.open.is_empty() {
+            return None;
+        }
+        let mut members = std::mem::take(&mut self.open);
+        self.open_bytes = 0;
+        if members.len() == 1 {
+            // Minted as `units` mints it, so its id and body are an unpacked
+            // object's.
+            let entry = members.pop().expect("one member");
+            return alone_units(entry, self.packing).next();
+        }
+        Some(packed_unit(&members))
+    }
+
+    fn shares(&self, entry: &ObjectEntry) -> bool {
+        self.packing.delimiter_for(entry).is_none()
+            && addressable(&entry.key)
+            && entry.key.len() <= PACK_KEY_MAX_BYTES
+            && entry
+                .etag
+                .as_deref()
+                .is_none_or(|etag| etag.len() <= PACK_ETAG_MAX_BYTES && sendable(etag))
+    }
+}
+
+/// [`units`] over one object, each with that object as its first.
+pub(crate) fn alone_units(
+    entry: ObjectEntry,
+    packing: Packing,
+) -> impl Iterator<Item = Result<Minted, SplitError>> {
+    let first_key = entry.key.clone();
+    units(entry, packing).enumerate().map(move |(i, unit)| {
+        unit.map(|unit| Minted {
+            unit,
+            first_key: first_key.clone(),
+            objects: 1,
+            listed: usize::from(i == 0),
+        })
+    })
+}
+
+/// One unit naming `members` whole, in order.
+fn packed_unit(members: &[ObjectEntry]) -> Result<Minted, SplitError> {
+    let id = split_id_for(members.iter().map(|e| (e.key.as_str(), e.etag.as_deref())))?;
+    let descriptor = SplitDescriptor::new(
+        members
+            .iter()
+            .map(|e| DescriptorObject {
+                key: e.key.clone(),
+                size: e.size,
+                etag: e.etag.clone(),
+                last_modified_ms: e.last_modified_ms,
+            })
+            .collect(),
+    );
+    Ok(Minted {
+        unit: Unit::new(id, descriptor.encode()?),
+        first_key: members[0].key.clone(),
+        objects: members.len(),
+        listed: members.len(),
+    })
+}
+
 /// Where a notification's records must point for the source to read them.
 #[derive(Clone, Debug)]
 pub(crate) struct Scope {
@@ -221,11 +371,14 @@ pub(crate) enum Decoded {
 /// not deserialise, or one for another bucket, for a key outside `scope`'s
 /// prefix, with no size, or with a key that does not decode fails the whole
 /// message, as does any other body. A created object of size 0 is then
-/// dropped. Every other record becomes one part, its key form-decoded (`+` is
-/// a space, then percent-decoding as UTF-8) and its ETag quoted, unless
-/// [`addressable`] refuses its key or its ETag cannot be an `If-Match` value,
-/// either of which fails the whole message. A message with no part left is
-/// acknowledged.
+/// dropped. Every other record becomes one part with its ETag quoted. Its key
+/// is read as written when the record's `eventSource` is exactly `ceph:s3`,
+/// and is otherwise form-decoded (`+` is a space, then percent-decoding as
+/// UTF-8), so only a form-decoded key can fail to decode. An absent or JSON
+/// null `eventSource` is form-decoded. A record whose `eventSource` is any
+/// other value that is not a string fails the whole message, and so does one
+/// whose key [`addressable`] refuses or whose ETag cannot be an `If-Match`
+/// value. A message with no part left is acknowledged.
 ///
 /// A record names a version when its `versionId` is a string other than `""`
 /// and `"null"`, and the part reads that version; absent, JSON null, `""` and
@@ -273,12 +426,18 @@ pub(crate) fn decode(body: &[u8], scope: &Scope, packing: Packing) -> Decoded {
 /// The longest `versionId` a notification record may carry.
 pub(crate) const MAX_VERSION_BYTES: usize = 1024;
 
+/// The `eventSource` of a record Ceph RGW writes, whose key is the object's
+/// name unencoded.
+const CEPH_SOURCE: &str = "ceph:s3";
+
 /// The field of a re-enqueued unit's record that counts its re-enqueues.
 const RE_ENQUEUES: &str = "spateReEnqueues";
 
 /// The fields of a notification record the source reads.
 #[derive(Deserialize)]
 struct Record {
+    #[serde(rename = "eventSource", default)]
+    event_source: Option<String>,
     #[serde(rename = "eventTime", default)]
     event_time: Option<String>,
     #[serde(rename = "spateReEnqueues", default)]
@@ -333,7 +492,13 @@ fn record_part(
             "the record names the bucket \"{bucket}\", which this source does not read"
         ));
     }
-    let key = form_decoded(&record.s3.object.key)?;
+    // A re-enqueued unit's record carries no `eventSource`, so the key
+    // `re_enqueue_body` form-encoded is decoded whatever store announced it.
+    let key = if record.event_source.as_deref() == Some(CEPH_SOURCE) {
+        record.s3.object.key
+    } else {
+        form_decoded(&record.s3.object.key)?
+    };
     let prefix = scope.prefix.as_ref();
     if !prefix.is_empty()
         && !key
@@ -408,8 +573,9 @@ fn record_part(
 /// key was overwritten while it was read: one `ObjectCreated:Put` record at
 /// the content `overwrite` names, counting `re_enqueues`.
 ///
-/// [`decode`] reads it as a notification: its key form-encoded, its ETag
-/// quoted when the store gave one, and no `versionId`. The body is ASCII
+/// [`decode`] reads it as a notification: its key form-encoded under no
+/// `eventSource`, its ETag quoted when the store gave one, and no
+/// `versionId`. The body is ASCII
 /// when the ETag is, as one read from a header always is.
 pub(crate) fn re_enqueue_body(bucket: &str, overwrite: &Overwrite, re_enqueues: u32) -> Vec<u8> {
     let mut object = serde_json::json!({
@@ -497,30 +663,40 @@ fn form_decoded(key: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| format!("the key \"{key}\" does not decode as UTF-8"))
 }
 
-/// The parts of the one object a descriptor body names, or why the unit
-/// cannot be read.
+/// The parts of the objects a descriptor body names, or why the unit cannot
+/// be read.
 ///
-/// A ranged unit is refused when its delimiter is not the framer's or its
-/// object is compressed, the refusals of a unit that cannot be
-/// read as a range.
+/// One member is read as [`parts_of`] cuts it, or as the byte range the
+/// descriptor names. Two or more are one whole part, read member by member
+/// on one lane. A unit naming no member, more than [`MAX_UNIT_MEMBERS`], or a
+/// member whose ETag cannot be sent in `If-Match` is refused, and so is a
+/// ranged unit whose delimiter is not the framer's or whose object is
+/// compressed.
 fn descriptor_parts(body: &[u8], packing: Packing) -> Result<Cursor, String> {
     let descriptor = SplitDescriptor::decode(body)
         .map_err(|e| format!("the unit's body is not a descriptor: {}", e.reason))?;
-    let object = match <[ObjectEntry; 1]>::try_from(descriptor.to_entries()) {
-        Ok([object]) => object,
-        Err(entries) => {
-            return Err(format!(
-                "the unit names {} objects; this source reads one object per unit",
-                entries.len()
-            ));
-        }
-    };
-    if object.etag.as_deref().is_some_and(|etag| !sendable(etag)) {
+    let entries = descriptor.to_entries();
+    if entries.is_empty() || entries.len() > MAX_UNIT_MEMBERS {
+        return Err(format!(
+            "the unit names {} objects; this source reads 1 to {MAX_UNIT_MEMBERS} per unit",
+            entries.len()
+        ));
+    }
+    if let Some(object) = entries
+        .iter()
+        .find(|e| e.etag.as_deref().is_some_and(|etag| !sendable(etag)))
+    {
         return Err(format!(
             "the unit's ETag for \"{}\" cannot be sent in `If-Match`",
             object.key
         ));
     }
+    let object = match <[ObjectEntry; 1]>::try_from(entries) {
+        Ok([object]) => object,
+        // `SplitDescriptor::decode` refuses a range on more than one member,
+        // so these are read whole.
+        Err(entries) => return Ok(Cursor::whole(Arc::new(entries), Origin::Lister)),
+    };
     let Some(range) = descriptor.range else {
         return Ok(parts_of(Arc::new(vec![object]), packing, Origin::Lister));
     };
@@ -785,6 +961,130 @@ mod tests {
         assert!(reason.contains("does not decode as UTF-8"), "{reason}");
     }
 
+    /// `record` with its `eventSource` set to `source`, or removed for
+    /// `None`.
+    fn from_source(mut record: serde_json::Value, source: Option<&str>) -> serde_json::Value {
+        match source {
+            Some(source) => record["eventSource"] = source.into(),
+            None => {
+                record
+                    .as_object_mut()
+                    .expect("a record is an object")
+                    .remove("eventSource");
+            }
+        }
+        record
+    }
+
+    /// A created record for `key` in the source's bucket, as Ceph RGW writes
+    /// it.
+    fn ceph(key: &str, size: u64) -> serde_json::Value {
+        from_source(created(key, size), Some("ceph:s3"))
+    }
+
+    /// Pins that a record whose `eventSource` is exactly `ceph:s3` is read at
+    /// its key as written, that any other source, none or JSON null
+    /// form-decodes, and that any other `eventSource` that is not a string
+    /// fails the message.
+    #[test]
+    fn a_ceph_notification_key_is_read_as_written() {
+        for key in [
+            "data/a+b c%25.ndjson",
+            "data/a%2Fb.ndjson",
+            "data/a%41.ndjson",
+            "data/a%zz.ndjson",
+            "data/c%",
+            "data/é x.ndjson",
+        ] {
+            assert_eq!(keys(decoded(&[ceph(key, 10)])), [key], "{key}");
+        }
+        for source in [
+            Some("aws:s3"),
+            Some("rustfs:s3"),
+            None,
+            Some("Ceph:s3"),
+            Some("ceph:s3 "),
+            Some("ceph"),
+        ] {
+            let record = |key| from_source(created(key, 10), source);
+            assert_eq!(
+                keys(decoded(&[record("data/a+b c%25.ndjson")])),
+                ["data/a b c%.ndjson"],
+                "{source:?}"
+            );
+            assert_eq!(
+                keys(decoded(&[record("data/a%41.ndjson")])),
+                ["data/aA.ndjson"],
+                "{source:?}"
+            );
+            let reason = failed(decoded(&[record("data/a%zz.ndjson")]));
+            assert!(
+                reason.contains("malformed `%` escape"),
+                "{source:?}: {reason}"
+            );
+        }
+        let mut null = created("data/a+b.ndjson", 10);
+        null["eventSource"] = serde_json::Value::Null;
+        assert_eq!(keys(decoded(&[null])), ["data/a b.ndjson"]);
+        let mut numbered = created("data/a.ndjson", 10);
+        numbered["eventSource"] = 1.into();
+        let reason = failed(decoded(&[numbered]));
+        assert!(reason.contains("the record is unreadable"), "{reason}");
+    }
+
+    /// Pins that a key read as written meets the prefix, size and path
+    /// checks that follow decoding, and that each record of one message
+    /// takes the rule its own `eventSource` names.
+    #[test]
+    fn a_ceph_key_meets_the_checks_that_follow_decoding() {
+        let reason = failed(decoded(&[ceph("data%2Fx.ndjson", 10)]));
+        assert!(
+            reason.contains("outside the source's prefix \"data/\""),
+            "{reason}"
+        );
+        for key in ["data//a.ndjson", "data/../x"] {
+            let reason = failed(decoded(&[ceph(key, 10)]));
+            assert!(
+                reason.contains("cannot be read under its own name"),
+                "{key}: {reason}"
+            );
+        }
+        let body = message(&[ceph("a/%2Fb.ndjson", 10)]);
+        assert_eq!(
+            keys(decode(&body, &whole_bucket(), packing())),
+            ["a/%2Fb.ndjson"]
+        );
+        acknowledged(decoded(&[ceph("data/a%zz", 0)]));
+        assert_eq!(
+            keys(decoded(&[
+                ceph("data/a+b.ndjson", 10),
+                created("data/a+b.ndjson", 10)
+            ])),
+            ["data/a+b.ndjson", "data/a b.ndjson"]
+        );
+    }
+
+    /// Pins that a unit re-enqueued for an object Ceph RGW announced decodes
+    /// to the key RGW wrote, though its body names no `eventSource`.
+    #[test]
+    fn a_re_enqueued_ceph_unit_reads_the_key_rgw_announced() {
+        let key = "data/a+b%2Fc d%25.ndjson";
+        let Decoded::Read(cursors) = decoded(&[ceph(key, 10)]) else {
+            panic!("not read");
+        };
+        let parts: Vec<Part> = cursors.into_iter().flatten().collect();
+        let entry = &parts[0].object[0];
+        assert_eq!(entry.key, key);
+        let overwrite = Overwrite {
+            key: entry.key.clone(),
+            etag: entry.etag.clone(),
+            size: entry.size,
+            last_modified_ms: entry.last_modified_ms,
+        };
+        let body = re_enqueue_body("bucket", &overwrite, 1);
+        assert_eq!(keys(decode(&body, &scope(), packing())), [key]);
+    }
+
     /// Pins that a created record is read whether or not its `eventName`
     /// carries the `s3:` prefix, and that the envelope RustFS sends is read
     /// as the bare `Records[]` message is.
@@ -1034,6 +1334,79 @@ mod tests {
         assert_eq!(keys(decode(&body, &scope(), packing())), ["data/a.ndjson"]);
     }
 
+    fn member(key: &str, size: u64, etag: &str) -> DescriptorObject {
+        DescriptorObject {
+            key: key.into(),
+            size,
+            etag: Some(etag.to_owned()),
+            last_modified_ms: 1,
+        }
+    }
+
+    /// Pins that a descriptor of two members is one whole part naming both
+    /// in order, with no member cut, though the first qualifies for cutting.
+    #[test]
+    fn a_multi_member_descriptor_is_one_whole_part() {
+        let body = SplitDescriptor::new(vec![
+            member("data/big.ndjson", 3 * packing().target_bytes, "\"a\""),
+            member("data/small.ndjson", 10, "\"b\""),
+        ])
+        .encode()
+        .unwrap();
+        let Decoded::Read(cursors) = decode(&body, &scope(), packing()) else {
+            panic!("the unit is read");
+        };
+        let parts: Vec<Part> = cursors.into_iter().flatten().collect();
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].range.is_none());
+        let keys: Vec<&str> = parts[0].object.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["data/big.ndjson", "data/small.ndjson"]);
+    }
+
+    /// Pins that every member's ETag is checked for `If-Match`, and the
+    /// refusal names the member that fails it.
+    #[test]
+    fn a_descriptor_with_an_unsendable_second_etag_fails() {
+        let body = SplitDescriptor::new(vec![
+            member("data/a.ndjson", 10, "\"abc\""),
+            member("data/b.ndjson", 10, "\"abc\u{1}\""),
+        ])
+        .encode()
+        .unwrap();
+        let reason = failed(decode(&body, &scope(), packing()));
+        assert!(
+            reason.contains("\"data/b.ndjson\" cannot be sent in `If-Match`"),
+            "{reason}"
+        );
+    }
+
+    /// Pins that a descriptor naming no member, or more than
+    /// `MAX_UNIT_MEMBERS`, fails, and that one at the bound is read.
+    #[test]
+    fn a_descriptor_of_no_members_or_past_the_bound_fails() {
+        let body = |n: usize| {
+            SplitDescriptor::new(
+                (0..n)
+                    .map(|i| member(&format!("data/{i}.ndjson"), 10, "\"e\""))
+                    .collect(),
+            )
+            .encode()
+            .unwrap()
+        };
+        for n in [0, MAX_UNIT_MEMBERS + 1] {
+            let reason = failed(decode(&body(n), &scope(), packing()));
+            assert!(
+                reason.contains(&format!("names {n} objects")),
+                "{n}: {reason}"
+            );
+        }
+        assert_eq!(
+            keys(decode(&body(MAX_UNIT_MEMBERS), &scope(), packing())).len(),
+            1,
+            "one whole part"
+        );
+    }
+
     /// Pins that a created object of size 0 is dropped before its ETag is
     /// checked: an ETag `If-Match` cannot carry on an empty object leaves the
     /// message's other records to be read.
@@ -1271,6 +1644,267 @@ mod tests {
                     prop_assert_ne!(&a.id, &b.id, "the id ignores the ETag");
                 }
             }
+        }
+    }
+
+    /// Every unit `Packer` mints over `entries`, pushed in order and closed.
+    fn pack(entries: &[ObjectEntry], packing: Packing) -> Vec<Minted> {
+        let mut packer = Packer::new(packing);
+        let mut out: Vec<Minted> = Vec::new();
+        for entry in entries {
+            for minted in packer.push(entry.clone()) {
+                out.push(minted.unwrap());
+            }
+        }
+        out.extend(packer.close().map(Result::unwrap));
+        out
+    }
+
+    fn member_keys(minted: &[Minted]) -> Vec<Vec<String>> {
+        minted
+            .iter()
+            .map(|m| {
+                SplitDescriptor::decode(&m.unit.body)
+                    .unwrap()
+                    .objects
+                    .into_iter()
+                    .map(|o| o.key)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn entry_tagged(key: &str, etag: Option<&str>) -> ObjectEntry {
+        ObjectEntry {
+            key: key.into(),
+            size: 10,
+            etag: etag.map(str::to_owned),
+            last_modified_ms: 1,
+        }
+    }
+
+    /// Pins that an object whose ETag `If-Match` cannot carry is a unit of
+    /// its own between objects that would otherwise share one.
+    #[test]
+    fn an_object_whose_etag_cannot_be_sent_is_packed_alone() {
+        let entries = [
+            entry_tagged("a/x", Some("\"x\"")),
+            entry_tagged("a/bad", Some("\"a\u{1}b\"")),
+            entry_tagged("a/y", Some("\"y\"")),
+        ];
+        assert_eq!(
+            member_keys(&pack(&entries, packing())),
+            [["a/x"], ["a/bad"], ["a/y"]]
+        );
+    }
+
+    /// Pins that a small object with no ETag shares a unit with the objects
+    /// listed beside it.
+    #[test]
+    fn a_small_object_without_an_etag_shares_a_unit() {
+        let entries = [
+            entry_tagged("a/x", Some("\"x\"")),
+            entry_tagged("a/none", None),
+            entry_tagged("a/y", Some("\"y\"")),
+        ];
+        let minted = pack(&entries, packing());
+        assert_eq!(member_keys(&minted), [["a/x", "a/none", "a/y"]]);
+        assert_eq!(minted[0].first_key, "a/x");
+        assert_eq!(minted[0].objects, 3);
+    }
+
+    /// Pins that an object whose listed size takes the open unit past the
+    /// split target closes that unit, for any size the listing reports.
+    #[test]
+    fn a_listed_size_near_u64_max_closes_the_open_unit() {
+        let mut big = entry_tagged("a/big", Some("\"b\""));
+        big.size = u64::MAX - 5;
+        let minted = pack(&[entry_tagged("a/x", Some("\"x\"")), big], packing());
+        assert_eq!(member_keys(&minted), [["a/x"], ["a/big"]]);
+    }
+
+    /// Pins that sixteen members at the key and ETag caps, every byte one
+    /// JSON escapes to two, encode under the packed body bound.
+    #[test]
+    fn a_unit_at_every_packing_cap_stays_under_the_body_bound() {
+        let etag = format!("\"{}\"", "\"".repeat(crate::split::PACK_ETAG_MAX_BYTES - 2));
+        let entries: Vec<ObjectEntry> = (0..PACK_MEMBERS)
+            .map(|i| {
+                let key = format!("a/{i:02}{}", "\"".repeat(PACK_KEY_MAX_BYTES - 4));
+                entry_tagged(&key, Some(&etag))
+            })
+            .collect();
+        let minted = pack(
+            &entries,
+            Packing {
+                target_bytes: MIB,
+                ..packing()
+            },
+        );
+        assert_eq!(minted.len(), 1, "one unit of {PACK_MEMBERS}");
+        let body = minted[0].unit.body.len() + minted[0].unit.id.len();
+        assert!(
+            body <= crate::split::PACKED_BODY_MAX_BYTES,
+            "{body} bytes with the id"
+        );
+    }
+
+    /// Pins that an object whose ETag is longer than the packing cap is a
+    /// unit of its own, so a packed body stays under its bound whatever
+    /// ETags the listing reports.
+    #[test]
+    fn a_packed_body_stays_under_its_bound_with_long_etags() {
+        let long = format!("\"{}\"", "e".repeat(70_000));
+        let entries: Vec<ObjectEntry> = (0..PACK_MEMBERS)
+            .map(|i| entry_tagged(&format!("a/{i:02}"), Some(&long)))
+            .chain([
+                entry_tagged("a/x", Some("\"x\"")),
+                entry_tagged("a/y", Some("\"y\"")),
+            ])
+            .collect();
+        let minted = pack(&entries, packing());
+        for m in &minted {
+            if m.objects > 1 {
+                assert!(m.unit.body.len() <= crate::split::PACKED_BODY_MAX_BYTES);
+            }
+        }
+        let sizes: Vec<usize> = minted.iter().map(|m| m.objects).collect();
+        let mut want = vec![1; PACK_MEMBERS];
+        want.push(2);
+        assert_eq!(sizes, want);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Pins the packing rule against a restatement of it: every listed
+        /// object is in exactly one unit, whole or in ranges tiling it; a
+        /// unit of several objects holds only objects read whole with an
+        /// addressable key of at most 1,024 bytes and a sendable ETag,
+        /// consecutive in listing order, at most sixteen and at most the
+        /// target in bytes, under the id of its member set; and two runs
+        /// mint the same units.
+        #[test]
+        fn prop_packed_units_tile_the_listing(
+            objects in proptest::collection::vec(
+                (0u8..7, any::<u64>(), 0usize..6, 0u8..6, 0u8..3, any::<bool>()),
+                0..40,
+            ),
+            target in target(),
+            codec in 0u8..4,
+            delimiter in proptest::option::of(Just(b'\n')),
+        ) {
+            let compression = compression(codec);
+            let packing = Packing { target_bytes: target, compression, delimiter };
+            let listing: Vec<(ObjectEntry, bool)> = objects
+                .iter()
+                .enumerate()
+                .map(|(i, &(size_shape, random, ext, key_shape, etag, long))| {
+                    let (mut key, unaddressable) = key(i, key_shape, EXTENSIONS[ext]);
+                    // Only an addressable key, so the padding keeps its shape.
+                    if long && key_shape == 0 {
+                        key = format!("{}{key}", "x".repeat(1025 - key.len()));
+                    }
+                    let etag = match etag {
+                        0 => None,
+                        1 => Some(format!("\"etag-{i}\"")),
+                        _ => Some(format!("\"bad\u{1}{i}\"")),
+                    };
+                    let entry = ObjectEntry {
+                        key,
+                        size: size(target, size_shape, random),
+                        etag,
+                        last_modified_ms: 1,
+                    };
+                    (entry, unaddressable)
+                })
+                .collect();
+            let entries: Vec<ObjectEntry> = listing.iter().map(|(e, _)| e.clone()).collect();
+            let got = pack(&entries, packing);
+            let again = pack(&entries, packing);
+            let units: Vec<&Unit> = got.iter().map(|m| &m.unit).collect();
+            prop_assert_eq!(units, again.iter().map(|m| &m.unit).collect::<Vec<_>>());
+
+            // The rule, restated: which objects are cut, and which share.
+            let cut = |(e, unaddressable): &(ObjectEntry, bool)| {
+                delimiter.is_some()
+                    && e.size > target
+                    && e.size <= MAX_SUBDIVIDABLE_BYTES
+                    && e.etag.is_some()
+                    && plain(compression, &e.key)
+                    && !unaddressable
+            };
+            let shares = |item: &(ObjectEntry, bool)| {
+                let (e, unaddressable) = item;
+                !cut(item)
+                    && !unaddressable
+                    && e.key.len() <= 1024
+                    && !e.etag.as_deref().is_some_and(|t| t.contains('\u{1}') || t.len() > 256)
+            };
+            // The expected groups: (keys, whether the group is one cut object).
+            let mut want: Vec<(Vec<String>, bool)> = Vec::new();
+            let mut open: Vec<String> = Vec::new();
+            let mut open_bytes = 0u64;
+            for item in &listing {
+                let (e, _) = item;
+                if shares(item) {
+                    if !open.is_empty() && open_bytes + e.size > target {
+                        want.push((std::mem::take(&mut open), false));
+                        open_bytes = 0;
+                    }
+                    open.push(e.key.clone());
+                    open_bytes += e.size;
+                    if open.len() == 16 {
+                        want.push((std::mem::take(&mut open), false));
+                        open_bytes = 0;
+                    }
+                } else {
+                    if !open.is_empty() {
+                        want.push((std::mem::take(&mut open), false));
+                        open_bytes = 0;
+                    }
+                    want.push((vec![e.key.clone()], cut(item)));
+                }
+            }
+            if !open.is_empty() {
+                want.push((open, false));
+            }
+
+            let mut at = 0;
+            for (keys, is_cut) in &want {
+                if *is_cut {
+                    let entry = &entries.iter().find(|e| e.key == keys[0]).unwrap();
+                    let mut next = 0;
+                    while next < entry.size {
+                        let d = SplitDescriptor::decode(&got[at].unit.body).unwrap();
+                        let range = d.range.expect("a cut object yields ranges");
+                        prop_assert_eq!(&d.objects[0].key, &keys[0]);
+                        prop_assert_eq!(range.start, next);
+                        next = range.end;
+                        at += 1;
+                    }
+                    continue;
+                }
+                let minted = &got[at];
+                let d = SplitDescriptor::decode(&minted.unit.body).unwrap();
+                let got_keys: Vec<&String> = d.objects.iter().map(|o| &o.key).collect();
+                prop_assert_eq!(got_keys, keys.iter().collect::<Vec<_>>());
+                prop_assert_eq!(d.range, None);
+                prop_assert!(keys.len() <= PACK_MEMBERS);
+                if keys.len() > 1 {
+                    let bytes: u64 = d.objects.iter().map(|o| o.size).sum();
+                    prop_assert!(bytes <= target, "{} bytes over a {} target", bytes, target);
+                }
+                let id = split_id_for(
+                    d.objects.iter().map(|o| (o.key.as_str(), o.etag.as_deref())),
+                )
+                .unwrap();
+                prop_assert_eq!(&minted.unit.id, &id);
+                prop_assert_eq!(&minted.first_key, &keys[0]);
+                prop_assert_eq!(minted.objects, keys.len());
+                at += 1;
+            }
+            prop_assert_eq!(at, got.len(), "a unit the rule does not account for");
         }
     }
 

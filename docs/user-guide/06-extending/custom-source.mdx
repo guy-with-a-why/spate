@@ -52,7 +52,12 @@ What the framework holds you to:
 - **Idle lanes block, never spin.** `Ok(None)` means nothing arrived, but
   reach it by waiting up to `timeout` (a blocking queue read, a condvar,
   worst case a sleep). A zero-timeout poll loop busy-spins a pipeline
-  thread at 100% for nothing.
+  thread at 100% for nothing. A lane that reaches the end of its input can
+  say so through `finished`. Once a poll has returned the `Ok(None)` that
+  ends its input, the lane may report `finished`, and that poll need not
+  wait out `timeout`: the pipeline thread stops polling the lane, and a
+  thread whose lanes have all finished waits on its control channel. A lane
+  that never reports `finished` keeps the rule above.
 
 The batch type holds one poll's payloads and streams them out one at a time,
 all sharing the batch lifetime:
@@ -100,7 +105,8 @@ them wherever your source resumes from instead.
 certificate your TLS stack fails to verify, a fatal TLS alert from the server
 listed in `spate::error::TLS_REJECTION_ALERTS`, no protocol version, cipher
 suite or other handshake parameter in common, an authentication or
-authorization error from the server, and a 401 or 403 from the service. A
+authorization error from the server, and a 401 or 403 from the service
+unless its error code names throttling or a limit that clears by itself. A
 failure to obtain credentials or reach the server stays `Retryable`, and so
 do a connection reset, closed or timed out during the handshake and a
 malformed TLS message. Under TLS 1.3 a server refuses a client certificate
@@ -109,7 +115,7 @@ well as on the connect call. `spate::error::find_source` finds your TLS
 library's error behind the client's wrappers, including inside an `io::Error`.
 With a rustls client, `spate::tls_rejection!(rustls, &err)` applies the whole
 TLS part of the rule.
-[ADR-0047](../../adr/0047-a-rejected-credential-or-tls-handshake-is-fatal.md)
+[ADR-0081](../../adr/0081-a-rejected-credential-or-tls-handshake-is-fatal-unless-throttled.md)
 states the rule.
 
 ## Framing: turning bytes into records
@@ -242,7 +248,10 @@ The pipeline file names the feed in its
 `configure_feed`. The runtime calls it before `open`, with the section, the feed
 it names, and the feed's `FeedOrigin`: `Section` when the runtime built the
 feed, `Given` when code passed it to `Pipeline::feed` and may still publish into
-it. Keep the feed, and read the section's common keys, such as `units_held`. The
+it. Keep the feed, and read the section's common keys, such as `units_held`.
+`SourceCtx::threads` gives the pipeline thread count at `open`, for a source
+that sizes its read parallelism from it; it is `None` when the source is opened
+by hand, as in [Testing](#testing). The
 default `configure_feed` refuses the section, so a source that reads no feed
 fails at startup when one is set. The runtime builds the in-process feed for
 `feed: { memory: {} }` and logs nothing about who publishes to it, since only
@@ -265,9 +274,12 @@ Your source follows these rules:
 - **Let go of a delivery whose receipt answers `Gone`.** The feed has
   delivered that unit again or already settled it, so retrying the call
   cannot succeed.
-- **Renew every unit you hold on each `poll_events` call.** A backend that
-  leases units extends a lease only while its holder renews it, so a control
-  plane that stops running gives its units back to the feed.
+- **Renew every unit you hold on each `poll_events` call, and in
+  `renew_held`.** A backend that leases units extends a lease only while its
+  holder renews it, so a control plane that stops running gives its units
+  back to the feed. While a revocation waits for its drain, for up to
+  `checkpoint.drain_timeout`, the runtime calls `renew_held` and no
+  `poll_events`. Renew there, and settle and report nothing.
 - **Never wait on the feed inside `poll_events`.** Hand the feed a waker from
   `wake_channel` with `set_waker`. When there is nothing to do, park on the
   paired `FeedPark` for at most the `timeout` that `poll_events` was given. A

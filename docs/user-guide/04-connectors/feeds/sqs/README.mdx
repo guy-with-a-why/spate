@@ -48,12 +48,22 @@ fields are rejected with the offending key.
 |---|---|---|---|
 | `queue_url` | string | `required` | The queue's URL, as `GetQueueUrl` returns it. An `http` or `https` URL. A FIFO queue, whose URL ends in `.fifo`, is refused. |
 | `visibility` | duration | `60s` | How long a received unit stays hidden from other workers without a renewal. Whole seconds from `3s` to `12h`. |
-| `region` | string | `none` | The AWS region. Unset, the region in a `sqs.<region>.amazonaws.com` queue URL applies, then `AWS_REGION`, the shared config file and instance metadata. |
+| `region` | string | `none` | The AWS region. Unset, the region in the queue URL's host applies when the AWS SDK builds that host for the region (`sqs.<region>.amazonaws.com` and its FIPS and dual-stack forms, in every AWS partition the SDK lists), then `AWS_REGION`, the shared config file and instance metadata. |
 | `endpoint` | string | `none` | An endpoint in place of the region's, such as a local emulator or a VPC endpoint. Calls go to this endpoint when it is set, and to the region's otherwise, so a VPC endpoint in `queue_url` is reached only when it is also set here. `AWS_ENDPOINT_URL` in the environment sets one too. |
 
 `units_held` beside `sqs:` sets how many units a worker holds at once. The
 section's `attempt_cap` is refused on `sqs`, because SQS counts deliveries
 through the queue's `maxReceiveCount`.
+
+In another AWS partition, the feed reads the region from the queue URL's host
+when the SDK's partition table lists that partition. A VPC endpoint host, a
+legacy queue host or a host in a partition the SDK does not list gives no
+region, so set `region`. Calls go to the region's endpoint in the SDK's
+partition table. For a private endpoint, or a partition the SDK does not list,
+set `endpoint` as well. A
+FIPS or dual-stack host gives only the region: `AWS_USE_FIPS_ENDPOINT` and
+`AWS_USE_DUALSTACK_ENDPOINT` choose those endpoints. With `endpoint` set, leave
+both unset and give the FIPS or dual-stack host as the endpoint.
 
 ## Security (credentials, permissions and TLS)
 
@@ -80,19 +90,25 @@ and the two KMS actions above on a queue a customer-managed key encrypts.
 
 The client verifies SQS against the system trust store. When `SSL_CERT_FILE`
 or `SSL_CERT_DIR` is set, the certificates they name replace the system store.
+A private CA is trusted once it is in the system trust store. A bundle that
+`SSL_CERT_FILE` names replaces that store for the feed's SQS, region and
+credential calls, so it holds the private CA and every public root those calls
+need.
 If the store yields no certificate the client can parse, it logs a warning and
 uses the Mozilla root bundle compiled into the binary. It goes through the
 proxy that `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` names, except for the
 hosts in `NO_PROXY`.
 
-A rejected credential, signature or token, a 401 or 403 answer, a missing
-queue, a rejected TLS handshake and a KMS key the queue cannot use (access
-denied, disabled, not found, in an invalid state, needing opt-in, or not
-usable for the operation) are
-fatal: connecting fails with them, and after startup the feed returns the
-error to every call and the pipeline stops. Throttling, KMS throttling
-included, a 5xx answer, a timeout and a failure to load credentials are
-retried.
+A rejected credential, signature or token, a 401 or 403 answer that is not
+throttling, a missing queue, a rejected TLS handshake, a KMS key the queue
+cannot use (access denied, disabled, not found, in an invalid state, needing
+opt-in, or not usable for the operation) and any other 400 answer that
+carries an error code are fatal: connecting fails with them, and after
+startup the feed returns the error to every call and the pipeline stops.
+Throttling, KMS throttling included, and the in-flight message limit are
+retried at 400 or 403, and so are a 5xx answer, a 400 with no error code,
+any other 4xx answer such as a 408 or 429, a timeout and a failure to load
+credentials.
 
 ## Startup checks
 
@@ -138,7 +154,24 @@ closes, every unit handed to the reader is extended on each tick, renewed or
 not (see [Stop](#stop)). A worker that stops renewing, because it crashed or
 its control loop stalled, loses its units at most one visibility period after
 their last extension, those not yet handed out included, and SQS hands them
-to another worker.
+to another worker. During a revocation's drain the worker keeps renewing its
+units, for as long as `checkpoint.drain_timeout` allows. A unit the feed has
+received and not yet handed out is kept the same way only while the worker
+still holds a unit it renews.
+
+The units due on one renewal tick are extended in batches of up to ten, all
+sent together. Each extension, the SDK's retries included, is given up after
+one renewal period, or half the time left to the earliest deadline among the
+units in its batch if that is shorter, and never after more than 30 seconds; a
+request already sent by then can still reach SQS just after. From a stop until
+the feed closes, each is given up after one second. A batch whose call fails,
+or is given up, with one renewal period or less to its earliest deadline is
+sent once more at once, so a unit the worker renews outlives one extension
+call that SQS does not answer. A credentials load that outlasts the call that
+started it keeps running, for up to a minute, and the next call that needs
+credentials waits for it. Each extension given up while it runs still fails,
+so a load that outlasts the time left to a unit's deadline lets that unit
+lapse.
 
 The long-poll wait is `visibility / 3` seconds, rounded down and at most 20.
 A unit that arrives at the end of a poll therefore still has two renewal
@@ -246,6 +279,14 @@ receive it. A unit already past its deadline is visible again, and the feed
 sends it nothing; a deadline never falls after
 [the 12-hour hold](#the-12-hour-hold) ends. Each handed-back unit keeps the
 receive it used toward `maxReceiveCount`.
+
+The feed spends at most one renewal period at a time on hand-backs, retries
+included, and gives each call up after at most 30 seconds; a request already
+sent by then can still reach SQS just after. A hand-back not answered in that
+time is sent again after the next renewal tick, until its unit's deadline, so
+a slow hand-back delays the extension of the other units by at most one
+renewal period. A unit whose hand-back is never answered returns when its
+visibility lapses.
 
 After the final commit the feed sends its queued deletes and sets each unit it
 still holds visible, within what is left of `checkpoint.drain_timeout`. A

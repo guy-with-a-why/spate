@@ -10,7 +10,7 @@ use super::{DriverEvent, ExitState, FatalErrorReport, ThreadControl};
 use crate::admin::HealthState;
 use crate::backpressure::InflightBudget;
 use crate::checkpoint::Checkpointer;
-use crate::clock::Clock;
+use crate::clock::{Clock, Stopwatch, SystemClock};
 use crate::error::{ErrorClass, FatalError, SourceError};
 use crate::feed::STOP_RESERVE;
 use crate::metrics::{
@@ -20,6 +20,7 @@ use crate::record::PartitionId;
 use crate::sink::SinkFailures;
 use crate::source::{DrainBarrier, LaneId, Source, SourceCtx, SourceEvent, SourceLane};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -75,6 +76,8 @@ pub(crate) struct ControllerContext<S: Source> {
     pub shutdown: Arc<AtomicBool>,
     /// The clock a stop's reserve and deadlines are read on.
     pub stop_clock: Arc<dyn Clock + Send + Sync>,
+    /// The clock the commit tick and the fast-commit window are read on.
+    pub clock: Arc<dyn Clock + Send + Sync>,
     /// [`CLOSE_SHARE`] when the pipeline's feed hands back, else zero.
     pub close_share: Duration,
     pub health: Arc<HealthState>,
@@ -120,6 +123,7 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
         stop,
         shutdown,
         stop_clock,
+        clock,
         close_share,
         health,
         commit_interval,
@@ -156,7 +160,8 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
             .with_stop(stop_signal.clone())
             .with_meter(source_meter)
             .with_stage_metrics(Some(Arc::clone(&source_metrics)))
-            .with_partition_detail(per_partition_detail),
+            .with_partition_detail(per_partition_detail)
+            .with_threads(NonZeroUsize::new(control_txs.len())),
     ) {
         state.failure = Some(FatalError {
             component: "source".into(),
@@ -164,7 +169,7 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
         });
     }
 
-    let mut last_commit = Instant::now();
+    let mut last_commit = clock.now();
     // Fast-commit mode (`SourceEvent::CommitReady`): partitions whose final
     // acks are being chased with a tightened cadence, each with its OWN
     // deadline bounding its chase to one commit interval. A single shared
@@ -228,8 +233,9 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
         harvest(&mut checkpointer, &mut state);
 
         // The commit tick.
-        if last_commit.elapsed() >= commit_interval {
-            last_commit = Instant::now();
+        let now = clock.now();
+        if now.saturating_duration_since(last_commit) >= commit_interval {
+            last_commit = now;
             // Seal partial chain buffers before harvesting acknowledgments. A
             // below-target chunk (a low-volume split branch under sustained
             // load) otherwise holds its records' acks, and with them the
@@ -253,8 +259,9 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
             // only ever fail, never un-fail. If one has been stalled past the
             // limit, a sink leg is permanently broken (fatal write error,
             // dropped table); fail the pipeline so it restarts and replays.
+            let now = checkpointer.now();
             for (partition, since) in checkpointer.stalled_partitions() {
-                let age = since.elapsed();
+                let age = now.saturating_duration_since(since);
                 if age > stalled_fail_after {
                     state.failure.get_or_insert(FatalError {
                         component: "checkpoint".into(),
@@ -362,7 +369,7 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
                 }
                 // Each hinted partition gets its own window; re-hinting one
                 // that is already being chased does not extend it.
-                let until = Instant::now() + chase_window;
+                let until = clock.now() + chase_window;
                 for p in partitions {
                     fast_commit.entry(p).or_insert(until);
                 }
@@ -390,7 +397,7 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
         if (!fast_commit.is_empty() || !after_window.is_empty()) && state.failure.is_none() {
             // A partition past its window leaves the 1 ms cadence and is
             // committed on ordinary passes.
-            let now = Instant::now();
+            let now = clock.now();
             fast_commit.retain(|&p, &mut until| {
                 let open = now < until;
                 if !open {
@@ -623,13 +630,18 @@ fn wait_revocation<S: Source>(
     watch: StopWatch<'_>,
 ) -> bool {
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = deadline.saturating_duration_since(watch.clock.now());
         if barrier.wait(left.min(STOP_POLL)) {
             return true;
         }
-        if left <= STOP_POLL {
+        // Re-read after the slice: the deadline is on the stop clock, which
+        // the real-time wait above does not move.
+        if watch.clock.now() >= deadline {
             return false;
         }
+        // The source gets no `poll_events` while the drain runs, so a lease
+        // it holds would lapse unless it renews here.
+        source.renew_held();
         if !watch.shutdown.load(Ordering::Relaxed) && watch.ends_the_wait(source) {
             watch.shutdown.store(true, Ordering::Relaxed);
         }
@@ -823,9 +835,10 @@ fn commit_cycle<S: Source>(
     }
 
     let stalled = checkpointer.stalled_partitions();
+    let now = checkpointer.now();
     let age = stalled
         .iter()
-        .map(|(_, since)| since.elapsed())
+        .map(|&(_, since)| now.saturating_duration_since(since))
         .max()
         .unwrap_or(Duration::ZERO);
     metrics.set_watermark_age(age);
@@ -846,10 +859,10 @@ fn commit_cycle<S: Source>(
     if positions.is_empty() {
         return;
     }
-    let started = Instant::now();
+    let started = Stopwatch::start(&SystemClock);
     match source.commit(&positions) {
         Ok(()) => {
-            metrics.commit(true, started.elapsed());
+            metrics.commit(true, started.elapsed(&SystemClock));
             for &(p, o) in &positions {
                 state.pending_commit.remove(&p);
                 // A retried commit can land after its partition left; the
@@ -862,18 +875,18 @@ fn commit_cycle<S: Source>(
             }
         }
         Err(e) if is_fatal(&e) => {
-            metrics.commit(false, started.elapsed());
+            metrics.commit(false, started.elapsed(&SystemClock));
             state.failure.get_or_insert(FatalError {
                 component: "source".into(),
                 reason: format!("commit failed fatally: {e}"),
             });
         }
         Err(e) if final_pass => {
-            metrics.commit(false, started.elapsed());
+            metrics.commit(false, started.elapsed(&SystemClock));
             tracing::warn!(error = %e, "final commit failed; uncommitted positions may replay");
         }
         Err(e) => {
-            metrics.commit(false, started.elapsed());
+            metrics.commit(false, started.elapsed(&SystemClock));
             tracing::warn!(error = %e, "commit failed; retrying next tick");
         }
     }
@@ -1129,7 +1142,7 @@ fn revoke_lanes<S: Source>(
     drain_timeout: Duration,
     watch: StopWatch<'_>,
 ) {
-    let deadline = Instant::now() + drain_timeout;
+    let deadline = watch.clock.now() + drain_timeout;
     let mut by_thread: HashMap<usize, Vec<LaneId>> = HashMap::new();
     for lane in lanes {
         match state.assignment.get(lane) {

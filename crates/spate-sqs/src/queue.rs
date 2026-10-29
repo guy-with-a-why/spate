@@ -92,7 +92,8 @@ pub(crate) trait Queue: Send + Sync + std::fmt::Debug + 'static {
     -> BoxFuture<'_, Result<BatchOutcome, CallError>>;
 
     /// A `ChangeMessageVisibilityBatch`. With `within` set, the call and
-    /// its retries end after that long, as a Retryable timeout.
+    /// its retries end after that long, or after the client's operation
+    /// timeout if that is shorter, as a Retryable timeout.
     fn change_visibility_batch(
         &self,
         entries: Vec<VisibilityEntry>,
@@ -341,28 +342,104 @@ impl Queue for SdkQueue {
 mod tests {
     use super::*;
     use crate::config::SqsFeedConfig;
-    use spate_test_support::{TestCa, serve_tls};
+    use crate::config::tests::{PARTITION_REGIONS, sdk_host};
+    use crate::test_stub::{ScriptedCredentials, queue_with, sqs_stub};
+    use aws_credential_types::provider::error::CredentialsError;
+    use aws_sdk_sqs::config::{BehaviorVersion, Credentials, Region, SharedCredentialsProvider};
+    use spate_test_support::{TestCa, native_certs, serve_tls};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    /// An [`SdkQueue`] over `endpoint`, with a static access key.
-    async fn queue_at(endpoint: &str) -> SdkQueue {
-        let config = SqsFeedConfig {
-            queue_url: format!("{endpoint}/000000000000/jobs"),
-            visibility: Duration::from_secs(60),
-            region: Some("eu-west-2".to_owned()),
-            endpoint: Some(endpoint.to_owned()),
-        };
-        let credentials = aws_sdk_sqs::config::Credentials::new("x", "x", None, None, "test");
+    /// An [`SdkQueue`] over `config`, with a static access key.
+    async fn queue_for(config: &SqsFeedConfig) -> SdkQueue {
+        let credentials = Credentials::new("x", "x", None, None, "test");
         let step = std::sync::Mutex::new("starting");
         crate::client::sdk_queue(
-            &config,
-            Some(aws_sdk_sqs::config::SharedCredentialsProvider::new(
-                credentials,
-            )),
+            config,
+            Some(SharedCredentialsProvider::new(credentials)),
             &step,
         )
         .await
         .unwrap()
+    }
+
+    /// An [`SdkQueue`] over `endpoint`, with a static access key.
+    async fn queue_at(endpoint: &str) -> SdkQueue {
+        queue_for(&SqsFeedConfig {
+            queue_url: format!("{endpoint}/000000000000/jobs"),
+            visibility: Duration::from_secs(60),
+            region: Some("eu-west-2".to_owned()),
+            endpoint: Some(endpoint.to_owned()),
+        })
+        .await
+    }
+
+    /// Pins that the client takes its region from the queue URL's host, in
+    /// one region per partition the SDK lists, when `region` is unset.
+    #[tokio::test]
+    async fn the_client_takes_its_region_from_the_queue_url_host() {
+        for region in PARTITION_REGIONS {
+            let host = sdk_host(region, false, false).await;
+            let queue = queue_for(&SqsFeedConfig {
+                queue_url: format!("https://{host}/000000000000/jobs"),
+                visibility: Duration::from_secs(60),
+                region: None,
+                endpoint: Some("http://127.0.0.1:1".to_owned()),
+            })
+            .await;
+            assert_eq!(
+                queue.client.config().region(),
+                Some(&Region::new(region)),
+                "{host}"
+            );
+        }
+    }
+
+    /// Pins that a private CA the system trust store yields is trusted: a
+    /// `GetQueueAttributes` call to a server it signed succeeds.
+    #[tokio::test]
+    async fn a_private_ca_in_the_system_store_is_trusted() {
+        let ca = TestCa::new("private");
+        let addr = serve_tls(ca.server_config(None), |mut tls| async move {
+            let mut buf = vec![0u8; 65536];
+            let _ = tls.read(&mut buf).await;
+            let body = r#"{"Attributes":{"QueueArn":"arn:aws:sqs:eu-west-2:000000000000:jobs"}}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-amz-json-1.0\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = tls.write_all(reply.as_bytes()).await;
+            let _ = tokio::io::copy(&mut tls, &mut tokio::io::sink()).await;
+        })
+        .await;
+        let der = ca.der();
+        let http = crate::client::http_client(move || native_certs(vec![der]))
+            .await
+            .unwrap();
+        let endpoint = format!("https://{addr}");
+        let conf = aws_sdk_sqs::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .http_client(http)
+            .endpoint_url(&endpoint)
+            .region(Region::new("eu-west-2"))
+            .credentials_provider(Credentials::new("x", "x", None, None, "test"))
+            .build();
+        let queue = SdkQueue {
+            client: Client::from_conf(conf),
+            queue_url: format!("{endpoint}/000000000000/jobs"),
+            receive_timeouts: aws_sdk_sqs::config::Builder::default(),
+        };
+        let attributes = queue
+            .attributes(&queue.queue_url, &["QueueArn"])
+            .await
+            .unwrap();
+        assert_eq!(
+            attributes.get("QueueArn").map(String::as_str),
+            Some("arn:aws:sqs:eu-west-2:000000000000:jobs")
+        );
     }
 
     /// Pins that a server whose certificate the client does not trust fails
@@ -445,5 +522,163 @@ mod tests {
             "ended after {elapsed:?}: {}",
             e.message
         );
+    }
+
+    /// Calls the batch call `op` names with one entry, bounded by `within`.
+    async fn one_entry(
+        queue: &SdkQueue,
+        op: &str,
+        within: Option<Duration>,
+    ) -> Result<BatchOutcome, CallError> {
+        if op == "visibility" {
+            let entry = VisibilityEntry {
+                id: "0".to_owned(),
+                handle: "h".to_owned(),
+                seconds: 30,
+            };
+            queue.change_visibility_batch(vec![entry], within).await
+        } else {
+            let entry = DeleteEntry {
+                id: "0".to_owned(),
+                handle: "h".to_owned(),
+            };
+            queue.delete_batch(vec![entry], within).await
+        }
+    }
+
+    /// Pins that a credentials load a bounded call gives up on finishes for
+    /// the next call, while `within` still ends the call that gave up.
+    #[tokio::test]
+    async fn a_credentials_load_given_up_by_one_call_finishes_for_the_next() {
+        let within = Some(Duration::from_secs(1));
+        for op in ["visibility", "delete"] {
+            let (endpoint, answered) = sqs_stub().await;
+            let credentials = ScriptedCredentials::slow_reloads(Duration::from_millis(1_200));
+            let (queue, _) =
+                queue_with(&endpoint, Duration::from_secs(60), credentials.provider()).await;
+            tokio::time::pause();
+            one_entry(&queue, op, None).await.unwrap();
+            let started = tokio::time::Instant::now();
+            let e = one_entry(&queue, op, within).await.unwrap_err();
+            let elapsed = started.elapsed();
+            assert_eq!(e.class, Class::Retryable, "{op}: {}", e.message);
+            assert!(
+                elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(2),
+                "{op}: ended after {elapsed:?}"
+            );
+            assert_eq!(
+                credentials.finished(),
+                1,
+                "{op}: the reload is still running"
+            );
+            let third = one_entry(&queue, op, within).await;
+            assert!(
+                third.is_ok(),
+                "{op}: {third:?}, loads started {}",
+                credentials.started()
+            );
+            assert_eq!(credentials.started(), 2, "{op}");
+            let reached = if op == "visibility" {
+                &answered.extended
+            } else {
+                &answered.deleted
+            };
+            assert_eq!(reached.load(Ordering::SeqCst), 2, "{op}");
+            tokio::time::resume();
+        }
+    }
+
+    /// An [`SdkQueue`] over the answering stub whose every credentials load
+    /// fails with `error`.
+    async fn failing_credentials(
+        error: impl Fn() -> CredentialsError + Send + Sync + 'static,
+    ) -> SdkQueue {
+        let (endpoint, _) = sqs_stub().await;
+        let error = Arc::new(error);
+        let credentials = ScriptedCredentials::new(move |_| {
+            let error = Arc::clone(&error);
+            Box::pin(async move { Err(error()) })
+        });
+        queue_with(&endpoint, Duration::from_secs(60), credentials.provider())
+            .await
+            .0
+    }
+
+    /// Pins that a failed credentials load fails the call as Retryable with
+    /// the load's cause in its message.
+    #[tokio::test]
+    async fn a_failed_credentials_load_reads_retryable_with_its_cause() {
+        let queue =
+            failing_credentials(|| CredentialsError::provider_error("no profile named ops")).await;
+        let e = one_entry(&queue, "visibility", Some(Duration::from_secs(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(e.class, Class::Retryable, "{}", e.message);
+        assert!(e.message.contains("no profile named ops"), "{}", e.message);
+    }
+
+    /// Pins that a credentials load the TLS layer rejected fails the call
+    /// as Fatal with the TLS error in its message.
+    #[tokio::test]
+    async fn a_credentials_load_rejected_by_tls_keeps_its_class() {
+        let queue = failing_credentials(|| {
+            CredentialsError::provider_error(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        })
+        .await;
+        let e = one_entry(&queue, "visibility", Some(Duration::from_secs(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(e.class, Class::Fatal, "{}", e.message);
+        assert!(e.message.contains("UnknownIssuer"), "{}", e.message);
+    }
+
+    /// Pins that a queue holding a finished credentials load nobody awaited
+    /// prints neither the secret key nor the session token.
+    #[tokio::test]
+    async fn a_queue_prints_no_secret_after_a_load() {
+        let (endpoint, _) = sqs_stub().await;
+        let credentials = ScriptedCredentials::slow_reloads(Duration::from_millis(1_200));
+        let (queue, _) =
+            queue_with(&endpoint, Duration::from_secs(60), credentials.provider()).await;
+        tokio::time::pause();
+        one_entry(&queue, "visibility", None).await.unwrap();
+        one_entry(&queue, "visibility", Some(Duration::from_secs(1)))
+            .await
+            .unwrap_err();
+        credentials.until_finished(2).await;
+        let printed = format!("{queue:?}");
+        assert!(!printed.contains("s3cr3t"), "{printed}");
+        assert!(!printed.contains("t0k3n"), "{printed}");
+    }
+
+    /// Pins that the client loads through [`SharedLoad`] on the AWS
+    /// provider chain as well as on a provider the caller passes.
+    ///
+    /// [`SharedLoad`]: crate::credentials::SharedLoad
+    #[tokio::test]
+    async fn the_default_chain_is_wrapped_too() {
+        let config = SqsFeedConfig {
+            queue_url: "http://127.0.0.1:1/000000000000/jobs".to_owned(),
+            visibility: Duration::from_secs(60),
+            region: Some("eu-west-2".to_owned()),
+            endpoint: Some("http://127.0.0.1:1".to_owned()),
+        };
+        let step = std::sync::Mutex::new("starting");
+        let given = Credentials::new("x", "x", None, None, "test");
+        for credentials in [None, Some(SharedCredentialsProvider::new(given))] {
+            let explicit = credentials.is_some();
+            let queue = crate::client::sdk_queue(&config, credentials, &step)
+                .await
+                .unwrap();
+            // The SDK's config has no getter for the provider it signs with;
+            // its `Debug` prints the identity resolvers.
+            let printed = format!("{:?}", queue.client.config());
+            assert!(
+                printed.contains("SharedLoad"),
+                "explicit {explicit}: {printed}"
+            );
+        }
     }
 }

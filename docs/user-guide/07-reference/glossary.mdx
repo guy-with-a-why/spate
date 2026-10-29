@@ -183,7 +183,7 @@ counts them.
 [Kafka source](../04-connectors/sources/kafka/README.mdx#lanes-partitions-on-pipeline-threads)
 — one partition queue ·
 [S3 source](../04-connectors/sources/s3/README.mdx#sizing-units-against-pipelinethreads)
-— one object or byte range in progress ·
+— one object, byte range or multi-object unit in progress ·
 [Datagen source](../04-connectors/sources/datagen/README.mdx#configuration) —
 one generator, `partitions` of them.
 
@@ -270,5 +270,6 @@ from its start.
 
 *Connector mapping:*
 [S3 source](../04-connectors/sources/s3/README.mdx#unit-identity-and-drift) —
-one whole object, identified by its key and ETag, or one byte range of a large
-object, identified by its key, ETag and range.
+one whole object, one byte range of a large object, or several small objects
+read whole in turn, identified by their keys and ETags (and a range's
+range).

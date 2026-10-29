@@ -10,6 +10,7 @@ use super::{DriverEvent, ThreadControl};
 use crate::admin::HealthState;
 use crate::backpressure::{InflightBudget, Transition, WatermarkController};
 use crate::checkpoint::{AckRef, AdvanceCounter};
+use crate::clock::{Clock, Stopwatch, SystemClock};
 use crate::error::{ErrorClass, FatalError, SourceError};
 use crate::metrics::{BackpressureMetrics, SourceMetrics};
 use crate::ops::{BlockReason, PushOutcome, RunnableChain};
@@ -77,6 +78,10 @@ pub(crate) struct DriverContext<L> {
     /// long-running inner loops (blocked-batch retries) so a wedged batch
     /// cannot defer shutdown to the barrier timeout.
     pub shutdown: Arc<AtomicBool>,
+    /// Drives the idle flush.
+    pub clock: Arc<dyn Clock + Send + Sync>,
+    /// Reads the drain deadlines, which the stop path cuts on this clock.
+    pub stop_clock: Arc<dyn Clock + Send + Sync>,
 }
 
 /// Run one driver thread to completion.
@@ -93,14 +98,17 @@ pub(crate) fn run_driver<L: SourceLane>(ctx: DriverContext<L>) -> DriverExit {
         bp_metrics,
         source_metrics,
         shutdown,
+        clock,
+        stop_clock,
     } = ctx;
 
     let mut lanes: Vec<L> = Vec::new();
     let mut next_lane = 0usize;
-    let mut last_data = Instant::now();
+    let mut last_data = clock.now();
     let mut flushed_since_data = false;
-    let mut pause_started: Option<Instant> = None;
-    // Consecutive empty lane polls; resets on data or a lane-set change.
+    let mut pause_started: Option<Stopwatch> = None;
+    // Consecutive empty or failed lane polls since the last batch; a skipped
+    // lane does not count.
     let mut empty_polls: usize = 0;
     // A control message received while parked with no lanes (see the
     // lane-less wait below); handled by the drain at the top of the loop.
@@ -110,8 +118,9 @@ pub(crate) fn run_driver<L: SourceLane>(ctx: DriverContext<L>) -> DriverExit {
     // retirement counter. A lane is skipped while the difference is at
     // `checkpoint.max_pending_batches`.
     let mut gates: HashMap<PartitionId, GateState> = HashMap::new();
-    // Consecutive gated lanes; a full gated pass parks on the control channel.
-    let mut gated_streak = 0usize;
+    // Consecutive lanes skipped as gated or finished; a full skipped pass
+    // parks on the control channel.
+    let mut skipped_streak = 0usize;
 
     loop {
         health.heartbeat(params.thread);
@@ -152,10 +161,14 @@ pub(crate) fn run_driver<L: SourceLane>(ctx: DriverContext<L>) -> DriverExit {
                         !goes
                     });
                     prune_gates(&mut gates, &lanes);
+                    // A streak counted against the old rotation would park
+                    // the smaller one before it has seen every lane.
+                    skipped_streak = 0;
                     if stopped > 0 {
                         flush_until(
                             chain.as_mut(),
                             deadline,
+                            &*stop_clock,
                             &mut bp,
                             &events,
                             &health,
@@ -189,11 +202,13 @@ pub(crate) fn run_driver<L: SourceLane>(ctx: DriverContext<L>) -> DriverExit {
                     // emits a partial chunk once per completed unit.
                     lanes.retain(|l| !drop.contains(&l.id()));
                     prune_gates(&mut gates, &lanes);
+                    skipped_streak = 0;
                 }
                 ThreadControl::Shutdown { barrier, deadline } => {
                     flush_until(
                         chain.as_mut(),
                         deadline,
+                        &*stop_clock,
                         &mut bp,
                         &events,
                         &health,
@@ -230,7 +245,7 @@ pub(crate) fn run_driver<L: SourceLane>(ctx: DriverContext<L>) -> DriverExit {
             park_on_control(&control, &mut parked, params.poll_timeout);
             idle_flush(
                 chain.as_mut(),
-                &mut last_data,
+                clock.now().saturating_duration_since(last_data),
                 &mut flushed_since_data,
                 params.idle_flush,
                 &mut bp,
@@ -256,11 +271,13 @@ pub(crate) fn run_driver<L: SourceLane>(ctx: DriverContext<L>) -> DriverExit {
         // Pending-ceiling gate: skip a lane whose partition has the full ceiling
         // of batches registered and not yet advanced past. The check precedes
         // the poll and a poll issues one batch, so pending stays at or under the
-        // ceiling. A fully gated pass parks on the control channel, where the
-        // controller's next harvest reopens the gates.
+        // ceiling. A pass in which every lane is gated or finished parks on the
+        // control channel, where the controller's next harvest reopens the
+        // gates. A finished lane is never polled again, so its gate is not read.
+        let finished = lanes[lane_idx].finished();
         let partition = lanes[lane_idx].partition();
         let at_ceiling = match gates.get_mut(&partition) {
-            Some(g) => {
+            Some(g) if !finished => {
                 let pending = g.issued.saturating_sub(g.advanced.get());
                 let at = pending >= params.max_pending_batches as u64;
                 // Edge-triggered: one line when the gate closes, so a partition
@@ -282,16 +299,16 @@ pub(crate) fn run_driver<L: SourceLane>(ctx: DriverContext<L>) -> DriverExit {
                 }
                 at
             }
-            None => false,
+            _ => false,
         };
-        if at_ceiling {
-            gated_streak += 1;
-            if gated_streak >= lanes.len() {
-                gated_streak = 0;
+        if finished || at_ceiling {
+            skipped_streak += 1;
+            if skipped_streak >= lanes.len() {
+                skipped_streak = 0;
                 park_on_control(&control, &mut parked, params.poll_timeout);
                 idle_flush(
                     chain.as_mut(),
-                    &mut last_data,
+                    clock.now().saturating_duration_since(last_data),
                     &mut flushed_since_data,
                     params.idle_flush,
                     &mut bp,
@@ -301,21 +318,21 @@ pub(crate) fn run_driver<L: SourceLane>(ctx: DriverContext<L>) -> DriverExit {
             }
             continue;
         }
-        gated_streak = 0;
+        skipped_streak = 0;
 
         let owned_ids: Vec<LaneId> = lanes.iter().map(SourceLane::id).collect();
         // The poll result borrows the lane's buffers, so the fatal is latched
         // here and acted on once this block ends.
         let fatal_reported = {
-            let poll_started = Instant::now();
+            let poll_started = Stopwatch::start(&SystemClock);
             let polled = lanes[lane_idx].poll(params.max_records, lane_timeout);
-            source_metrics.poll_duration(poll_started.elapsed());
+            source_metrics.poll_duration(poll_started.elapsed(&SystemClock));
 
             let mut fatal_reported = false;
             match polled {
                 Ok(Some(mut batch)) => {
                     empty_polls = 0;
-                    last_data = Instant::now();
+                    last_data = clock.now();
                     flushed_since_data = false;
                     if let Some(g) = gates.get_mut(&partition) {
                         let id = batch.ack().batch_id();
@@ -354,7 +371,7 @@ pub(crate) fn run_driver<L: SourceLane>(ctx: DriverContext<L>) -> DriverExit {
                     empty_polls = empty_polls.saturating_add(1);
                     idle_flush(
                         chain.as_mut(),
-                        &mut last_data,
+                        clock.now().saturating_duration_since(last_data),
                         &mut flushed_since_data,
                         params.idle_flush,
                         &mut bp,
@@ -413,9 +430,9 @@ struct GateState {
 }
 
 /// Park on the control channel for up to `poll_timeout`. A thread with nothing
-/// pollable (no lanes, or every lane gated) is waiting for a control message,
-/// or, when gated, for the controller's next harvest. A received message is
-/// stashed for the drain at the top of the loop.
+/// pollable (no lanes, or every lane gated or finished) is waiting for a
+/// control message, or, when gated, for the controller's next harvest. A
+/// received message is stashed for the drain at the top of the loop.
 fn park_on_control<L>(
     control: &crossbeam_channel::Receiver<ThreadControl<L>>,
     parked: &mut Option<ThreadControl<L>>,
@@ -514,7 +531,7 @@ fn drive_batch(
     owned: &[LaneId],
     health: &HealthState,
     bp_metrics: &BackpressureMetrics,
-    pause_started: &mut Option<Instant>,
+    pause_started: &mut Option<Stopwatch>,
     shutdown: &AtomicBool,
 ) -> Result<(), FatalError> {
     // Cloned before the first push. If the chain panics the batch may be
@@ -612,6 +629,7 @@ impl<'buf> PayloadBatch<'buf> for CountingBatch<'_, 'buf> {
 fn flush_until(
     chain: &mut dyn RunnableChain,
     deadline: Instant,
+    stop_clock: &dyn Clock,
     bp: &mut WatermarkController,
     events: &crossbeam_channel::Sender<DriverEvent>,
     health: &HealthState,
@@ -623,7 +641,7 @@ fn flush_until(
             PushOutcome::Done => return,
             PushOutcome::Blocked { .. } => {
                 bp.on_send_rejected();
-                if Instant::now() >= deadline {
+                if stop_clock.now() >= deadline {
                     tracing::error!(
                         thread,
                         "drain deadline exceeded with the chain still blocked; \
@@ -641,17 +659,18 @@ fn flush_until(
     }
 }
 
-/// Flush partial terminal state once per data lull.
+/// Flush partial terminal state once per data lull, once `quiet_for` since
+/// the last data reaches `after`.
 fn idle_flush(
     chain: &mut dyn RunnableChain,
-    last_data: &mut Instant,
+    quiet_for: Duration,
     flushed_since_data: &mut bool,
     after: Duration,
     bp: &mut WatermarkController,
     events: &crossbeam_channel::Sender<DriverEvent>,
     thread: usize,
 ) {
-    if *flushed_since_data || last_data.elapsed() < after {
+    if *flushed_since_data || quiet_for < after {
         return;
     }
     match chain.flush() {
@@ -672,11 +691,11 @@ fn apply_transition(
     owned: &[LaneId],
     events: &crossbeam_channel::Sender<DriverEvent>,
     bp_metrics: &BackpressureMetrics,
-    pause_started: &mut Option<Instant>,
+    pause_started: &mut Option<Stopwatch>,
 ) {
     match t {
         Transition::Pause => {
-            *pause_started = Some(Instant::now());
+            *pause_started = Some(Stopwatch::start(&SystemClock));
             bp_metrics.pause_started();
             let _ = events.send(DriverEvent::PauseLanes {
                 lanes: owned.to_vec(),
@@ -685,7 +704,7 @@ fn apply_transition(
         Transition::Resume => {
             let paused_for = pause_started
                 .take()
-                .map(|s| s.elapsed())
+                .map(|s| s.elapsed(&SystemClock))
                 .unwrap_or_default();
             bp_metrics.pause_ended(paused_for);
             let _ = events.send(DriverEvent::ResumeLanes {

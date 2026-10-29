@@ -13,21 +13,26 @@ use futures_util::TryStreamExt as _;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore as _, ObjectStoreExt as _, PutPayload};
-use spate_test_support::{ACCESS_KEY, ElasticMq, Message, REGION, Rustfs, SECRET_KEY};
+use spate_test_support::{ACCESS_KEY, ElasticMq, Message, REGION, S3Store, SECRET_KEY, Store};
 
 /// A bucket created through the helper takes a signed put, get, list and
-/// delete, and the container joins the network it was given.
+/// delete, and the container joins the network it was given. A store that
+/// takes its Kafka target through a topic, started without one, refuses a
+/// bucket's notification configuration naming `start_notifying`, and Garage
+/// refuses one, and refuses to start notifying, naming notifications.
 #[test]
 #[ignore = "requires Docker"]
-fn rustfs_round_trips_an_object() {
+fn s3_store_round_trips_an_object() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let network = format!("spate-test-support-{}-{nanos}", std::process::id());
-    let rustfs = Rustfs::start(Some(&network)).expect("start RustFS");
+    let s3_store = S3Store::start(Some(&network)).expect("start the S3 store");
+    let lane = Store::selected().unwrap().lane();
+    assert_eq!(s3_store.store().lane(), lane);
     assert_eq!(
-        rustfs.container_name(),
-        Some(format!("{network}-rustfs").as_str())
+        s3_store.container_name(),
+        Some(format!("{network}-{lane}").as_str())
     );
     let joined = std::process::Command::new("docker")
         .args([
@@ -35,7 +40,7 @@ fn rustfs_round_trips_an_object() {
             "--format",
             "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}",
         ])
-        .arg(rustfs.container_name().unwrap())
+        .arg(s3_store.container_name().unwrap())
         .output()
         .expect("docker inspect");
     assert!(joined.status.success(), "{joined:?}");
@@ -45,10 +50,28 @@ fn rustfs_round_trips_an_object() {
             .any(|n| n == network),
         "{joined:?}"
     );
-    rustfs.create_bucket("smoke").expect("create the bucket");
+    s3_store.create_bucket("smoke").expect("create the bucket");
+    match s3_store.store() {
+        Store::Rustfs => {}
+        Store::Rgw => {
+            let err = s3_store
+                .put_bucket_notification("smoke")
+                .expect_err("a store with no topic refuses");
+            assert!(err.contains("start_notifying"), "{err}");
+        }
+        Store::Garage => {
+            let err = s3_store
+                .put_bucket_notification("smoke")
+                .expect_err("Garage refuses a notification configuration");
+            assert!(err.contains("notifications"), "{err}");
+            let err = S3Store::start_notifying("no-such-container", 0, "smoke")
+                .expect_err("Garage refuses to start notifying");
+            assert!(err.contains("notifications"), "{err}");
+        }
+    }
 
     let store = AmazonS3Builder::new()
-        .with_endpoint(rustfs.endpoint())
+        .with_endpoint(s3_store.endpoint())
         .with_allow_http(true)
         .with_bucket_name("smoke")
         .with_region(REGION)

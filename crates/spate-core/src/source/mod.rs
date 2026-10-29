@@ -23,6 +23,7 @@ use crate::feed::{Feed, FeedOrigin};
 use crate::framing::FramingContract;
 use crate::metrics::{Meter, SourceMetrics};
 use crate::record::{PartitionId, RawPayload};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -66,11 +67,32 @@ pub trait SourceLane: Send {
     /// Poll up to `max_records` payloads, waiting at most `timeout`.
     /// `Ok(None)` means nothing arrived; the driver treats it as idle.
     /// Implementations must not busy-spin when idle; block up to `timeout`.
+    /// A lane that reports [`finished`](Self::finished) may return its
+    /// end-of-input `Ok(None)` without waiting out `timeout`, because the
+    /// pipeline thread stops polling it.
     fn poll(
         &mut self,
         max_records: usize,
         timeout: Duration,
     ) -> Result<Option<Self::Batch<'_>>, SourceError>;
+
+    /// Whether this lane has reached the end of its input and will not be
+    /// polled again.
+    ///
+    /// It may turn `true` only after a `poll` on this lane returned the
+    /// `Ok(None)` that decided its end-of-input, with no batch left to emit,
+    /// the rule [`SourceEvent::Drained`] states. A lane that reports `true`
+    /// while it still holds data has that data never read. Once `true`, it
+    /// stays `true` for the life of the lane.
+    ///
+    /// The pipeline thread reads it before every poll and does not poll a
+    /// lane that reports `true`; the lane still receives its stop, drop and
+    /// shutdown. It is read on every turn, so it must be a cheap read that
+    /// does no I/O and never blocks. The default `false` keeps the lane
+    /// polled.
+    fn finished(&self) -> bool {
+        false
+    }
 }
 
 /// Control-plane event returned by [`Source::poll_events`].
@@ -222,6 +244,11 @@ pub struct SourceCtx {
     /// `spate_source_lag_records`; consumer lag has no aggregate series to fall
     /// back to, so it always publishes per partition.
     pub per_partition_detail: bool,
+    /// The pipeline thread count the runtime resolved, the value
+    /// `spate_pipeline_threads` reports, for a source that sizes its read
+    /// parallelism from it. `None` only when the source is driven outside a
+    /// pipeline (tests, or a direct `open` call).
+    pub threads: Option<NonZeroUsize>,
     /// The run's stop. A feed-reading source reads it to stop receiving and to answer
     /// [`Source::reading_on_stop`].
     pub stop: StopSignal,
@@ -238,6 +265,7 @@ impl SourceCtx {
             meter: None,
             stage_metrics: None,
             per_partition_detail: false,
+            threads: None,
             stop: StopSignal::default(),
         }
     }
@@ -271,6 +299,13 @@ impl SourceCtx {
     #[must_use]
     pub fn with_partition_detail(mut self, enabled: bool) -> Self {
         self.per_partition_detail = enabled;
+        self
+    }
+
+    /// Attach the pipeline thread count. Called by the runtime.
+    #[must_use]
+    pub fn with_threads(mut self, threads: Option<NonZeroUsize>) -> Self {
+        self.threads = threads;
         self
     }
 }
@@ -365,6 +400,17 @@ pub trait Source: Send {
         Ok(())
     }
 
+    /// Renew the feed units the source holds, and nothing else.
+    ///
+    /// The controller calls this on each pass of a revocation's wait for its
+    /// drain. That wait lasts up to `checkpoint.drain_timeout` and makes no
+    /// [`poll_events`](Self::poll_events) call, so a source that holds leased
+    /// units renews them here. Once a stop is set, the wait also asks
+    /// [`reading_on_stop`](Self::reading_on_stop) on each pass. Never waits. Settles, acknowledges and
+    /// emits nothing: what the renewal finds is reported by the next
+    /// [`poll_events`](Self::poll_events). The default does nothing.
+    fn renew_held(&mut self) {}
+
     /// Whether the source is still reading units it holds after a graceful
     /// stop began. The controller asks on each pass between the stop and the
     /// drain, and begins the drain on the first `false` or at
@@ -392,8 +438,10 @@ pub trait Source: Send {
 mod tests {
     use super::{SourceCtx, StopSignal};
     use crate::checkpoint::Checkpointer;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     /// A default signal never reads set.
     #[test]
@@ -425,5 +473,58 @@ mod tests {
         assert!(ctx.meter.is_none());
         let ctx = SourceCtx::new(cp.handle()).with_partition_detail(true);
         assert!(ctx.per_partition_detail);
+    }
+
+    /// Pins that a context carries no thread count unless one is attached,
+    /// and carries the one attached.
+    #[test]
+    fn source_ctx_threads_defaults_to_none_and_round_trips() {
+        let cp = Checkpointer::new();
+        assert_eq!(SourceCtx::new(cp.handle()).threads, None);
+        let ctx = SourceCtx::new(cp.handle()).with_threads(NonZeroUsize::new(4));
+        assert_eq!(ctx.threads, NonZeroUsize::new(4));
+    }
+
+    /// A lane on every provided default; its batches are never built.
+    struct DefaultLane;
+
+    /// The batch type `DefaultLane` names and never returns.
+    struct NoBatch;
+
+    impl<'a> super::PayloadBatch<'a> for NoBatch {
+        fn next_payload(&mut self) -> Option<crate::record::RawPayload<'a>> {
+            None
+        }
+        fn ack(&self) -> &crate::checkpoint::AckRef {
+            unreachable!("`DefaultLane` never returns a batch")
+        }
+    }
+
+    impl super::SourceLane for DefaultLane {
+        type Batch<'a> = NoBatch;
+        fn id(&self) -> super::LaneId {
+            super::LaneId(0)
+        }
+        fn partition(&self) -> crate::record::PartitionId {
+            crate::record::PartitionId(0)
+        }
+        fn poll(
+            &mut self,
+            _max_records: usize,
+            _timeout: Duration,
+        ) -> Result<Option<NoBatch>, crate::error::SourceError> {
+            Ok(None)
+        }
+    }
+
+    /// Pins that a lane which does not override `finished` reports that it
+    /// has not finished, before and after a poll that returns nothing.
+    #[test]
+    fn a_lane_is_unfinished_unless_it_says_so() {
+        use super::SourceLane;
+        let mut lane = DefaultLane;
+        assert!(!lane.finished());
+        assert!(lane.poll(1, Duration::ZERO).unwrap().is_none());
+        assert!(!lane.finished());
     }
 }

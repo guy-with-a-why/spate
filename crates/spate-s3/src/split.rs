@@ -1,6 +1,7 @@
 //! Unit descriptors and deterministic unit identity.
 //!
-//! A unit of work is one object or one byte range of one object. The
+//! A unit of work is one object, one byte range of one object, or several
+//! objects read whole in turn. The
 //! [`SplitDescriptor`] carries the unit's member objects (keys, sizes, ETags)
 //! and its range, if it has one, verbatim to whichever worker receives the
 //! unit, so workers never list.
@@ -24,7 +25,8 @@
 //!
 //! An object above the target that [`Packing::delimiter_for`] accepts is cut
 //! by [`tile`] into byte ranges of at most the target, one unit each; any
-//! other object is read whole.
+//! other object is read whole, and the lister packs it into a unit with the
+//! objects listed beside it while their bytes stay within the target.
 
 use crate::config::Compression;
 use crate::fetch::ObjectEntry;
@@ -38,6 +40,40 @@ use sha2::{Digest as _, Sha256};
 /// to the descriptor's schema; a worker refuses a descriptor written by an
 /// incompatible release instead of misreading it.
 pub const DESCRIPTOR_VERSION: u32 = 2;
+
+/// The most member objects a descriptor may name for the source to read it.
+/// A unit naming more is failed back. Far below the composite offset's
+/// ordinal space, so no unit's ordinal overflows it.
+pub const MAX_UNIT_MEMBERS: usize = 4096;
+
+/// The most objects one unit the lister publishes packs together.
+pub(crate) const PACK_MEMBERS: usize = 16;
+
+/// The longest key the lister packs with other objects. A longer key is
+/// published alone, so a packed unit's body stays under
+/// [`PACKED_BODY_MAX_BYTES`] on a store that allows keys longer than S3's
+/// 1,024 bytes.
+pub(crate) const PACK_KEY_MAX_BYTES: usize = 1024;
+
+/// The longest ETag the lister packs with other objects. A longer ETag is
+/// published alone, so a packed unit's body stays under
+/// [`PACKED_BODY_MAX_BYTES`].
+pub(crate) const PACK_ETAG_MAX_BYTES: usize = 256;
+
+/// The largest body a packed unit carries: [`PACK_MEMBERS`] members whose
+/// keys of [`PACK_KEY_MAX_BYTES`] and ETags of [`PACK_ETAG_MAX_BYTES`] each
+/// escape to two bytes a byte in JSON, with a size and a time each, come to
+/// about 43 KB. It sits under
+/// librdkafka's default `message.max.bytes` of 1,000,000 less 36 bytes of
+/// record overhead, and under the SQS feed's 1 MiB message less its
+/// attribute name and type, with room for a 25-byte id and a dead-letter
+/// copy's headers.
+pub(crate) const PACKED_BODY_MAX_BYTES: usize = 48 * 1024;
+
+const _: () = assert!(PACK_MEMBERS <= MAX_UNIT_MEMBERS);
+const _: () = assert!(PACKED_BODY_MAX_BYTES + 1024 + 25 <= 1_000_000 - 36);
+const _: () =
+    assert!(PACKED_BODY_MAX_BYTES + 1024 + 25 <= 1_048_576 - "spate.unit".len() - "String".len());
 
 /// Version folded into every id by [`split_id_for`] and
 /// [`split_id_for_range`]. It is part of the persisted identity, so a change
@@ -133,6 +169,14 @@ impl SplitRange {
 /// [`encode`](SplitDescriptor::encode) refuses anything else) and mint ids
 /// with [`split_id_for`] or [`split_id_for_range`] respectively, which
 /// together are the whole cross-process contract. Fields are freely readable.
+///
+/// The source reads a descriptor of one member whole, in byte ranges when the
+/// member qualifies for cutting, or as the byte range the descriptor names. It
+/// reads a descriptor of two or more members whole, member by member in order,
+/// on one lane, and a member named twice is read once per mention. It fails
+/// back a descriptor that names no member or more than [`MAX_UNIT_MEMBERS`],
+/// carries an ETag `If-Match` cannot send, or names a byte range cut on a
+/// delimiter other than the framer's or of an object the source decompresses.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitDescriptor {
     /// Encoding version; always [`DESCRIPTOR_VERSION`] at write. Private to
