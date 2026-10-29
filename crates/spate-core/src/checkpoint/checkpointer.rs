@@ -13,6 +13,7 @@ use super::ack::AckTx;
 use super::gate::AdvanceCounter;
 use super::tracker::{PartitionTracker, ResolveOutcome};
 use super::{AckMsg, AckRef, BatchId};
+use crate::clock::{SharedClock, SystemClock};
 use crate::error::FatalError;
 use crate::record::PartitionId;
 use std::collections::HashMap;
@@ -117,7 +118,6 @@ impl AckIssuer {
 /// assert_eq!(cp.take_watermarks(), vec![(p, 100)]);
 /// assert_eq!(cp.take_watermarks(), vec![]); // idempotent until new acks
 /// ```
-#[derive(Debug)]
 pub struct Checkpointer {
     ack_tx: crossbeam_channel::Sender<AckMsg>,
     ack_rx: crossbeam_channel::Receiver<AckMsg>,
@@ -136,6 +136,19 @@ pub struct Checkpointer {
     /// enforce this: a revocation removes the tracker, so a re-add would look
     /// fresh.
     admitted_through: Option<PartitionId>,
+    /// Stamps the start of a stall, so a health check that ages it reads
+    /// the same timeline.
+    clock: SharedClock,
+}
+
+impl std::fmt::Debug for Checkpointer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Checkpointer")
+            .field("epoch", &self.epoch)
+            .field("trackers", &self.trackers)
+            .field("admitted_through", &self.admitted_through)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Checkpointer {
@@ -163,7 +176,19 @@ impl Checkpointer {
             trackers: HashMap::new(),
             gates: HashMap::new(),
             admitted_through: None,
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Stamps stall starts on `clock`, the clock that ages them.
+    pub(crate) fn set_clock(&mut self, clock: SharedClock) {
+        self.clock = clock;
+    }
+
+    /// The current instant on the clock that stamps stall starts, for
+    /// ageing them.
+    pub(crate) fn now(&self) -> Instant {
+        self.clock.now()
     }
 
     /// An issuer handle for a pipeline thread.
@@ -362,7 +387,7 @@ impl Checkpointer {
         let mut out = Vec::new();
         for (&p, t) in &mut self.trackers {
             let before = t.pending();
-            let watermark = t.advance();
+            let watermark = t.advance_on(&*self.clock);
             // Retired batches reopen the partition's pending gate; the
             // owning driver reads the counter at its poll boundary.
             let retired = before - t.pending();
@@ -415,7 +440,8 @@ impl Checkpointer {
     }
 
     /// Partitions whose watermark is permanently stalled behind a failed
-    /// batch, with the stall start (health-probe input).
+    /// batch, with the stall start on the checkpointer's clock (health-probe
+    /// input).
     #[must_use]
     pub fn stalled_partitions(&self) -> Vec<(PartitionId, Instant)> {
         let mut out: Vec<_> = self
@@ -434,6 +460,23 @@ mod tests {
 
     const P0: PartitionId = PartitionId(0);
     const P1: PartitionId = PartitionId(1);
+
+    /// The clock it holds leaves `Checkpointer` `UnwindSafe` and
+    /// `RefUnwindSafe`.
+    #[test]
+    fn checkpointer_stays_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        unwind_safe::<Checkpointer>();
+    }
+
+    /// The hand-written `Debug` names the type and its epoch.
+    #[test]
+    fn debug_names_the_checkpointer_and_its_epoch() {
+        let (cp, _issuer) = checkpointer(&[P0]);
+        let text = format!("{cp:?}");
+        assert!(text.starts_with("Checkpointer {"), "{text}");
+        assert!(text.contains("epoch: 1"), "{text}");
+    }
 
     fn checkpointer(partitions: &[PartitionId]) -> (Checkpointer, AckIssuer) {
         let mut cp = Checkpointer::new();
