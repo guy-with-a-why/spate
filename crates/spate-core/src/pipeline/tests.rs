@@ -2824,36 +2824,32 @@ fn a_failed_dead_letter_read_warns() {
     assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
 }
 
-/// Pins that the runtime hands a feed backend a `Meter` scoped
-/// `spate_<backend>_feed_*`, carrying the feed's labels, before the source is
-/// handed the feed.
-#[test]
-fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
+/// The in-process feed under `key`, passing the `Meter` it is handed to `attach`.
+// Redundant for the compiler. cargo-mutants skips an item under exactly
+// `cfg(test)`, and these tests never call most of the forwarding methods.
+#[cfg(test)]
+fn keyed_feed(
+    key: &'static str,
+    attach: impl Fn(Option<crate::metrics::Meter>) + Send + Sync + 'static,
+) -> Arc<dyn crate::feed::Feed> {
     use crate::feed::{Confirmation, Delivery, Feed, FeedError, FeedWaker, Receipt, Unit};
     use crate::metrics::Meter;
 
-    /// The in-process feed under another key, counting through the `Meter`
-    /// it is handed and noting whether the source already held the feed.
-    struct Probe {
+    struct Keyed<A> {
         inner: MemoryFeed,
-        source: SharedLog,
-        source_had_feed: Arc<Mutex<Option<bool>>>,
+        key: &'static str,
+        attach: A,
     }
 
-    impl Feed for Probe {
+    impl<A: Fn(Option<Meter>) + Send + Sync> Feed for Keyed<A> {
         fn backend(&self) -> &str {
-            "probe"
+            self.key
         }
         fn set_waker(&self, waker: FeedWaker) {
             self.inner.set_waker(waker);
         }
         fn attach_metrics(&self, meter: Option<Meter>) {
-            let had_feed = self.source.lock().unwrap().feed.is_some();
-            *self.source_had_feed.lock().unwrap() = Some(had_feed);
-            meter
-                .expect("`probe` can scope a family")
-                .counter("attached_total", &[])
-                .increment(1);
+            (self.attach)(meter);
         }
         fn receive(&self, max: usize) -> Result<Vec<Delivery>, FeedError> {
             self.inner.receive(max)
@@ -2872,6 +2868,18 @@ fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
         }
     }
 
+    Arc::new(Keyed {
+        inner: MemoryFeed::new(),
+        key,
+        attach,
+    })
+}
+
+/// Pins that the runtime hands a feed backend one `Meter` scoped
+/// `spate_<backend>_feed_*`, carrying the feed's labels, once the recorder is
+/// installed and before the source is handed the feed.
+#[test]
+fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
     let mut cfg = test_config(1);
     cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
     cfg.feed = feed_section("probe: {}");
@@ -2883,14 +2891,15 @@ fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
     let h = start_prepared(
         cfg,
         test_options(),
-        |log| {
-            log.accept_feed = true;
-        },
+        |log| log.accept_feed = true,
         move |runtime, source| {
-            runtime.with_feed(Arc::new(Probe {
-                inner: MemoryFeed::new(),
-                source: Arc::clone(source),
-                source_had_feed: noted,
+            let source = Arc::clone(source);
+            runtime.with_feed(keyed_feed("probe", move |meter| {
+                *noted.lock().unwrap() = Some(source.lock().unwrap().feed.is_some());
+                meter
+                    .expect("`probe` can scope a family")
+                    .counter("attached_total", &[])
+                    .increment(1);
             }))
         },
         ok_chain,
@@ -2913,6 +2922,43 @@ fn a_feed_backend_receives_a_meter_scoped_to_the_feed_role() {
     );
     let rendered = handle.render();
     assert!(rendered.lines().any(|l| l == series), "{rendered}");
+}
+
+/// Pins that a backend whose key cannot scope a family receives `None` and the
+/// job still runs: a reserved root and `custom` silently, a malformed key with
+/// a warning naming it.
+#[test]
+fn a_feed_backend_whose_key_cannot_scope_a_family_receives_no_meter() {
+    for (key, warns) in [("feed", false), ("custom", false), ("not-a-segment", true)] {
+        let mut cfg = test_config(1);
+        cfg.feed = feed_section(&format!("{key}: {{}}"));
+        let attached = Arc::new(Mutex::new(Vec::new()));
+        let noted = Arc::clone(&attached);
+        let h = start_prepared(
+            cfg,
+            test_options(),
+            |log| log.accept_feed = true,
+            move |runtime, _| {
+                runtime.with_feed(keyed_feed(key, move |meter| {
+                    noted.lock().unwrap().push(meter.is_some());
+                }))
+            },
+            ok_chain,
+        );
+        h.script.lock().unwrap().push_back(Script::Drained);
+        let report = h.join.join().unwrap().unwrap();
+        assert_eq!(report.state, ExitState::Completed, "{key}");
+        assert_eq!(*attached.lock().unwrap(), [false], "{key}");
+        let warned = h.warnings.0.lock().unwrap().iter().any(|fields| {
+            fields
+                .iter()
+                .any(|(name, value)| name == "role" && value.contains("feed"))
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "component_type" && value.contains(key))
+        });
+        assert_eq!(warned, warns, "{key}");
+    }
 }
 
 /// Pins that `run` passes a `location` beside a backend other than the
