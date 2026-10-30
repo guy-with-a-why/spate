@@ -24,6 +24,7 @@ use super::{Core, Gating, LatchOnPanic};
 use rdkafka::error::{IsError as _, KafkaError, KafkaResult, RDKafkaErrorCode};
 use rdkafka::producer::Producer as _;
 use rdkafka::{Offset, TopicPartitionList};
+use spate_core::clock::Stopwatch;
 use spate_core::error::ErrorClass;
 use std::collections::BTreeSet;
 #[cfg(test)]
@@ -121,7 +122,7 @@ impl Gate {
         if entries.is_empty() {
             return;
         }
-        let started = Instant::now();
+        let started = self.core.clock().now();
         match self.catch_up(&entries, started) {
             Ok(unread) if unread.partitions.is_empty() => self.admit(entries),
             Ok(unread) => {
@@ -195,7 +196,7 @@ impl Gate {
         let mut late = Vec::new();
         let mut slowest: Option<(i32, Duration)> = None;
         for partition in partitions {
-            let begun = Instant::now();
+            let begun = Stopwatch::start(&**self.core.clock());
             match self.read(started, partition)? {
                 Read::Marks(lwm, hwm) => marks.push((partition, lwm, hwm)),
                 Read::Failed(reason) => {
@@ -204,7 +205,7 @@ impl Gate {
                 }
                 Read::Late => late.push(partition),
             }
-            let took = begun.elapsed();
+            let took = begun.elapsed(&**self.core.clock());
             if slowest.is_none_or(|(_, longest)| took > longest) {
                 slowest = Some((partition, took));
             }
@@ -301,7 +302,7 @@ impl Gate {
     /// once the feed stopped or latched.
     fn late(&self, started: Instant) -> Result<bool, Halt> {
         self.ended()?;
-        Ok(started.elapsed() >= self.delivery_timeout)
+        Ok(self.core.clock().now().saturating_duration_since(started) >= self.delivery_timeout)
     }
 
     /// `Err` once the feed stopped or latched.
@@ -360,7 +361,7 @@ impl Gate {
     /// on `partition`.
     fn check(&self, started: Instant, partition: i32) -> Result<(), Halt> {
         self.ended()?;
-        if started.elapsed() >= self.delivery_timeout {
+        if self.core.clock().now().saturating_duration_since(started) >= self.delivery_timeout {
             let read_to = attempt::lock(&self.core.ledger).read_to(partition);
             return Err(Halt::Behind(format!(
                 "the attempt follower did not catch up on `{}` partition {partition} within \
@@ -450,6 +451,7 @@ pub(crate) fn admission(core: &Core, entry: Gating) -> Option<Write> {
             count + 1,
             entry.receipt,
             entry.unit,
+            &**core.clock(),
         )));
     }
     st.admitting = st.admitting.saturating_sub(1);
@@ -473,16 +475,18 @@ pub(crate) fn admission(core: &Core, entry: Gating) -> Option<Write> {
         Some(entry.unit.id.clone()),
         count,
         Finish::Tombstone(entry.identity),
+        &**core.clock(),
     )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feed::FeedRole;
     use crate::feed::config::KafkaFeedConfig;
-    use crate::feed::producer::FeedProducerContext;
-    use rdkafka::config::FromClientConfigAndContext;
+    use crate::feed::producer::FeedProducerHooks;
     use rdkafka::error::RDKafkaErrorCode as C;
+    use spate_core::clock::SyncClock;
     use std::num::NonZeroU32;
     use std::sync::mpsc;
 
@@ -499,12 +503,14 @@ mod tests {
         .unwrap();
         let config = KafkaFeedConfig::from_section(&section).unwrap();
         for how in ["stopped", "latched"] {
-            let core = Arc::new(Core::new(&config, NonZeroU32::MIN));
-            let producer = Producer::from_config_and_context(
-                &config.producer_config(false),
-                FeedProducerContext::new(Arc::clone(&core)),
-            )
-            .unwrap();
+            let core = Arc::new(Core::new(&config, NonZeroU32::MIN, SyncClock::system()));
+            let producer = config
+                .base(false)
+                .create::<Producer, _>(
+                    &config.client(FeedRole::Producer),
+                    FeedProducerHooks::new(Arc::clone(&core)),
+                )
+                .unwrap();
             let gate = Gate::new(Arc::clone(&core), producer, config.delivery_timeout)
                 .with_step(Duration::from_secs(3600));
             if how == "stopped" {
@@ -536,12 +542,14 @@ mod tests {
         )
         .unwrap();
         let config = KafkaFeedConfig::from_section(&section).unwrap();
-        let core = Arc::new(Core::new(&config, NonZeroU32::MIN));
-        let producer = Producer::from_config_and_context(
-            &config.producer_config(false),
-            FeedProducerContext::new(Arc::clone(&core)),
-        )
-        .unwrap();
+        let core = Arc::new(Core::new(&config, NonZeroU32::MIN, SyncClock::system()));
+        let producer = config
+            .base(false)
+            .create::<Producer, _>(
+                &config.client(FeedRole::Producer),
+                FeedProducerHooks::new(Arc::clone(&core)),
+            )
+            .unwrap();
         let gate = Gate::new(Arc::clone(&core), producer, config.delivery_timeout);
 
         let halt = gate.watermark_error(0, &KafkaError::MetadataFetch(C::OperationTimedOut));

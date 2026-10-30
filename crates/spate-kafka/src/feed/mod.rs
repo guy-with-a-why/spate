@@ -54,20 +54,18 @@ mod startup;
 mod tests;
 mod write;
 
+pub(crate) use config::{FeedRole, KafkaFeedConfig};
 pub use error::KafkaFeedError;
 pub use publisher::KafkaFeedPublisher;
 
-use crate::context::SourceContext;
-use crate::error::redacted_client_error;
+use crate::context::SourceHooks;
 use attempt::{Follower, Ledger, PublishId, SharedLedger};
-use config::{BACKEND, KafkaFeedConfig};
+use config::BACKEND;
 use consumer::Driver;
 use inflight::Tracker;
-use producer::FeedProducerContext;
-use rdkafka::admin::AdminClient;
-use rdkafka::config::{FromClientConfig, FromClientConfigAndContext};
+use producer::FeedProducerHooks;
 use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::producer::ThreadedProducer;
+use spate_core::clock::SyncClock;
 use spate_core::config::FeedSection;
 use spate_core::feed::{
     Confirmation, Confirmer, Delivery, DepthOf, DepthReading, DepthReporter, Feed, FeedError,
@@ -233,6 +231,9 @@ pub(crate) struct Core {
     attempt_partitions: NonZeroU32,
     /// The attempt counts the follower reads and the gate answers from.
     ledger: SharedLedger,
+    /// The clock the feed's timed reads take: the commit cadence, resend due
+    /// times, the gate's pass bound and the durations it logs.
+    clock: SyncClock,
     /// How many watermark calls the gate has begun, counted just before
     /// each `fetch_watermarks` and each `list_offset`.
     #[cfg(test)]
@@ -240,7 +241,7 @@ pub(crate) struct Core {
 }
 
 impl Core {
-    fn new(config: &KafkaFeedConfig, attempt_partitions: NonZeroU32) -> Core {
+    fn new(config: &KafkaFeedConfig, attempt_partitions: NonZeroU32, clock: SyncClock) -> Core {
         Core {
             state: Mutex::new(State::default()),
             gate_wake: Condvar::new(),
@@ -249,6 +250,7 @@ impl Core {
             attempt_cap: config.attempt_cap,
             attempt_partitions,
             ledger: Arc::new((Mutex::new(Ledger::new(attempt_partitions)), Condvar::new())),
+            clock,
             #[cfg(test)]
             gate_reads: AtomicUsize::new(0),
         }
@@ -256,6 +258,10 @@ impl Core {
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn clock(&self) -> &SyncClock {
+        &self.clock
     }
 
     pub(crate) fn topics(&self) -> &Topics {
@@ -329,17 +335,17 @@ impl Core {
                         // Queued for the consumer thread to send: `Core`
                         // holds no producer, since the producer's context
                         // holds `Core`.
+                        let due = self.clock.now();
                         let mut st = self.lock();
                         if st.fatal.is_none() && !self.stopped() {
-                            st.resends
-                                .push((Instant::now(), Write::Tombstone(tombstone)));
+                            st.resends.push((due, Write::Tombstone(tombstone)));
                         }
                     }
                 }
-                events::moved(&moving);
+                events::moved(&moving, &*self.clock);
             }
             Write::Attempt(attempt) => {
-                events::attempt_written(attempt.started.elapsed());
+                events::attempt_written(attempt.started.elapsed(&*self.clock));
                 let mut st = self.lock();
                 st.admitting = st.admitting.saturating_sub(1);
                 // `None` when the partition was given up or the copy was
@@ -399,11 +405,12 @@ impl Core {
                     "writing {} failed; sending it again",
                     write.what()
                 );
+                let due = self.clock.now() + retry_in;
                 let mut st = self.lock();
                 // A resent attempt write keeps its share of `admitting`
                 // until it settles or `take_due` drops it.
                 if st.fatal.is_none() && !self.stopped() {
-                    st.resends.push((Instant::now() + retry_in, write));
+                    st.resends.push((due, write));
                 }
             }
         }
@@ -527,7 +534,13 @@ impl KafkaFeed {
         section: &FeedSection,
         io: &tokio::runtime::Handle,
     ) -> Result<KafkaFeed, KafkaFeedError> {
-        Self::connect_with(section, io, startup::Scope::All, startup::CONNECT_BOUND)
+        Self::connect_with(
+            section,
+            io,
+            startup::Scope::All,
+            startup::CONNECT_BOUND,
+            SyncClock::system(),
+        )
     }
 
     /// [`connect`](Self::connect) with only the checks that the topics
@@ -548,6 +561,34 @@ impl KafkaFeed {
             io,
             startup::Scope::Existence,
             startup::CONNECT_BOUND,
+            SyncClock::system(),
+        )
+    }
+
+    /// [`connect_without_config_checks`](Self::connect_without_config_checks)
+    /// with the feed's timed reads on `clock`: the connect bound, the commit
+    /// cadence, resend due times, the gate's pass bound and the durations it
+    /// logs.
+    ///
+    /// librdkafka's timers stay on real time. A clock that does not move
+    /// never ends the connect checks at the bound.
+    ///
+    /// # Errors
+    ///
+    /// As [`connect_without_config_checks`](Self::connect_without_config_checks).
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn connect_without_config_checks_on(
+        section: &FeedSection,
+        io: &tokio::runtime::Handle,
+        clock: spate_core::clock::SharedClock,
+    ) -> Result<KafkaFeed, KafkaFeedError> {
+        Self::connect_with(
+            section,
+            io,
+            startup::Scope::Existence,
+            startup::CONNECT_BOUND,
+            SyncClock::new(clock),
         )
     }
 
@@ -556,10 +597,11 @@ impl KafkaFeed {
         io: &tokio::runtime::Handle,
         scope: startup::Scope,
         bound: Duration,
+        clock: SyncClock,
     ) -> Result<KafkaFeed, KafkaFeedError> {
         let config = KafkaFeedConfig::from_section(section)?;
-        let checked = check_topics(&config, io, scope, bound)?;
-        let (core, producer, driver) = parts(&config, checked.attempt_partitions)?;
+        let checked = check_topics(&config, io, scope, bound, clock.clone())?;
+        let (core, producer, driver) = parts(&config, checked.attempt_partitions, clock)?;
         let follower = Follower::new(&config, Arc::clone(&core))?
             .spawn()
             .map_err(|e| {
@@ -610,16 +652,12 @@ fn start_depth(
     let openssl_env = crate::security::openssl_env_overrides();
     // The feed's group, never subscribed: it reads the group's committed
     // offsets without joining the group.
-    let consumer = BaseConsumer::from_config_and_context(
-        &config.depth_config(openssl_env),
-        SourceContext::default(),
-    )
-    .map_err(|e| {
-        KafkaFeedError::Refused(format!(
-            "creating the depth reader: {}",
-            redacted_client_error(&e)
-        ))
-    })?;
+    let consumer = config
+        .base(openssl_env)
+        .create(&config.client(FeedRole::Depth), SourceHooks::default())
+        .map_err(|reason| {
+            KafkaFeedError::Refused(format!("creating the depth reader: {reason}"))
+        })?;
     let (tx, rx) = mpsc::channel();
     let core = Arc::clone(core);
     std::thread::Builder::new()
@@ -656,32 +694,30 @@ fn log_started(config: &KafkaFeedConfig, checked: &startup::Checked) {
 }
 
 /// Run the startup checks over the topics `config` names, on the runtime
-/// `io`, under `bound`, with the rejection watch over the checking clients,
-/// which are dropped when it returns.
+/// `io`, under `bound` on `clock`, with the rejection watch over the checking
+/// clients, which are dropped when it returns.
 fn check_topics(
     config: &KafkaFeedConfig,
     io: &tokio::runtime::Handle,
     scope: startup::Scope,
     bound: Duration,
+    clock: SyncClock,
 ) -> Result<startup::Checked, KafkaFeedError> {
     let openssl_env = crate::security::openssl_env_overrides();
-    let admin_config = config.admin_config(openssl_env);
-    let admin = AdminClient::from_config(&admin_config).map_err(|e| {
-        KafkaFeedError::Refused(format!(
-            "creating the admin client: {}",
-            redacted_client_error(&e)
-        ))
-    })?;
-    let reader = ThreadedProducer::from_config_and_context(
-        &admin_config,
-        crate::sink::SinkContext::detached(crate::clock::SyncClock::system()),
-    )
-    .map_err(|e| {
-        KafkaFeedError::Refused(format!(
-            "creating the metadata client: {}",
-            redacted_client_error(&e)
-        ))
-    })?;
+    let base = config.base(openssl_env);
+    let admin = base
+        .create(&config.client(FeedRole::Admin), ())
+        .map_err(|reason| {
+            KafkaFeedError::Refused(format!("creating the admin client: {reason}"))
+        })?;
+    let reader = base
+        .create(
+            &config.client(FeedRole::Reader),
+            crate::sink::SinkHooks::detached(clock.clone()),
+        )
+        .map_err(|reason| {
+            KafkaFeedError::Refused(format!("creating the metadata client: {reason}"))
+        })?;
     let topics = Topics::new(config);
     let step = Mutex::new("starting".to_owned());
     let admin = Arc::new(startup::Brokers::new(admin, reader));
@@ -689,6 +725,7 @@ fn check_topics(
     io.block_on(startup::bounded(
         &step,
         bound,
+        clock,
         move || watched.rejection(),
         startup::check(&*admin, &topics, scope, &step),
     ))
@@ -699,19 +736,17 @@ fn check_topics(
 fn producer_parts(
     config: &KafkaFeedConfig,
     attempt_partitions: NonZeroU32,
+    clock: SyncClock,
 ) -> Result<(Arc<Core>, Producer), KafkaFeedError> {
     let openssl_env = crate::security::openssl_env_overrides();
-    let core = Arc::new(Core::new(config, attempt_partitions));
-    let producer = Producer::from_config_and_context(
-        &config.producer_config(openssl_env),
-        FeedProducerContext::new(Arc::clone(&core)),
-    )
-    .map_err(|e| {
-        KafkaFeedError::Refused(format!(
-            "creating the producer: {}",
-            redacted_client_error(&e)
-        ))
-    })?;
+    let core = Arc::new(Core::new(config, attempt_partitions, clock));
+    let producer = config
+        .base(openssl_env)
+        .create(
+            &config.client(FeedRole::Producer),
+            FeedProducerHooks::new(Arc::clone(&core)),
+        )
+        .map_err(|reason| KafkaFeedError::Refused(format!("creating the producer: {reason}")))?;
     Ok((core, producer))
 }
 
@@ -721,20 +756,16 @@ fn producer_parts(
 fn parts(
     config: &KafkaFeedConfig,
     attempt_partitions: NonZeroU32,
+    clock: SyncClock,
 ) -> Result<(Arc<Core>, Producer, Driver), KafkaFeedError> {
     let openssl_env = crate::security::openssl_env_overrides();
-    let (core, producer) = producer_parts(config, attempt_partitions)?;
-    let consumer_config = config.consumer_config(openssl_env);
-    let lookup_timeout = consumer::committed_lookup_timeout(&consumer_config);
-    let consumer =
-        BaseConsumer::from_config_and_context(&consumer_config, SourceContext::default()).map_err(
-            |e| {
-                KafkaFeedError::Refused(format!(
-                    "creating the consumer: {}",
-                    redacted_client_error(&e)
-                ))
-            },
-        )?;
+    let (core, producer) = producer_parts(config, attempt_partitions, clock)?;
+    let base = config.base(openssl_env);
+    let role = config.client(FeedRole::Consumer);
+    let lookup_timeout = consumer::committed_lookup_timeout(&base.config(&role));
+    let consumer: BaseConsumer<crate::context::SourceContext> = base
+        .create(&role, SourceHooks::default())
+        .map_err(|reason| KafkaFeedError::Refused(format!("creating the consumer: {reason}")))?;
     consumer
         .subscribe(&[&config.topic, &config.retry_topic])
         .map_err(|e| KafkaFeedError::Refused(format!("subscribing: {e}")))?;
@@ -900,6 +931,7 @@ impl Feed for KafkaFeed {
                 Some(handed.unit.id),
                 handed.deliveries,
                 finish,
+                &**self.core.clock(),
             )
         };
         match moving.to {

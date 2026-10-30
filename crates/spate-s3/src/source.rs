@@ -77,7 +77,8 @@ pub struct S3Source {
     /// A location store injected via the `testing`-gated
     /// `with_location_store` seam.
     location_store: Option<Arc<dyn ObjectStore>>,
-    /// Times the wait for the job fingerprint and the end check.
+    /// Times the wait for the job fingerprint, the end check and the lanes'
+    /// receive deadline.
     clock: Arc<dyn Clock>,
     /// The `feed:` section's settling window, or its default.
     settling_window: Duration,
@@ -220,8 +221,13 @@ impl S3Source {
         self
     }
 
-    /// Test seam: time the wait for the job fingerprint and the end check on
-    /// `clock`.
+    /// Test seam: time the wait for the job fingerprint, the end check and
+    /// the lanes' receive deadline on `clock`.
+    ///
+    /// An idle lane waits on `clock` until a chunk arrives, its channel
+    /// closes or `clock` reaches the poll's deadline. On a clock that does not
+    /// move, a lane whose read sends nothing holds its pipeline thread, so a
+    /// test that stops such a run advances `clock` until it exits.
     ///
     /// Behind the off-by-default `testing` feature, outside the semver
     /// surface.
@@ -677,6 +683,7 @@ impl Source for S3Source {
         let parts = LaneParts {
             store,
             handle: self.handle.clone(),
+            clock: Arc::clone(&self.clock),
             issuer: ctx.issuer,
             make_framer,
             packing: Packing {
