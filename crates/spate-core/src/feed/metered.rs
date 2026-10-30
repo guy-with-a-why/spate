@@ -226,7 +226,7 @@ mod tests {
         counts: bool,
         // Moved by each renewal and publish, so a test can see what the call
         // took.
-        call_takes: Mutex<Option<(Arc<TestClock>, Duration)>>
+        call_takes: Mutex<Option<(Arc<TestClock>, Duration)>>,
     }
 
     impl Fake {
