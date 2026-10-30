@@ -165,8 +165,9 @@ mod tests {
         refusals: Mutex<VecDeque<FeedErrorKind>>,
         deliveries: Mutex<Vec<Delivery>>,
         confirmers: Mutex<Vec<Confirmer>>,
-        // Moved by each renewal, so a test can see what the call took.
-        renew_takes: Mutex<Option<(Arc<TestClock>, Duration)>>,
+        // Moved by each renewal and publish, so a test can see what the call
+        // took.
+        call_takes: Mutex<Option<(Arc<TestClock>, Duration)>>,
     }
 
     impl Fake {
@@ -193,6 +194,12 @@ mod tests {
             );
         }
 
+        fn take_time(&self) {
+            if let Some((clock, by)) = &*self.call_takes.lock().unwrap() {
+                clock.advance(*by);
+            }
+        }
+
         fn take_confirmer(&self) -> Confirmer {
             self.confirmers.lock().unwrap().remove(0)
         }
@@ -215,9 +222,7 @@ mod tests {
 
         fn renew(&self, receipt: Receipt) -> Result<(), FeedError> {
             self.log(format!("renew {}", receipt.0));
-            if let Some((clock, by)) = &*self.renew_takes.lock().unwrap() {
-                clock.advance(*by);
-            }
+            self.take_time();
             self.answer()
         }
 
@@ -233,6 +238,7 @@ mod tests {
 
         fn publish(&self, unit: Unit) -> Confirmation {
             self.log(format!("publish {}", unit.id));
+            self.take_time();
             let (confirmer, confirmation) = confirmation();
             self.confirmers.lock().unwrap().push(confirmer);
             confirmation
@@ -456,7 +462,7 @@ mod tests {
     #[test]
     fn every_call_is_timed_under_its_op() {
         let rig = Rig::new("metered-timed");
-        *rig.fake.renew_takes.lock().unwrap() =
+        *rig.fake.call_takes.lock().unwrap() =
             Some((Arc::clone(&rig.clock), Duration::from_millis(2)));
         rig.feed.receive(1).unwrap();
         rig.feed.receive(1).unwrap();
@@ -470,10 +476,14 @@ mod tests {
         for op in ["renew", "acknowledge", "fail", "hand_back", "publish"] {
             assert_eq!(rig.calls_timed(op), 1.0, "{op}");
         }
-        assert_eq!(
-            rig.value("spate_feed_call_duration_seconds_sum", ",op=\"renew\""),
-            Some(0.002)
-        );
+        for op in ["renew", "publish"] {
+            let extra = format!(",op=\"{op}\"");
+            assert_eq!(
+                rig.value("spate_feed_call_duration_seconds_sum", &extra),
+                Some(0.002),
+                "{op}"
+            );
+        }
         assert_eq!(rig.counter("spate_feed_units_published_total"), 0.0);
     }
 
