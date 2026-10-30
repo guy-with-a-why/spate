@@ -345,11 +345,11 @@ pub const RESERVED_ROOTS: &[&str] = &[
 pub const CUSTOM_NAMESPACE: &str = "custom";
 
 /// The role segments the runtime injects between a component's namespace and
-/// its metric names (`spate_<ns>_source_*` / `_sink_*`) to separate a connector's
-/// source and sink families. Reserved as the leading segment of a `Meter` local
-/// name, so a hand-written `source_`/`sink_` name cannot alias a role-scoped
+/// its metric names (`spate_<ns>_source_*`, `_sink_*`, `_feed_*`) to separate a
+/// connector's families by role. Reserved as the leading segment of a `Meter`
+/// local name, so a hand-written name with one cannot alias a role-scoped
 /// family. Must stay in sync with `MetricRole::segment`.
-pub const ROLE_SEGMENTS: &[&str] = &["source", "sink"];
+pub const ROLE_SEGMENTS: &[&str] = &["source", "sink", "feed"];
 
 #[cfg(test)]
 mod tests {

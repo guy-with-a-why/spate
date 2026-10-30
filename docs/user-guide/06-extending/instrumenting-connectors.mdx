@@ -180,10 +180,10 @@ component's `Meter` it derives the end from the source-vs-sink position and
 scopes the family `spate_<namespace>_source_*` / `spate_<namespace>_sink_*`, so
 its source `bytes_total` and its sink `bytes_total` land under distinct names.
 Your connector code is identical at either end. You never name the role, and a
-`Meter` local name may not itself begin with a role segment (`source_` /
-`sink_`), which is reserved for this scoping. Instance identity, such as two
-sinks of the same type, stays in the `component` label, where same-meaning
-series belong.
+`Meter` local name may not itself begin with a role segment, such as `source_`
+or `feed_`, which the runtime reserves for scoping a component by role.
+Instance identity, such as two sinks of the same type, stays in the `component`
+label, where same-meaning series belong.
 
 ### From a pipeline author's operators
 
@@ -286,11 +286,11 @@ it. Distinct labels per test avoid the collision entirely, and
 `spate_test::unique_name("orders_in")` returns a name no other call in the
 process returns.
 
-## From a built-in source or sink
+## From a built-in source, sink or feed backend
 
-A `Meter` you construct with `Meter::new(...)`, or take from `ChainCtx`,
-covers pipeline authors. A **built-in `Source` or sink `ShardWriter`** doesn't
-construct one: the runtime hands it a pre-scoped `Meter` at construction, so a
+A `Meter` you construct with `Meter::new(...)`, or take from `ChainCtx`, covers
+pipeline authors. A **built-in `Source`, sink `ShardWriter` or `Feed` backend**
+doesn't construct one: the runtime hands it a pre-scoped `Meter`, so a
 connector never wires the pipeline name, the labels, or the prefix.
 
 - **Declare a `component_type`.** A source overrides
@@ -308,10 +308,18 @@ connector never wires the pipeline name, the labels, or the prefix.
   `spate_<namespace>_source_*` and its sink families under
   `spate_<namespace>_sink_*`, under distinct names. The connector's code is
   identical at either end.
+- **A feed backend** overrides
+  [`Feed::attach_metrics`](../07-reference/README.mdx), which the runtime calls
+  before it hands the feed to the source. Its namespace is its `Feed::backend`
+  key, and its families land under `spate_<backend>_feed_*` with
+  `component="feed"`, beside the framework's own `spate_feed_*` families for the
+  same feed. The backend's own tasks and calls go without the `Meter` until it
+  arrives, and a feed handed to a source directly never receives one, so treat
+  the handles as optional.
 
-Both methods together are a shape rather than a program: the `impl Source for`
-header is left out and the rest of `open` is elided at the `// ...`, so this
-fence is written to be read rather than compiled.
+The source's two methods below are a shape rather than a program: the
+`impl Source for` header is left out and the rest of `open` is elided at the
+`// ...`, so this fence is written to be read rather than compiled.
 
 ```rust
 // A source, in open():
@@ -334,7 +342,8 @@ root (an undeclared source keeps `"source"`) or the author-reserved `"custom"`
 (a sink's default) opts out silently, and a value that is a legal label but an
 illegal metric-name segment (a hyphen, say) is logged at `warn` and
 also yields `None`. A component gets a scope only once it declares a
-distinct, well-formed `component_type`.
+distinct, well-formed `component_type`. A feed backend's `Meter` follows the
+same rule over its `Feed::backend` key.
 
 Worked reference for the full production shape, including lazily-registered
 per-endpoint series and detail-gated per-partition series:

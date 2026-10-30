@@ -852,7 +852,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "role segment")]
     fn custom_meter_rejects_role_prefixed_local_name() {
-        // `sink_`/`source_` are reserved to the runtime's role scoping, so a
+        // A role segment is reserved to the runtime's role scoping, so a
         // hand-written name starting with one can't alias a role-scoped family.
         let _ = Meter::new("p", "c", "t").counter("sink_writes_total", &[]);
     }
@@ -888,6 +888,58 @@ mod tests {
         assert!(rendered.contains(
             r#"spate_clickhouse_sink_bytes_total{pipeline="orders",component="orders_out",component_type="clickhouse"} 20"#
         ));
+    }
+
+    /// `feed_` is reserved to the feed role's scoping in the pipeline-author
+    /// `custom` namespace.
+    #[test]
+    #[should_panic(expected = "the role segment `feed_`")]
+    fn a_local_name_may_not_lead_with_the_feed_role() {
+        let _ = Meter::new("p", "c", "t").counter("feed_items_total", &[]);
+    }
+
+    /// Pins the `# Panics` section of `counter`, `gauge` and `histogram`, in a
+    /// namespace of each kind.
+    #[test]
+    fn every_handle_refuses_what_its_panics_section_names() {
+        type Extra = [(&'static str, SharedString)];
+        let shadowed: [(&'static str, SharedString); 1] = [("component", "x".into())];
+        let repeated: [(&'static str, SharedString); 2] = [("k", "a".into()), ("k", "b".into())];
+        let mut cases: Vec<(String, &Extra, &str)> = vec![
+            ("spate_items".to_owned(), &[], "without the `spate_` prefix"),
+            ("items".to_owned(), &shadowed, "shadows a standard label"),
+            ("items".to_owned(), &repeated, "is repeated"),
+        ];
+        for segment in names::ROLE_SEGMENTS {
+            cases.push((format!("{segment}_items"), &[], "role segment"));
+        }
+        let panics_with = |register: &dyn Fn(), expected: &str| {
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(register))
+                .expect_err("the refusal panics");
+            let message = payload
+                .downcast_ref::<String>()
+                .expect("a formatted message");
+            assert!(message.contains(expected), "{message}");
+        };
+        let meters = [
+            Meter::new("p", "c", "t"),
+            Meter::with_namespace("connector", "p", "c", "t"),
+            Meter::for_component("connector", MetricRole::Feed, "p", "c").expect("scopes a family"),
+        ];
+        for meter in &meters {
+            for (name, extra, expected) in &cases {
+                panics_with(&|| drop(meter.counter(name, extra)), expected);
+                panics_with(&|| drop(meter.gauge(name, extra)), expected);
+                panics_with(&|| drop(meter.histogram(name, extra)), expected);
+            }
+        }
+    }
+
+    /// Only a whole leading segment is reserved, so a name that merely begins
+    /// with a role's letters registers.
+    #[test]
+    fn a_local_name_may_begin_with_the_letters_of_a_role() {
+        let _ = Meter::new("p", "c", "t").counter("feedback_total", &[]);
     }
 
     #[test]

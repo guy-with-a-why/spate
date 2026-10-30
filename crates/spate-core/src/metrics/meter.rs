@@ -24,11 +24,10 @@
 //! - [`Meter::new`] uses the `custom` namespace → `spate_custom_*`. This is the
 //!   bucket for pipeline-author metrics.
 //! - [`Meter::with_namespace`] takes a segment a connector owns (`"kafka"` →
-//!   `spate_kafka_*`). A connector that can appear at both ends of a pipeline (a
-//!   Kafka source *and* a future Kafka sink) is separated by the runtime into
-//!   `spate_kafka_source_*` / `spate_kafka_sink_*` when it injects the
-//!   component's `Meter`. The role is derived from the source-vs-sink
-//!   position, not set by hand.
+//!   `spate_kafka_*`). The runtime keeps a connector's roles apart when it
+//!   injects a component's `Meter`, under `spate_kafka_source_*`,
+//!   `spate_kafka_sink_*` and `spate_kafka_feed_*`. The role is derived from
+//!   the wiring position, not set by hand.
 //!
 //! The namespace is validated once, at construction. It must be a lowercase
 //! `[a-z][a-z0-9_]*` segment and must not be one of the framework's reserved
@@ -40,6 +39,8 @@
 //!   [`ChainCtx::meter`](crate::pipeline::ChainCtx::meter) (the `custom`
 //!   namespace) and close the resolved handle over an operator closure
 //!   (`.inspect` / `.map`).
+//! - **A source, sink or feed backend** receives one from the runtime, scoped
+//!   by its role.
 //! - **Standalone** (a tool, a test, an example) constructs one with
 //!   [`Meter::new`] / [`Meter::with_namespace`].
 //!
@@ -56,15 +57,17 @@
 use super::labels::{ComponentLabels, NamespaceRejection, classify_namespace, validate_namespace};
 use metrics::{Counter, Gauge, Histogram, SharedString};
 
-/// Which end of the pipeline a component sits at, appended to its namespace so
-/// a connector that can be both a source and a sink keeps its families apart
-/// (`spate_kafka_source_*` vs `spate_kafka_sink_*`). The runtime derives it
-/// from the wiring position when it builds a component's
-/// [`Meter`](Meter::for_component), so connector code never names a role.
+/// The part a component plays in the pipeline, appended to its namespace so a
+/// connector that is a source, a sink and a feed backend keeps its families
+/// apart (`spate_kafka_source_*`, `spate_kafka_sink_*`, `spate_kafka_feed_*`).
+/// The runtime derives it from the wiring position when it builds a
+/// component's [`Meter`](Meter::for_component), so connector code never names
+/// a role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MetricRole {
     Source,
     Sink,
+    Feed,
 }
 
 impl MetricRole {
@@ -72,6 +75,7 @@ impl MetricRole {
         match self {
             MetricRole::Source => "source",
             MetricRole::Sink => "sink",
+            MetricRole::Feed => "feed",
         }
     }
 }
@@ -141,8 +145,9 @@ impl Meter {
         }
     }
 
-    /// The scope the runtime hands a built-in component (a `Source` or a sink
-    /// `ShardWriter`). The namespace is the component's `component_type`, and
+    /// The scope the runtime hands a built-in component (a `Source`, a sink
+    /// `ShardWriter` or a `Feed` backend). The namespace is the component's
+    /// `component_type`, which for a feed backend is its `Feed::backend` key, and
     /// `role` (derived from the wiring position) is appended, giving
     /// `spate_<component_type>_<role>_*`. The `component_type` is also the
     /// standard `component_type` label, so a family joins the component's stage
@@ -215,16 +220,16 @@ impl Meter {
             super::names::PREFIX,
             self.prefix
         );
-        // A local name may not lead with a role segment (`source_`/`sink_`).
-        // The runtime injects those to separate a connector's source and sink
-        // families (`spate_<ns>_source_*` / `_sink_*`), so a hand-written
-        // `source_`/`sink_` name could otherwise alias a role-scoped family.
+        // A local name may not lead with a role segment. The runtime injects
+        // one between the namespace and the name (`spate_<ns>_<role>_*`), so a
+        // hand-written name leading with one could alias a role-scoped family.
         let first = name.split('_').next().unwrap_or_default();
         assert!(
             !super::names::ROLE_SEGMENTS.contains(&first),
             "metric local name `{name}` must not begin with the role segment \
-             `{first}_`; the runtime reserves `source_`/`sink_` to scope a \
-             component's source vs sink families"
+             `{first}_`; the runtime reserves {:?} to scope a component's families \
+             by role",
+            super::names::ROLE_SEGMENTS
         );
         format!("{}{name}", self.prefix).into()
     }
@@ -237,12 +242,28 @@ impl Meter {
     /// Follow the taxonomy rules: `_total` suffix on counters, and push
     /// per-instance identity (a topic, a shard) into `extra` labels rather
     /// than the name, keeping the name low-cardinality.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` starts with `spate_`, or if its first `_`-separated
+    /// segment is a role segment in
+    /// [`ROLE_SEGMENTS`](super::names::ROLE_SEGMENTS) (`source`, `sink`,
+    /// `feed`), in every namespace. Panics if `extra` shadows a standard label
+    /// or repeats a key.
     pub fn counter(&self, name: &str, extra: &[(&'static str, SharedString)]) -> Counter {
         self.labels.register_counter(self.qualify(name), extra)
     }
 
     /// Resolve a gauge under this scope (local name, auto-prefixed).
     /// Build-time only.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` starts with `spate_`, or if its first `_`-separated
+    /// segment is a role segment in
+    /// [`ROLE_SEGMENTS`](super::names::ROLE_SEGMENTS) (`source`, `sink`,
+    /// `feed`), in every namespace. Panics if `extra` shadows a standard label
+    /// or repeats a key.
     pub fn gauge(&self, name: &str, extra: &[(&'static str, SharedString)]) -> Gauge {
         self.labels.register_gauge(self.qualify(name), extra)
     }
@@ -250,6 +271,14 @@ impl Meter {
     /// Resolve a histogram under this scope (local name, auto-prefixed).
     /// Build-time only. Give it a unit suffix (`_seconds` / `_bytes` /
     /// `_rows`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` starts with `spate_`, or if its first `_`-separated
+    /// segment is a role segment in
+    /// [`ROLE_SEGMENTS`](super::names::ROLE_SEGMENTS) (`source`, `sink`,
+    /// `feed`), in every namespace. Panics if `extra` shadows a standard label
+    /// or repeats a key.
     pub fn histogram(&self, name: &str, extra: &[(&'static str, SharedString)]) -> Histogram {
         self.labels.register_histogram(self.qualify(name), extra)
     }
@@ -260,5 +289,26 @@ impl Meter {
     #[must_use]
     pub fn labels(&self) -> &ComponentLabels {
         &self.labels
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use crate::metrics::names::ROLE_SEGMENTS;
+
+    /// Pins that every role's segment is reserved as a local name's lead.
+    #[test]
+    fn every_role_segment_is_reserved() {
+        let roles = [MetricRole::Source, MetricRole::Sink, MetricRole::Feed];
+        for role in roles {
+            // No wildcard arm, so a new role fails to compile here until it
+            // joins `roles`.
+            match role {
+                MetricRole::Source | MetricRole::Sink | MetricRole::Feed => {}
+            }
+        }
+        let segments: Vec<&str> = roles.into_iter().map(MetricRole::segment).collect();
+        assert_eq!(segments, ROLE_SEGMENTS);
     }
 }

@@ -70,6 +70,7 @@
 //! return through redelivery.
 
 use crate::error::ErrorClass;
+use crate::metrics::Meter;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -260,6 +261,21 @@ pub trait Feed: Send + Sync {
     /// `receive` that takes nothing sends no signal. Called before the first
     /// `receive`; a later call replaces the waker.
     fn set_waker(&self, waker: FeedWaker);
+
+    /// Receive a [`Meter`] scoped `spate_<backend>_feed_*` for the backend's
+    /// own metric families, pre-labeled with the pipeline, `component="feed"`
+    /// and the [`backend`](Feed::backend) key as `component_type`. Called
+    /// before the source is handed the feed, once for each pipeline that runs
+    /// it, with that pipeline's labels. Resolve handles here and keep them,
+    /// which `&self` leaves to interior mutability.
+    ///
+    /// The backend's own tasks until this call, the calls made before it, and
+    /// a feed the runtime is not given all go without a `Meter`, so treat the
+    /// handles as optional wherever they are used. `None` when the backend key
+    /// cannot scope a family: a reserved root or `custom` opts out silently,
+    /// and a malformed key is logged and also yields `None`. The default
+    /// ignores it.
+    fn attach_metrics(&self, _meter: Option<Meter>) {}
 
     /// Up to `max` deliveries the backend has buffered, oldest first. Never
     /// waits; returns an empty list when nothing is ready.

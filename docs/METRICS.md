@@ -21,9 +21,10 @@ never be one of the framework's reserved stage roots (`source`, `deser`,
 `feed`, `e2e`, `pipeline`), so custom families cannot collide with a framework
 metric. A built-in source or sink receives its `Meter` from the runtime, scoped
 by its declared `component_type` and its role (`spate_<component_type>_source_*`
-/ `_sink_*`), so a connector that is both a source and a sink keeps its families
-apart. Dropping to the raw `metrics` macros is the escape hatch for a metric you
-deliberately want *outside* the `spate_` namespace. See
+/ `_sink_*`). A feed backend receives one scoped by its backend key
+(`spate_<backend>_feed_*`), so a connector that plays more than one role keeps
+its families apart. Dropping to the raw `metrics` macros is the escape hatch for
+a metric you deliberately want *outside* the `spate_` namespace. See
 [Instrumenting connectors](user-guide/06-extending/instrumenting-connectors.mdx).
 
 ## Conventions
