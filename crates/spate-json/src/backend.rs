@@ -27,8 +27,8 @@
 //! [`Buffers`]: https://docs.rs/simd-json
 
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, SeqAccess, Visitor};
+use spate_core::hash::QualitySet;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::fmt;
 
 /// Identifier of the compiled decode backend, surfaced for benchmark and
@@ -193,7 +193,9 @@ impl<'de> Visitor<'de> for DupVisitor {
     where
         A: MapAccess<'de>,
     {
-        let mut seen: HashSet<Cow<'de, str>> = HashSet::new();
+        // Payload keys are chosen by the producer, so the set takes the
+        // quality hasher, seeded afresh for each object.
+        let mut seen: QualitySet<Cow<'de, str>> = QualitySet::default();
         while let Some(Key(key)) = map.next_key::<Key<'de>>()? {
             if let Some(dup) = seen.replace(key) {
                 return Err(de::Error::custom(format!("duplicate object key `{dup}`")));
@@ -294,9 +296,9 @@ mod tests {
     fn duplicate_key_names_the_key() {
         let err = check_no_duplicate_keys(br#"{"id":1,"id":2}"#).unwrap_err();
         assert!(err.is_data, "{err}");
-        assert!(
-            err.to_string().starts_with("duplicate object key `id`"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "duplicate object key `id` at line 1 column 12"
         );
     }
 
