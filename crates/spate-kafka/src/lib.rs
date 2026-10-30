@@ -63,7 +63,7 @@
 //!
 //! [the metrics reference]: https://spate.kainth.dev/docs/METRICS
 
-mod clock;
+mod client;
 mod config;
 mod context;
 mod error;

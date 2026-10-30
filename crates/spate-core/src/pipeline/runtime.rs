@@ -453,8 +453,8 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             .map_err(|e| StartError::Metrics(e.to_string()))?,
         );
 
-        // Wrapped here rather than where it is resolved, because the feed's
-        // handles bind to the recorder installed above.
+        // The feed's handles bind to the recorder installed above, so the
+        // feed is wrapped after it.
         let kept_feed = match resolved_feed {
             Some((section, feed, origin)) => {
                 let metrics = FeedMetrics::try_new(&ComponentLabels::new(

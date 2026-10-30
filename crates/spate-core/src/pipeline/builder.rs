@@ -706,7 +706,8 @@ impl Pipeline {
 
     /// Hand the source a feed built in code, for the config's `feed:`
     /// section to name. `run` passes it to [`Source::configure_feed`] with
-    /// the section.
+    /// the section, wrapped so the source's calls on it are recorded under
+    /// `spate_feed_*`.
     ///
     /// The feed's [`backend`](Feed::backend) must equal the key the section
     /// names, and the config must have a `feed:` section; `run` fails at
@@ -719,6 +720,7 @@ impl Pipeline {
     /// builds the in-process feed itself for `feed: { memory: {} }` and
     /// refuses any other backend. To publish to
     /// the in-process feed, keep a handle to a `MemoryFeed` and pass it here.
+    /// Calls on a handle kept this way are not recorded.
     #[must_use]
     pub fn feed(mut self, feed: Arc<dyn Feed>) -> Self {
         self.feed = Some(feed);
