@@ -1,6 +1,6 @@
-//! The feed's depth reads, which a bounded job's end check takes: the lag
-//! of the feed's group on the work and retry topics, and whether the
-//! dead-letter topic has ever been written.
+//! The feed's depth reads: the lag of the feed's group on the work and retry
+//! topics, for a bounded job's end check, and the sum of the dead-letter
+//! topic's end offsets, for the end check and the runtime's dead-letter reads.
 //!
 //! The reads run on a thread of the feed's own, through a consumer that
 //! carries the feed's `group.id` and never subscribes, so no read runs on
