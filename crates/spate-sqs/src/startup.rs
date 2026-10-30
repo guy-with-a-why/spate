@@ -7,8 +7,8 @@
 //! first send and keeps that count when the message moves to the dead-letter
 //! queue, so a dead-letter queue that does not outlive the source can delete
 //! a unit as soon as it arrives. Both queues must report their message
-//! counts, which a bounded job's end check reads. The checks run once, at
-//! connect.
+//! counts. A bounded job's end check reads both, and the runtime reads the
+//! dead-letter queue's on every job. The checks run once, at connect.
 
 use crate::error::{CallError, Class, SqsError};
 use crate::queue::BoxFuture;

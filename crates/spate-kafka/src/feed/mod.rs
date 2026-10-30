@@ -5,10 +5,11 @@
 //! retry topics as a member of the feed's group. The follower thread reads
 //! the attempt topic into memory. The gate thread records each delivered
 //! unit's attempt before the unit reaches the reader. The depth thread
-//! answers a bounded job's depth reads. One producer writes
-//! publishes, attempt records and their tombstones, retries and dead
-//! letters. The [`Feed`] methods lock the shared state, change it, and hand
-//! any write to the producer, so none of them waits on I/O (INV-2).
+//! answers a bounded job's end check and the runtime's dead-letter reads.
+//! One producer writes publishes, attempt records and their tombstones,
+//! retries and dead letters. The [`Feed`] methods lock the shared state,
+//! change it, and hand any write to the producer, so none of them waits on
+//! I/O (INV-2).
 //!
 //! # Offsets
 //!

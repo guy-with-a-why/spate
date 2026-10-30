@@ -218,6 +218,9 @@ metric_names! {
         /// Deliveries the source holds: received and not yet acknowledged,
         /// failed, handed back or answered Gone.
         FEED_HELD_UNITS = "spate_feed_held_units",
+        /// Units in the feed's dead-letter destination at the last reading.
+        /// Absent until the first reading settles.
+        FEED_DEAD_LETTER_UNITS = "spate_feed_dead_letter_units",
 
 
         // Pipeline.
