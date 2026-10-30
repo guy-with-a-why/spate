@@ -2672,56 +2672,56 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     assert_eq!(report.state, ExitState::Completed);
 }
 
+/// The in-process feed, counting the dead-letter reads made on it.
+struct DeadLetterReads {
+    inner: MemoryFeed,
+    reads: Arc<AtomicUsize>,
+}
+
+impl crate::feed::Feed for DeadLetterReads {
+    fn backend(&self) -> &str {
+        self.inner.backend()
+    }
+    fn set_waker(&self, waker: crate::feed::FeedWaker) {
+        self.inner.set_waker(waker);
+    }
+    fn receive(&self, max: usize) -> Result<Vec<crate::feed::Delivery>, crate::feed::FeedError> {
+        self.inner.receive(max)
+    }
+    fn renew(&self, receipt: crate::feed::Receipt) -> Result<(), crate::feed::FeedError> {
+        self.inner.renew(receipt)
+    }
+    fn acknowledge(&self, receipt: crate::feed::Receipt) -> Result<(), crate::feed::FeedError> {
+        self.inner.acknowledge(receipt)
+    }
+    fn fail(
+        &self,
+        receipt: crate::feed::Receipt,
+        reason: &str,
+    ) -> Result<(), crate::feed::FeedError> {
+        self.inner.fail(receipt, reason)
+    }
+    fn publish(&self, unit: crate::feed::Unit) -> crate::feed::Confirmation {
+        self.inner.publish(unit)
+    }
+    fn read_depth(&self, of: crate::feed::DepthOf) -> Option<crate::feed::DepthReading> {
+        if of == crate::feed::DepthOf::DeadLetters {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.read_depth(of)
+    }
+}
+
 /// Pins that the runtime reads the feed's dead-letter depth once at startup
 /// by default, and makes no such read when `dead_letter_read_interval` is
 /// `None`.
 #[test]
 fn the_runtime_reads_dead_letters_only_on_its_interval() {
-    use crate::feed::{
-        Confirmation, Delivery, DepthOf, DepthReading, Feed, FeedError, FeedWaker, Receipt, Unit,
-    };
-
-    /// The in-process feed, counting the dead-letter reads made on it.
-    struct Counting {
-        inner: MemoryFeed,
-        reads: Arc<AtomicUsize>,
-    }
-
-    impl Feed for Counting {
-        fn backend(&self) -> &str {
-            self.inner.backend()
-        }
-        fn set_waker(&self, waker: FeedWaker) {
-            self.inner.set_waker(waker);
-        }
-        fn receive(&self, max: usize) -> Result<Vec<Delivery>, FeedError> {
-            self.inner.receive(max)
-        }
-        fn renew(&self, receipt: Receipt) -> Result<(), FeedError> {
-            self.inner.renew(receipt)
-        }
-        fn acknowledge(&self, receipt: Receipt) -> Result<(), FeedError> {
-            self.inner.acknowledge(receipt)
-        }
-        fn fail(&self, receipt: Receipt, reason: &str) -> Result<(), FeedError> {
-            self.inner.fail(receipt, reason)
-        }
-        fn publish(&self, unit: Unit) -> Confirmation {
-            self.inner.publish(unit)
-        }
-        fn read_depth(&self, of: DepthOf) -> Option<DepthReading> {
-            if of == DepthOf::DeadLetters {
-                self.reads.fetch_add(1, Ordering::Relaxed);
-            }
-            self.inner.read_depth(of)
-        }
-    }
-
     for (interval, expected) in [(None, 0), (Some(Duration::from_secs(60)), 1)] {
         let mut cfg = test_config(1);
         cfg.feed = feed_section("memory: {}");
         let reads = Arc::new(AtomicUsize::new(0));
-        let feed = Counting {
+        let feed = DeadLetterReads {
             inner: MemoryFeed::new(),
             reads: Arc::clone(&reads),
         };
@@ -2741,6 +2741,37 @@ fn the_runtime_reads_dead_letters_only_on_its_interval() {
         assert_eq!(report.state, ExitState::Completed);
         assert_eq!(reads.load(Ordering::Relaxed), expected, "{interval:?}");
     }
+}
+
+/// Pins that the runtime times its dead-letter reads on the injected clock:
+/// one at startup, and the next once that clock has moved an interval.
+#[test]
+fn the_runtime_reads_dead_letters_on_its_clock() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let feed = DeadLetterReads {
+        inner: MemoryFeed::new(),
+        reads: Arc::clone(&reads),
+    };
+    let clock = crate::clock::TestClock::frozen();
+    let injected = Arc::clone(&clock);
+    let h = start_prepared(
+        cfg,
+        test_options(),
+        |log| log.accept_feed = true,
+        move |runtime, _| runtime.with_feed(Arc::new(feed)).with_clock(injected),
+        ok_chain,
+    );
+    wait_for("the startup read", Duration::from_secs(5), || {
+        reads.load(Ordering::Relaxed) == 1
+    });
+    clock.advance(crate::feed::DEAD_LETTER_READ_INTERVAL);
+    wait_for("the second read", Duration::from_secs(5), || {
+        reads.load(Ordering::Relaxed) == 2
+    });
+    h.script.lock().unwrap().push_back(Script::Drained);
+    assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
 }
 
 /// Pins that `run` passes a `location` beside a backend other than the
