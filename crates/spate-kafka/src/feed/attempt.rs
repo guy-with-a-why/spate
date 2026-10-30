@@ -435,8 +435,8 @@ impl Follower {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::SyncClock;
     use proptest::prelude::*;
+    use spate_core::clock::SyncClock;
 
     fn topics() -> Topics {
         Topics {
@@ -757,9 +757,9 @@ mod tests {
 
         use super::super::*;
         use crate::client::testing::{Raw as _, raw_config};
-        use crate::clock::SyncClock;
         use rdkafka::mocking::MockCluster;
         use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+        use spate_core::clock::SyncClock;
         use spate_core::config::FeedSection;
         use spate_test::wait_until;
         use std::sync::atomic::Ordering;

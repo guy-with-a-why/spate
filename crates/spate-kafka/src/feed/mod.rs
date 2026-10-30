@@ -58,7 +58,6 @@ pub(crate) use config::{FeedRole, KafkaFeedConfig};
 pub use error::KafkaFeedError;
 pub use publisher::KafkaFeedPublisher;
 
-use crate::clock::SyncClock;
 use crate::context::SourceHooks;
 use attempt::{Follower, Ledger, PublishId, SharedLedger};
 use config::BACKEND;
@@ -66,6 +65,7 @@ use consumer::Driver;
 use inflight::Tracker;
 use producer::FeedProducerHooks;
 use rdkafka::consumer::{BaseConsumer, Consumer};
+use spate_core::clock::SyncClock;
 use spate_core::config::FeedSection;
 use spate_core::feed::{
     Confirmation, Confirmer, Delivery, DepthOf, DepthReading, DepthReporter, Feed, FeedError,
@@ -581,7 +581,7 @@ impl KafkaFeed {
     pub fn connect_without_config_checks_on(
         section: &FeedSection,
         io: &tokio::runtime::Handle,
-        clock: crate::clock::SharedClock,
+        clock: spate_core::clock::SharedClock,
     ) -> Result<KafkaFeed, KafkaFeedError> {
         Self::connect_with(
             section,

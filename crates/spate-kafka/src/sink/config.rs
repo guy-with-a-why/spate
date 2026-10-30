@@ -29,7 +29,6 @@
 //! at-least-once into at-most-once.
 
 use crate::client::{Base, Keys, Role, canonical};
-use crate::clock::SyncClock;
 use crate::sink::context::{SinkContext, SinkHooks};
 use crate::sink::encoder::{
     DEFAULT_MAX_MESSAGE_BYTES, KafkaBytesEncoder, KafkaEncoder, KafkaJsonEncoder, MessageEncoder,
@@ -38,6 +37,7 @@ use crate::sink::writer::{DELIVERY_GRACE, KafkaEndpoint, KafkaWriter};
 use bytesize::ByteSize;
 use rdkafka::producer::ThreadedProducer;
 use serde::Deserialize;
+use spate_core::clock::SyncClock;
 use spate_core::clock::tokio::{Clock as IoClock, SystemClock as IoSystemClock};
 use spate_core::config::{ComponentConfig, ConfigError, redact};
 use spate_core::deser::{Owned, RecFamily};
@@ -530,7 +530,7 @@ pub fn build(cfg: KafkaSinkConfig) -> Result<KafkaSink, ConfigError> {
 #[doc(hidden)]
 pub fn build_on_clocks(
     cfg: KafkaSinkConfig,
-    clock: crate::clock::SharedClock,
+    clock: spate_core::clock::SharedClock,
     io_clock: Arc<dyn IoClock + RefUnwindSafe>,
 ) -> Result<KafkaSink, ConfigError> {
     build_on(cfg, SyncClock::new(clock), io_clock)

@@ -64,7 +64,6 @@
 //! [`Source::poll_events`] stands against a librdkafka that stops holding
 //! the contract.
 
-use crate::clock::SyncClock;
 use crate::config::KafkaSourceConfig;
 use crate::context::{Intent, SourceContext, SourceHooks};
 use crate::lane::KafkaLane;
@@ -76,6 +75,7 @@ use rdkafka::statistics::Statistics;
 use rdkafka::{Offset, TopicPartitionList};
 use spate_core::checkpoint::AckIssuer;
 use spate_core::clock::Stopwatch;
+use spate_core::clock::SyncClock;
 use spate_core::error::{ErrorClass, SourceError};
 use spate_core::metrics::SourceMetrics;
 use spate_core::record::PartitionId;
@@ -187,7 +187,7 @@ impl KafkaSource {
     #[cfg(feature = "testing")]
     #[doc(hidden)]
     #[must_use]
-    pub fn with_clock(mut self, clock: crate::clock::SharedClock) -> KafkaSource {
+    pub fn with_clock(mut self, clock: spate_core::clock::SharedClock) -> KafkaSource {
         self.clock = SyncClock::new(clock);
         self
     }

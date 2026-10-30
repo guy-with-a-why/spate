@@ -482,11 +482,11 @@ pub(crate) fn admission(core: &Core, entry: Gating) -> Option<Write> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::SyncClock;
     use crate::feed::FeedRole;
     use crate::feed::config::KafkaFeedConfig;
     use crate::feed::producer::FeedProducerHooks;
     use rdkafka::error::RDKafkaErrorCode as C;
+    use spate_core::clock::SyncClock;
     use std::num::NonZeroU32;
     use std::sync::mpsc;
 

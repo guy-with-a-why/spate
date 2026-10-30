@@ -310,8 +310,8 @@ mod tests {
     use super::*;
     use crate::client::SpateContext;
     use crate::client::testing::raw;
-    use crate::clock::SyncClock;
     use crate::context::SourceHooks;
+    use spate_core::clock::SyncClock;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
