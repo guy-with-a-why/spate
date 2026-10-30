@@ -33,7 +33,9 @@ pub const L_OUTCOME: &str = "outcome";
 pub const L_EVENT: &str = "event";
 /// Error class label. [`SINK_ERRORS_TOTAL`] carries the class the connector
 /// assigned (`retryable`, `record_level`, `fatal`); [`OPERATOR_ERRORS_TOTAL`]
-/// carries what the stage did with the error (`record_level`, `fatal`).
+/// carries what the stage did with the error (`record_level`, `fatal`);
+/// [`FEED_ERRORS_TOTAL`] carries the feed's error kind (`gone`, `refused`,
+/// `retryable`, `fatal`).
 pub const L_ERROR_TYPE: &str = "error_type";
 /// Queue edge label (`<upstream>-><downstream>`).
 pub const L_QUEUE: &str = "queue";
@@ -41,6 +43,9 @@ pub const L_QUEUE: &str = "queue";
 pub const L_STATE: &str = "state";
 /// Build version label on `spate_pipeline_info`.
 pub const L_VERSION: &str = "version";
+/// Feed call label (`receive`, `renew`, `acknowledge`, `fail`, `hand_back`,
+/// `publish`).
+pub const L_OP: &str = "op";
 
 // Declares each name as a constant and builds the kind's list from the same entries.
 macro_rules! metric_names {
@@ -125,6 +130,24 @@ metric_names! {
 
         /// Source commit calls, by [`L_OUTCOME`].
         CHECKPOINT_COMMITS_TOTAL = "spate_checkpoint_commits_total",
+
+        // Feed.
+
+        /// Deliveries the source received from the feed.
+        FEED_UNITS_RECEIVED_TOTAL = "spate_feed_units_received_total",
+        /// Acknowledges the feed accepted.
+        FEED_UNITS_ACKNOWLEDGED_TOTAL = "spate_feed_units_acknowledged_total",
+        /// Fails the feed accepted.
+        FEED_UNITS_FAILED_TOTAL = "spate_feed_units_failed_total",
+        /// Hand-backs the feed accepted.
+        FEED_UNITS_HANDED_BACK_TOTAL = "spate_feed_units_handed_back_total",
+        /// Publishes the feed confirmed it stored.
+        FEED_UNITS_PUBLISHED_TOTAL = "spate_feed_units_published_total",
+        /// Renewals the feed accepted.
+        FEED_RENEWALS_TOTAL = "spate_feed_renewals_total",
+        /// Feed calls answered with an error, and publishes that settled with
+        /// one, by [`L_OP`] and [`L_ERROR_TYPE`].
+        FEED_ERRORS_TOTAL = "spate_feed_errors_total",
     }
 }
 
@@ -189,6 +212,12 @@ metric_names! {
         /// Age of the oldest unacknowledged batch. The primary "stuck pipeline"
         /// alert signal.
         CHECKPOINT_WATERMARK_AGE_SECONDS = "spate_checkpoint_watermark_age_seconds",
+
+        // Feed.
+
+        /// Deliveries the source holds: received and not yet acknowledged,
+        /// failed, handed back or answered Gone.
+        FEED_HELD_UNITS = "spate_feed_held_units",
 
 
         // Pipeline.
@@ -258,6 +287,16 @@ metric_names! {
         /// Commit round-trip time.
         CHECKPOINT_COMMIT_DURATION_SECONDS = "spate_checkpoint_commit_duration_seconds",
 
+        // Feed.
+
+        /// Time spent inside one feed call, by [`L_OP`]. A feed call never
+        /// waits on I/O, so a reading past a millisecond is a backend that
+        /// blocks the caller.
+        FEED_CALL_DURATION_SECONDS = "spate_feed_call_duration_seconds",
+        /// Time from a publish to the first check that found it settled,
+        /// either outcome.
+        FEED_PUBLISH_DURATION_SECONDS = "spate_feed_publish_duration_seconds",
+
 
         // End to end.
 
@@ -289,6 +328,7 @@ pub const RESERVED_ROOTS: &[&str] = &[
     "sink",
     "checkpoint",
     "coordination",
+    "feed",
     "e2e",
     "pipeline",
 ];

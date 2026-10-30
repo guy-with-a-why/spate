@@ -9,9 +9,9 @@ use crate::checkpoint::Checkpointer;
 use crate::clock::{Clock, SystemClock};
 use crate::config::{MetricsExporter, PinningMode, PipelineConfig};
 use crate::feed::memory::MemoryFeed;
-use crate::feed::{Feed, FeedOrigin, STOP_RESERVE};
+use crate::feed::{Feed, FeedOrigin, MeteredFeed, STOP_RESERVE};
 use crate::metrics::{
-    self, BackpressureMetrics, CheckpointMetrics, ComponentLabels, E2eBasis, Exporter,
+    self, BackpressureMetrics, CheckpointMetrics, ComponentLabels, E2eBasis, Exporter, FeedMetrics,
     InflightBudgetMetrics, IoBusySampler, IoRuntimeMetrics, Meter, MetricRole, MetricsHandle,
     MetricsSettings, PipelineMetrics, PipelineState, SourceMetrics,
 };
@@ -286,10 +286,10 @@ impl<S: Source + 'static> PipelineRuntime<S> {
     }
 
     /// Read the commit tick, the fast-commit window, the stall check, the
-    /// idle flush and the health probe on `clock`, so a test moves them by
-    /// hand. Every drain deadline is computed on the stop clock set by
-    /// `with_stop_clock`, and the sink pool counts its share down on its own
-    /// tokio clock.
+    /// idle flush, the health probe and the feed's call timings on `clock`, so
+    /// a test moves them by hand. Every drain deadline is computed on the stop
+    /// clock set by `with_stop_clock`, and the sink pool counts its share down
+    /// on its own tokio clock.
     #[cfg(any(test, feature = "testing"))]
     #[doc(hidden)]
     #[must_use]
@@ -354,7 +354,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                 )));
             }
         }
-        let mut kept_feed = None;
+        let mut resolved_feed = None;
         match (&self.config.feed, self.feed.take()) {
             (Some(section), given) => {
                 let (feed, origin) = match given {
@@ -380,10 +380,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                         feed.backend()
                     )));
                 }
-                kept_feed = Some(Arc::clone(&feed));
-                self.source
-                    .configure_feed(section, feed, origin)
-                    .map_err(|e| StartError::Config(e.to_string()))?;
+                resolved_feed = Some((section, feed, origin));
             }
             (None, Some(_)) => {
                 return Err(StartError::Config(
@@ -447,6 +444,25 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             ))
             .map_err(|e| StartError::Metrics(e.to_string()))?,
         );
+
+        // The feed's handles bind to the recorder installed above, so the
+        // feed is wrapped after it.
+        let kept_feed = match resolved_feed {
+            Some((section, feed, origin)) => {
+                let metrics = FeedMetrics::try_new(&ComponentLabels::new(
+                    pipeline_name.clone(),
+                    "feed",
+                    feed.backend().to_owned(),
+                ))
+                .map_err(|e| StartError::Metrics(e.to_string()))?;
+                let feed = Arc::new(MeteredFeed::new(feed, metrics, Arc::clone(&self.clock)));
+                self.source
+                    .configure_feed(section, Arc::clone(&feed) as Arc<dyn Feed>, origin)
+                    .map_err(|e| StartError::Config(e.to_string()))?;
+                Some(feed)
+            }
+            None => None,
+        };
 
         let health = HealthState::with_clock(
             threads,

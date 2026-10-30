@@ -1,0 +1,186 @@
+//! Feed handles (`spate_feed_*`): what the runtime records about the calls a
+//! source makes through its feed.
+//!
+//! One handle set per pipeline, resolved by the runtime when it wraps the feed
+//! it hands the source. Every label takes its values from a fixed set: the
+//! recorded feed calls, the [`FeedErrorKind`]s, and the backend's key as the
+//! `component_type`.
+
+use super::MetricsError;
+use super::labels::ComponentLabels;
+use super::names;
+use super::ownership::{SeriesClaim, series_key};
+use crate::feed::{FeedError, FeedErrorKind};
+use metrics::{Counter, Gauge, Histogram};
+use std::time::Duration;
+
+/// A feed call, as the `op` label names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FeedOp {
+    Receive,
+    Renew,
+    Acknowledge,
+    Fail,
+    HandBack,
+    Publish,
+}
+
+impl FeedOp {
+    /// Every call, in discriminant order, so `op as usize` indexes a table
+    /// built from it.
+    const ALL: [FeedOp; 6] = [
+        FeedOp::Receive,
+        FeedOp::Renew,
+        FeedOp::Acknowledge,
+        FeedOp::Fail,
+        FeedOp::HandBack,
+        FeedOp::Publish,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            FeedOp::Receive => "receive",
+            FeedOp::Renew => "renew",
+            FeedOp::Acknowledge => "acknowledge",
+            FeedOp::Fail => "fail",
+            FeedOp::HandBack => "hand_back",
+            FeedOp::Publish => "publish",
+        }
+    }
+}
+
+/// The `error_type` label values, in the order [`kind_index`] numbers them.
+const ERROR_TYPES: [&str; 4] = ["gone", "refused", "retryable", "fatal"];
+
+fn kind_index(kind: FeedErrorKind) -> usize {
+    match kind {
+        FeedErrorKind::Gone => 0,
+        FeedErrorKind::Refused => 1,
+        FeedErrorKind::Retryable => 2,
+        FeedErrorKind::Fatal => 3,
+    }
+}
+
+/// Feed handles (`spate_feed_*`).
+#[derive(Debug)]
+pub(crate) struct FeedMetrics {
+    received: Counter,
+    acknowledged: Counter,
+    failed: Counter,
+    handed_back: Counter,
+    published: Counter,
+    renewals: Counter,
+    errors: [[Counter; ERROR_TYPES.len()]; FeedOp::ALL.len()],
+    call_duration: [Histogram; FeedOp::ALL.len()],
+    publish_duration: Histogram,
+    held_units: Gauge,
+    _claim: SeriesClaim,
+}
+
+impl FeedMetrics {
+    /// Resolve the feed handles, failing when another live handle set already
+    /// owns the series.
+    ///
+    /// # Errors
+    ///
+    /// [`MetricsError::DuplicateSeries`] on a collision.
+    pub(crate) fn try_new(labels: &ComponentLabels) -> Result<Self, MetricsError> {
+        let claim = SeriesClaim::try_claim(series_key("feed", labels, ""))?;
+        let held_units = labels.gauge(names::FEED_HELD_UNITS);
+        held_units.set(0.0);
+        Ok(FeedMetrics {
+            received: labels.counter(names::FEED_UNITS_RECEIVED_TOTAL),
+            acknowledged: labels.counter(names::FEED_UNITS_ACKNOWLEDGED_TOTAL),
+            failed: labels.counter(names::FEED_UNITS_FAILED_TOTAL),
+            handed_back: labels.counter(names::FEED_UNITS_HANDED_BACK_TOTAL),
+            published: labels.counter(names::FEED_UNITS_PUBLISHED_TOTAL),
+            renewals: labels.counter(names::FEED_RENEWALS_TOTAL),
+            errors: FeedOp::ALL.map(|op| {
+                ERROR_TYPES.map(|error_type| {
+                    labels.counter2(
+                        names::FEED_ERRORS_TOTAL,
+                        names::L_OP,
+                        op.label(),
+                        names::L_ERROR_TYPE,
+                        error_type,
+                    )
+                })
+            }),
+            call_duration: FeedOp::ALL.map(|op| {
+                labels.histogram1(names::FEED_CALL_DURATION_SECONDS, names::L_OP, op.label())
+            }),
+            publish_duration: labels.histogram(names::FEED_PUBLISH_DURATION_SECONDS),
+            held_units,
+            _claim: claim,
+        })
+    }
+
+    pub(crate) fn received(&self, units: usize) {
+        self.received.increment(units as u64);
+        self.held_units.increment(units as f64);
+    }
+
+    /// The source let go of one delivery it held.
+    pub(crate) fn released(&self) {
+        self.held_units.decrement(1.0);
+    }
+
+    pub(crate) fn acknowledged(&self) {
+        self.acknowledged.increment(1);
+    }
+
+    pub(crate) fn failed(&self) {
+        self.failed.increment(1);
+    }
+
+    pub(crate) fn handed_back(&self) {
+        self.handed_back.increment(1);
+    }
+
+    pub(crate) fn renewed(&self) {
+        self.renewals.increment(1);
+    }
+
+    pub(crate) fn error(&self, op: FeedOp, kind: FeedErrorKind) {
+        self.errors[op as usize][kind_index(kind)].increment(1);
+    }
+
+    pub(crate) fn call(&self, op: FeedOp, elapsed: Duration) {
+        self.call_duration[op as usize].record(elapsed);
+    }
+
+    /// Record a publish that settled `elapsed` after it was made.
+    pub(crate) fn publish_settled(&self, outcome: &Result<(), FeedError>, elapsed: Duration) {
+        self.publish_duration.record(elapsed);
+        match outcome {
+            Ok(()) => self.published.increment(1),
+            Err(e) => self.error(FeedOp::Publish, e.kind),
+        }
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    /// Pins that `ALL` lists the calls in discriminant order, which the
+    /// handle tables are indexed by.
+    #[test]
+    fn every_feed_op_sits_at_its_discriminant() {
+        for (i, op) in FeedOp::ALL.into_iter().enumerate() {
+            assert_eq!(op as usize, i, "{op:?}");
+        }
+    }
+
+    /// Pins that a second handle set on the same labels is refused, so the
+    /// held gauge has one owner (INV-10).
+    #[test]
+    fn a_second_feed_handle_set_is_refused() {
+        let labels = ComponentLabels::new("feed-duplicate", "feed", "memory");
+        let owner = FeedMetrics::try_new(&labels).unwrap();
+        let err = FeedMetrics::try_new(&labels).unwrap_err();
+        assert!(matches!(err, MetricsError::DuplicateSeries(_)), "{err}");
+        drop(owner);
+        FeedMetrics::try_new(&labels).expect("the claim frees with its owner");
+    }
+}

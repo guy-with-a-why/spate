@@ -78,8 +78,10 @@ use tokio::sync::oneshot;
 
 mod end_check;
 pub mod memory;
+mod metered;
 
 pub use end_check::{END_CHECK_INTERVAL, EndAction, EndCheck, EndOutcome, MarkerRead};
+pub(crate) use metered::MeteredFeed;
 
 /// The settling window a bounded job waits out when its `feed:` section sets
 /// none: five minutes.
@@ -581,6 +583,19 @@ pub struct Confirmation {
     // The settled outcome, kept so a check after settling repeats it and the
     // receiver is never polled again once it has yielded.
     outcome: Option<Result<(), FeedError>>,
+    on_settle: Option<OnSettle>,
+}
+
+/// What a [`Confirmation`] runs on its outcome when it settles.
+struct OnSettle(Box<SettleFn>);
+
+// `Sync` keeps the confirmation `Sync`.
+type SettleFn = dyn FnOnce(&Result<(), FeedError>) + Send + Sync;
+
+impl fmt::Debug for OnSettle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OnSettle")
+    }
 }
 
 impl Confirmation {
@@ -590,13 +605,31 @@ impl Confirmation {
     pub fn try_outcome(&mut self) -> Option<Result<(), FeedError>> {
         if self.outcome.is_none() {
             use oneshot::error::TryRecvError;
-            self.outcome = match self.rx.try_recv() {
-                Ok(outcome) => Some(outcome),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Closed) => Some(Err(unsettled())),
+            let outcome = match self.rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Closed) => Err(unsettled()),
             };
+            self.settle(outcome);
         }
         self.outcome.clone()
+    }
+
+    /// Run `f` on the outcome once, when a check or an await first finds it
+    /// settled. A confirmation dropped before then never runs it.
+    pub(crate) fn on_settle(
+        mut self,
+        f: impl FnOnce(&Result<(), FeedError>) + Send + Sync + 'static,
+    ) -> Confirmation {
+        self.on_settle = Some(OnSettle(Box::new(f)));
+        self
+    }
+
+    fn settle(&mut self, outcome: Result<(), FeedError>) {
+        if let Some(OnSettle(f)) = self.on_settle.take() {
+            f(&outcome);
+        }
+        self.outcome = Some(outcome);
     }
 }
 
@@ -612,7 +645,7 @@ impl Future for Confirmation {
             Poll::Ready(Ok(outcome)) => outcome,
             Poll::Ready(Err(_)) => Err(unsettled()),
         };
-        self.outcome = Some(outcome.clone());
+        self.settle(outcome.clone());
         Poll::Ready(outcome)
     }
 }
@@ -622,7 +655,14 @@ impl Future for Confirmation {
 #[must_use]
 pub fn confirmation() -> (Confirmer, Confirmation) {
     let (tx, rx) = oneshot::channel();
-    (Confirmer(tx), Confirmation { rx, outcome: None })
+    (
+        Confirmer(tx),
+        Confirmation {
+            rx,
+            outcome: None,
+            on_settle: None,
+        },
+    )
 }
 
 fn unsettled() -> FeedError {
@@ -819,6 +859,15 @@ mod tests {
         assert_eq!(class(FeedErrorKind::Gone), ErrorClass::Fatal);
         assert_eq!(class(FeedErrorKind::Refused), ErrorClass::Fatal);
         assert_eq!(class(FeedErrorKind::Fatal), ErrorClass::Fatal);
+    }
+
+    /// Pins that a confirmation with a settle hook says so in its debug
+    /// output, since the hook itself has nothing to print.
+    #[test]
+    fn a_settle_hook_shows_in_the_debug_output() {
+        let (_confirmer, confirmation) = confirmation();
+        let hooked = confirmation.on_settle(|_| {});
+        assert!(format!("{hooked:?}").contains("OnSettle"), "{hooked:?}");
     }
 
     /// Pins that an awaited outcome is repeated to a later check, though the

@@ -76,6 +76,9 @@ pub(crate) struct SourceLog {
     pub(crate) accept_feed: bool,
     /// The origin `configure_feed` was handed.
     pub(crate) feed_origin: Option<crate::feed::FeedOrigin>,
+    /// The feed `configure_feed` was handed, kept so a test reads through
+    /// what the source reads through.
+    pub(crate) feed: Option<Arc<dyn crate::feed::Feed>>,
     /// The answer to `reading_on_stop`, modeling a feed reader that still
     /// holds units it is reading.
     pub(crate) read_on_stop: bool,
@@ -361,8 +364,9 @@ impl Source for FakeSource {
         feed: Arc<dyn crate::feed::Feed>,
         origin: crate::feed::FeedOrigin,
     ) -> Result<(), crate::config::ConfigError> {
-        let _ = (section, feed);
+        let _ = section;
         self.shared.lock().unwrap().feed_origin = Some(origin);
+        self.shared.lock().unwrap().feed = Some(feed);
         if self.shared.lock().unwrap().accept_feed {
             return Ok(());
         }

@@ -2603,6 +2603,68 @@ fn the_source_learns_where_its_feed_came_from() {
     }
 }
 
+/// Pins that the source reads through a feed the runtime counts, under the
+/// `feed` component and the backend's key, and times on the injected clock.
+#[test]
+fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
+    use crate::feed::{Feed, Unit};
+    let mut cfg = test_config(1);
+    cfg.metrics.exporter = crate::config::MetricsExporter::Prometheus;
+    cfg.feed = feed_section("memory: {}");
+    let pipeline_name = cfg.pipeline.name.clone();
+    let settings = crate::pipeline::metrics_settings(&cfg);
+
+    // One unit waiting, published through a call the runtime does not see.
+    let backend = Arc::new(MemoryFeed::new());
+    drop(backend.publish(Unit::new("work", Vec::new())));
+
+    let given = Arc::clone(&backend);
+    let clock = crate::clock::TestClock::frozen();
+    let injected = Arc::clone(&clock);
+    let h = start_prepared(
+        cfg,
+        test_options(),
+        |log| log.accept_feed = true,
+        move |runtime, _| runtime.with_feed(given).with_clock(injected),
+        ok_chain,
+    );
+    wait_for("the source's feed", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().feed.is_some()
+    });
+    // The runtime's own install, taken after it: in a process of its own, as
+    // nextest runs it, a feed wrapped before the recorder existed would render
+    // nothing here.
+    let handle = crate::metrics::install(&settings).expect("the runtime's exporter");
+    let feed = h
+        .shared
+        .lock()
+        .unwrap()
+        .feed
+        .clone()
+        .expect("the source's feed");
+    let work = feed.receive(8).unwrap().remove(0);
+    feed.acknowledge(work.receipt).unwrap();
+    let mut published = feed.publish(Unit::new("more", Vec::new()));
+    clock.advance(Duration::from_secs(3));
+    published.try_outcome().expect("settled").unwrap();
+
+    let series = |name: &str| {
+        format!(r#"{name}{{pipeline="{pipeline_name}",component="feed",component_type="memory"}} "#)
+    };
+    let reads = |name: &str, value: &str| {
+        let line = format!("{}{value}", series(name));
+        handle.render().lines().any(|l| l == line)
+    };
+    assert!(reads("spate_feed_units_received_total", "1"));
+    assert!(reads("spate_feed_units_acknowledged_total", "1"));
+    assert!(reads("spate_feed_held_units", "0"));
+    assert!(reads("spate_feed_publish_duration_seconds_sum", "3"));
+
+    h.script.lock().unwrap().push_back(Script::Drained);
+    let report = h.join.join().unwrap().unwrap();
+    assert_eq!(report.state, ExitState::Completed);
+}
+
 /// Pins that `run` passes a `location` beside a backend other than the
 /// in-process feed on to the feed checks that follow.
 #[test]
