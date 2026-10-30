@@ -890,10 +890,10 @@ mod tests {
         ));
     }
 
-    /// `feed_` is reserved to the feed role's scoping in every namespace, the
-    /// pipeline-author `custom` one included.
+    /// `feed_` is reserved to the feed role's scoping in the pipeline-author
+    /// `custom` namespace.
     #[test]
-    #[should_panic(expected = "role segment")]
+    #[should_panic(expected = "the role segment `feed_`")]
     fn a_local_name_may_not_lead_with_the_feed_role() {
         let _ = Meter::new("p", "c", "t").counter("feed_items_total", &[]);
     }
@@ -933,6 +933,13 @@ mod tests {
                 panics_with(&|| drop(meter.histogram(name, extra)), expected);
             }
         }
+    }
+
+    /// Only a whole leading segment is reserved, so a name that merely begins
+    /// with a role's letters registers.
+    #[test]
+    fn a_local_name_may_begin_with_the_letters_of_a_role() {
+        let _ = Meter::new("p", "c", "t").counter("feedback_total", &[]);
     }
 
     #[test]
