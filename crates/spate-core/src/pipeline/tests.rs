@@ -2672,10 +2672,12 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     assert_eq!(report.state, ExitState::Completed);
 }
 
-/// The in-process feed, counting the dead-letter reads made on it.
+/// The in-process feed, counting the dead-letter reads made on it and failing
+/// each one when `fails` is set.
 struct DeadLetterReads {
     inner: MemoryFeed,
     reads: Arc<AtomicUsize>,
+    fails: bool,
 }
 
 impl crate::feed::Feed for DeadLetterReads {
@@ -2707,6 +2709,14 @@ impl crate::feed::Feed for DeadLetterReads {
     fn read_depth(&self, of: crate::feed::DepthOf) -> Option<crate::feed::DepthReading> {
         if of == crate::feed::DepthOf::DeadLetters {
             self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.fails {
+                let (reporter, reading) = crate::feed::depth_reading();
+                reporter.report(Err(crate::feed::FeedError::new(
+                    crate::feed::FeedErrorKind::Retryable,
+                    "throttled",
+                )));
+                return Some(reading);
+            }
         }
         self.inner.read_depth(of)
     }
@@ -2724,6 +2734,7 @@ fn the_runtime_reads_dead_letters_only_on_its_interval() {
         let feed = DeadLetterReads {
             inner: MemoryFeed::new(),
             reads: Arc::clone(&reads),
+            fails: false,
         };
         let options = RuntimeOptions {
             dead_letter_read_interval: interval,
@@ -2753,6 +2764,7 @@ fn the_runtime_reads_dead_letters_on_its_clock() {
     let feed = DeadLetterReads {
         inner: MemoryFeed::new(),
         reads: Arc::clone(&reads),
+        fails: false,
     };
     let clock = crate::clock::TestClock::frozen();
     let injected = Arc::clone(&clock);
@@ -2770,6 +2782,39 @@ fn the_runtime_reads_dead_letters_on_its_clock() {
     wait_for("the second read", Duration::from_secs(5), || {
         reads.load(Ordering::Relaxed) == 2
     });
+    h.script.lock().unwrap().push_back(Script::Drained);
+    assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
+}
+
+/// Pins that a dead-letter read that fails is logged as a warning naming the
+/// feed.
+#[test]
+fn a_failed_dead_letter_read_warns() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}");
+    let feed = DeadLetterReads {
+        inner: MemoryFeed::new(),
+        reads: Arc::default(),
+        fails: true,
+    };
+    let h = start_prepared(
+        cfg,
+        test_options(),
+        |log| log.accept_feed = true,
+        move |runtime, _| runtime.with_feed(Arc::new(feed)),
+        ok_chain,
+    );
+    let warned = || {
+        h.warnings.0.lock().unwrap().iter().any(|fields| {
+            fields
+                .iter()
+                .any(|(name, value)| name == "message" && value.contains("dead-letter destination"))
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "feed" && value.contains("memory"))
+        })
+    };
+    wait_for("the warning", Duration::from_secs(5), warned);
     h.script.lock().unwrap().push_back(Script::Drained);
     assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
 }
