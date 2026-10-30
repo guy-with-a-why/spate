@@ -313,8 +313,9 @@ connector never wires the pipeline name, the labels, or the prefix.
   before it hands the feed to the source. Its namespace is its `Feed::backend`
   key, and its families land under `spate_<backend>_feed_*` with
   `component="feed"`, beside the framework's own `spate_feed_*` families for the
-  same feed. The backend's own tasks, and its other calls, go without the
-  `Meter` until it arrives, so treat the handles as optional.
+  same feed. The backend's own tasks and calls go without the `Meter` until it
+  arrives, and a feed handed to a source directly never receives one, so treat
+  the handles as optional.
 
 The source's two methods below are a shape rather than a program: the
 `impl Source for` header is left out and the rest of `open` is elided at the
