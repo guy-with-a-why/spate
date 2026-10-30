@@ -346,7 +346,9 @@ thirty a minute at `6s`.
 
 ## Metrics
 
-The SQS feed registers no metric families of its own.
+The SQS feed registers no metric families of its own. The runtime records
+the calls a source makes on it under the framework's `spate_feed_*` families,
+with `component_type="sqs"`; see [Metrics](../../../../METRICS.md).
 
 ## Related
 

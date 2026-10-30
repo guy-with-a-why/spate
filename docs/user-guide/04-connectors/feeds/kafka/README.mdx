@@ -539,7 +539,9 @@ error naming the record's offset.
 
 ## Metrics
 
-The Kafka feed registers no metric families of its own.
+The Kafka feed registers no metric families of its own. The runtime records
+the calls a source makes on it under the framework's `spate_feed_*` families,
+with `component_type="kafka"`; see [Metrics](../../../../METRICS.md).
 
 ## Related
 
