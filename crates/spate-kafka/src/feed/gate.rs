@@ -26,6 +26,7 @@ use rdkafka::producer::Producer as _;
 use rdkafka::{Offset, TopicPartitionList};
 use spate_core::clock::Stopwatch;
 use spate_core::error::ErrorClass;
+use spate_core::task::{ThreadHandle, spawn_thread};
 use std::collections::BTreeSet;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
@@ -94,10 +95,8 @@ impl Gate {
     /// # Errors
     ///
     /// When the thread cannot be started.
-    pub(crate) fn spawn(self) -> std::io::Result<std::thread::JoinHandle<()>> {
-        std::thread::Builder::new()
-            .name("spate-kafka-feed-gate".to_owned())
-            .spawn(move || self.run())
+    pub(crate) fn spawn(self) -> std::io::Result<ThreadHandle<()>> {
+        spawn_thread("spate-kafka-feed-gate", move || self.run())
     }
 
     fn run(self) {
@@ -494,6 +493,10 @@ mod tests {
     /// feed that stopped or latched before the wait began, whose notify has
     /// already fired or never fires: with a step of an hour, `rest` returns.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the thread ends when `rest` returns"
+    )]
     fn the_wait_after_a_partial_pass_is_skipped_once_the_feed_ends() {
         let section: spate_core::config::FeedSection = serde_yaml::from_str(
             "kafka:\n  brokers: 127.0.0.1:1\n  group_id: workers\n  topic: units\n  \

@@ -18,7 +18,9 @@ use crate::metrics::{
     MetricsSettings, PipelineMetrics, PipelineState, SourceMetrics,
 };
 use crate::ops::RunnableChain;
+use crate::sink::SinkProbeFn;
 use crate::source::{DrainBarrier, Source};
+use crate::task;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -503,42 +505,35 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         // the driver threads (below) so a failure in any of them can stop
         // the already-running drivers instead of leaking them.
 
-        if self.options.handle_signals {
+        // The io tasks' handles live to the end of `run` and drop just before
+        // the io runtime shuts down, since dropping one aborts its task.
+        let signal_task = self.options.handle_signals.then(|| {
             let stop = Arc::clone(&self.stop);
-            io.spawn(async move {
-                wait_for_signal().await;
-                tracing::info!("shutdown signal received; draining");
-                stop.trigger();
-            });
-        }
+            task::spawn_on(
+                "shutdown-signal",
+                async move {
+                    wait_for_signal().await;
+                    tracing::info!("shutdown signal received; draining");
+                    stop.trigger();
+                },
+                io.handle(),
+            )
+        });
 
         // Sink readiness: probe at startup and periodically (tighter while
         // failing), driving the sinks-connected half of `/readyz`. No probe
         // hook means nothing to check, so report connected.
-        match self.sink.probe.take() {
-            Some(probe) => {
-                let health_probe = Arc::clone(&health);
-                io.spawn(async move {
-                    loop {
-                        let connected = match probe().await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "sink probe failed");
-                                false
-                            }
-                        };
-                        health_probe.set_sinks_connected(connected);
-                        let recheck = if connected {
-                            Duration::from_secs(30)
-                        } else {
-                            Duration::from_secs(5)
-                        };
-                        tokio::time::sleep(recheck).await;
-                    }
-                });
+        let probe_task = match self.sink.probe.take() {
+            Some(probe) => Some(task::spawn_on(
+                "sink-probe",
+                probe_sinks(probe, Arc::clone(&health)),
+                io.handle(),
+            )),
+            None => {
+                health.set_sinks_connected(true);
+                None
             }
-            None => health.set_sinks_connected(true),
-        }
+        };
 
         // Wiring.
         let (events_tx, events_rx) = crossbeam_channel::unbounded::<DriverEvent>();
@@ -625,6 +620,10 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                 stop_clock: Arc::clone(&self.stop_clock),
             };
             let core = core_ids.get(i).copied().flatten();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "`run` joins every driver thread, on each early return too"
+            )]
             let spawned = std::thread::Builder::new()
                 .name(format!("spate-pipeline-{i}"))
                 .spawn(move || {
@@ -663,7 +662,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
 
         // Admin bind now that the drivers are live: a bind failure (e.g. the
         // address is taken) stops them instead of leaking them.
-        let admin_stop_tx = match self.config.admin.listen {
+        let (admin_stop_tx, admin_task) = match self.config.admin.listen {
             Some(addr) => {
                 let render = handle.exports().then(|| handle.render_fn());
                 let admin = match io.block_on(AdminServer::bind(addr, render, Arc::clone(&health)))
@@ -682,8 +681,9 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                 };
                 let (admin_stop_tx, admin_stop_rx) = watch::channel(false);
                 tracing::info!(addr = %admin.local_addr(), "admin server listening");
-                io.spawn(admin.run(admin_stop_rx));
-                Some(admin_stop_tx)
+                let admin_task =
+                    task::spawn_on("admin-server", admin.run(admin_stop_rx), io.handle());
+                (Some(admin_stop_tx), Some(admin_task))
             }
             None => {
                 if handle.exports() {
@@ -693,14 +693,13 @@ impl<S: Source + 'static> PipelineRuntime<S> {
                          Pipeline::metrics(), or set `metrics.exporter: none`"
                     );
                 }
-                None
+                (None, None)
             }
         };
-        {
-            // spawn_upkeep uses tokio::spawn internally; enter the runtime.
+        let upkeep_task = {
             let _guard = io.enter();
-            let _upkeep = handle.spawn_upkeep(Duration::from_secs(5));
-        }
+            handle.spawn_upkeep(Duration::from_secs(5))
+        };
 
         let controller_ctx = ControllerContext {
             source: self.source,
@@ -733,6 +732,10 @@ impl<S: Source + 'static> PipelineRuntime<S> {
             per_partition_detail: self.config.metrics.per_partition_detail,
             pipeline_metrics,
         };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`run` joins the controller after the driver threads, and on each early return"
+        )]
         let controller_handle = match std::thread::Builder::new()
             .name("spate-controller".into())
             .spawn(move || run_controller(controller_ctx))
@@ -865,6 +868,7 @@ impl<S: Source + 'static> PipelineRuntime<S> {
         // `Drop` may still need the io runtime (the S3 source aborts its lister
         // there).
         let _ = controller_handle.join();
+        drop((signal_task, probe_task, admin_task, upkeep_task));
         io.shutdown_timeout(Duration::from_secs(2));
 
         Ok(ExitReport {
@@ -1015,6 +1019,39 @@ pub fn metrics_settings(config: &PipelineConfig) -> MetricsSettings {
             crate::config::E2eBasis::Ingest => E2eBasis::Ingest,
             crate::config::E2eBasis::Event => E2eBasis::Event,
         },
+    }
+}
+
+/// Probe the sinks at once and then periodically, keeping the
+/// sinks-connected half of `/readyz` current. Runs until aborted.
+///
+/// A panic in `probe` marks the sinks not connected, so readiness does not
+/// keep the last probe's answer once nothing updates it.
+pub(crate) async fn probe_sinks(probe: SinkProbeFn, health: Arc<HealthState>) {
+    struct NotConnectedOnPanic<'a>(&'a HealthState);
+    impl Drop for NotConnectedOnPanic<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.set_sinks_connected(false);
+            }
+        }
+    }
+    let _guard = NotConnectedOnPanic(&health);
+    loop {
+        let connected = match probe().await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "sink probe failed");
+                false
+            }
+        };
+        health.set_sinks_connected(connected);
+        let recheck = if connected {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(5)
+        };
+        tokio::time::sleep(recheck).await;
     }
 }
 

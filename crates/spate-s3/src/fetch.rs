@@ -910,9 +910,6 @@ async fn retry_or_fail(
         });
     }
     *attempt += 1;
-    if let Some(c) = retries {
-        c.increment(1);
-    }
     if *attempt >= MAX_ATTEMPTS {
         return Err(SplitFailure::Poison(
             PoisonKind::RetriesExhausted,
@@ -938,9 +935,18 @@ async fn retry_or_fail(
     // Tokio's own timer, so a frozen test clock cannot hold a retrying
     // read.
     tokio::time::sleep(backoff).await;
+    // Counted once the backoff ends, so a fetcher aborted while it waits
+    // counts no attempt it never made.
+    if let Some(c) = retries {
+        c.increment(1);
+    }
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a fetcher task ends when the test aborts it or the test's runtime drops"
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2753,28 +2759,33 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(flaky);
         let slice = rt.block_on(listed(&store));
         let (tx, rx) = mpsc::channel(4);
-        rt.spawn(run_fetcher(FetcherParams {
-            split: "s3-test".into(),
-            store,
-            slice: Arc::new(slice),
-            start_ordinal: 0,
-            resume_etag: None,
-            chunk_bytes: plan.chunk_bytes,
-            range_bytes: plan.range_bytes,
-            tx,
-            pause: Arc::new(AtomicBool::new(false)),
-            retry_base: Duration::from_millis(1),
-            retries: None,
-            range,
-            bytes_read: None,
-            origin: Origin::Lister,
-        }));
+        let fetcher = spate_core::task::spawn_on(
+            "s3-fetcher",
+            run_fetcher(FetcherParams {
+                split: "s3-test".into(),
+                store,
+                slice: Arc::new(slice),
+                start_ordinal: 0,
+                resume_etag: None,
+                chunk_bytes: plan.chunk_bytes,
+                range_bytes: plan.range_bytes,
+                tx,
+                pause: Arc::new(AtomicBool::new(false)),
+                retry_base: Duration::from_millis(1),
+                retries: None,
+                range,
+                bytes_read: None,
+                origin: Origin::Lister,
+            }),
+            rt.handle(),
+        );
         let tracker = Arc::new(SplitTracker::new());
         let (poison_tx, poison_rx) = std_mpsc::channel();
         let mut lane = S3Lane::new(
             spate_core::source::LaneId(0),
             spate_core::record::PartitionId(0),
             rx,
+            fetcher,
             rt.handle().clone(),
             Arc::new(SystemClock),
             spate_core::checkpoint::Checkpointer::new().handle(),

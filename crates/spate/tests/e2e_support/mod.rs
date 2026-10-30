@@ -33,6 +33,7 @@ use spate::avro::AvroDeserializerBuilder;
 use spate::clickhouse::{ClickHouseEncoder, config};
 use spate::config::PipelineConfig;
 use spate::error::ErrorPolicy;
+use spate::hash::FastMap;
 use spate::kafka::KafkaSource;
 use spate::ops::{ChunkConfig, chain_owned};
 use spate::pipeline::{
@@ -40,7 +41,6 @@ use spate::pipeline::{
 };
 use spate::sink::KeyHashRouter;
 use spate_test_support::{container_image, http};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -63,7 +63,7 @@ pub const CH_PASSWORD: &str = "e2e";
 
 /// Schemas the stub registry serves, by id. Shared with the server task so a
 /// scenario whose row shape is not [`Event`] can publish its own.
-type Schemas = Arc<Mutex<HashMap<u32, String>>>;
+type Schemas = Arc<Mutex<FastMap<u32, String>>>;
 
 /// Globally-unique record id: partition-millions + sequence. With a fresh
 /// topic and a single ordered producer per partition, `seq` equals the
@@ -125,7 +125,7 @@ impl Harness {
             || http(ch_addr, "GET", &query).is_ok_and(|(status, _)| status == 200),
         );
 
-        let schemas: Schemas = Arc::new(Mutex::new(HashMap::from([(
+        let schemas: Schemas = Arc::new(Mutex::new(FastMap::from_iter([(
             SCHEMA_ID,
             SCHEMA_JSON.to_string(),
         )])));
@@ -401,6 +401,10 @@ impl Harness {
             .into_runtime(source)
             .expect("into_runtime");
         let shutdown = runtime.shutdown_handle();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`RunningPipeline` joins the pipeline thread"
+        )]
         let join = std::thread::Builder::new()
             .name("e2e-pipeline".into())
             .spawn(move || runtime.run())
@@ -555,6 +559,10 @@ fn docker(args: &[&str]) {
 /// `/schemas/ids/{id}`, with `SCHEMA_JSON` under `SCHEMA_ID` out of the box,
 /// and 404s everything else, including the subject lookups a `prewarm_subjects`
 /// list makes (a pre-warm miss is logged, never fatal).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the stub server's tasks end when the test's runtime drops"
+)]
 async fn serve_stub_registry(schemas: Schemas) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

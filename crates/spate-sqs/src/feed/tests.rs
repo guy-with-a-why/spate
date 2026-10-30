@@ -1,3 +1,8 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "a test task ends when the test's runtime drops"
+)]
+
 use super::*;
 use crate::queue::BoxFuture;
 use crate::scripted::{Failure, Message, ScriptedQueue};
@@ -1516,13 +1521,13 @@ impl startup::QueueAttributes for Hangs {
         &'a self,
         queue_url: &'a str,
         _names: &'static [&'static str],
-    ) -> BoxFuture<'a, Result<HashMap<String, String>, CallError>> {
+    ) -> BoxFuture<'a, Result<FastMap<String, String>, CallError>> {
         let hang = queue_url == self.url;
         Box::pin(async move {
             if hang {
                 std::future::pending::<()>().await;
             }
-            Ok(HashMap::from([
+            Ok(FastMap::from_iter([
                 (
                     "QueueArn".to_owned(),
                     "arn:aws:sqs:x:000000000000:jobs".to_owned(),
@@ -1926,8 +1931,8 @@ impl startup::QueueAttributes for Uncounted {
         &'a self,
         _queue_url: &'a str,
         _names: &'static [&'static str],
-    ) -> BoxFuture<'a, Result<HashMap<String, String>, CallError>> {
-        Box::pin(async { Ok(HashMap::new()) })
+    ) -> BoxFuture<'a, Result<FastMap<String, String>, CallError>> {
+        Box::pin(async { Ok(FastMap::default()) })
     }
 }
 
@@ -2699,6 +2704,20 @@ async fn the_stop_methods_on_an_abandoned_feed_send_nothing() {
     step(Duration::from_secs(40)).await;
     assert!(queue.visibility().is_empty());
     assert!(queue.deletes().is_empty());
+}
+
+/// Pins `abandon`'s rustdoc that the feed's tasks end, the ones parked with
+/// no work queued among them.
+#[tokio::test(start_paused = true)]
+async fn abandon_ends_every_task() {
+    let (feed, _queue) = start(MINUTE);
+    settle_tasks().await;
+    assert!(feed.tasks.iter().all(|t| !t.is_finished()), "the tasks run");
+    feed.abandon();
+    until("every task ended", || {
+        feed.tasks.iter().all(TaskHandle::is_finished)
+    })
+    .await;
 }
 
 /// Pins that a close whose delete SQS refuses settles rejected, naming how

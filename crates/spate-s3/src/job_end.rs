@@ -17,6 +17,7 @@ use spate_core::feed::{
     DepthOf, DepthReading, EndAction, EndCheck, EndOutcome, Feed, FeedWaker, MarkerRead,
 };
 use spate_core::source::StopSignal;
+use spate_core::task::{self, TaskHandle};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -33,6 +34,9 @@ pub(crate) enum Finish {
     Solo { finished: bool },
 }
 
+/// The answer of one end-marker read.
+type MarkerAnswer = oneshot::Receiver<Result<Option<String>, SourceError>>;
+
 /// The end check of one bounded job, held by its unit reader.
 pub(crate) struct JobEnd {
     finish: Finish,
@@ -44,8 +48,9 @@ pub(crate) struct JobEnd {
     stop: StopSignal,
     /// Signalled when a marker read finishes, so the reader's park ends.
     waker: Option<FeedWaker>,
-    /// The marker read's answer, sent before its task signals the waker.
-    marker_read: Option<oneshot::Receiver<Result<Option<String>, SourceError>>>,
+    /// The marker read's task, aborted when dropped, and its answer, sent
+    /// before the task signals the waker.
+    marker_read: Option<(TaskHandle<()>, MarkerAnswer)>,
     depth_read: Option<DepthReading>,
     /// What the last depth read asked for, so a failure names it.
     depth_of: Option<DepthOf>,
@@ -102,7 +107,7 @@ impl JobEnd {
 
     /// The reader holds work: send the check back to its opening read, and
     /// drop any read outstanding, as `EndCheck::restart` asks. A marker read
-    /// still running finishes on its own, unread.
+    /// still running is aborted.
     pub(crate) fn busy(&mut self) {
         self.due = None;
         self.closed = false;
@@ -152,7 +157,7 @@ impl JobEnd {
         let Some(check) = &mut self.check else {
             return Ok(false);
         };
-        if let Some(answer) = &mut self.marker_read
+        if let Some((_, answer)) = &mut self.marker_read
             && let Some(outcome) = match answer.try_recv() {
                 Ok(outcome) => Some(Some(outcome)),
                 Err(oneshot::error::TryRecvError::Empty) => None,
@@ -194,15 +199,19 @@ impl JobEnd {
                     let location = location.clone();
                     let waker = self.waker.clone();
                     let (answer, answered) = oneshot::channel();
-                    self.marker_read = Some(answered);
                     // The answer is sent before the wake, so the poll the
                     // wake starts finds it.
-                    drop(self.handle.spawn(async move {
-                        let _ = answer.send(read_end(store.as_ref(), &location).await);
-                        if let Some(waker) = waker {
-                            waker.wake();
-                        }
-                    }));
+                    let read = task::spawn_on(
+                        "s3-end-marker-read",
+                        async move {
+                            let _ = answer.send(read_end(store.as_ref(), &location).await);
+                            if let Some(waker) = waker {
+                                waker.wake();
+                            }
+                        },
+                        &self.handle,
+                    );
+                    self.marker_read = Some((read, answered));
                 }
                 EndAction::ReadDepth(of) => {
                     self.depth_of = Some(of);
@@ -447,5 +456,74 @@ mod tests {
         );
         let err = end.idle(&feed, || Ok(Some(0))).unwrap_err().to_string();
         assert!(err.contains("not a lister run's end marker"), "{err}");
+    }
+
+    /// Pins that `busy` aborts a marker read still in flight: the read's
+    /// body never ends, and the task reading it is dropped.
+    #[test]
+    fn busy_aborts_a_marker_read_in_flight() {
+        use futures_util::StreamExt as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        static DROPPED: AtomicBool = AtomicBool::new(false);
+        struct Dropped;
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                DROPPED.store(true, Ordering::SeqCst);
+            }
+        }
+        fn hanging_get(
+            path: &object_store::path::Path,
+        ) -> Option<object_store::Result<object_store::GetResult>> {
+            STARTED.store(true, Ordering::SeqCst);
+            let guard = Dropped;
+            let body = futures_util::stream::poll_fn(move |_| {
+                let _ = &guard;
+                std::task::Poll::<Option<object_store::Result<bytes::Bytes>>>::Pending
+            })
+            .boxed();
+            let meta = object_store::ObjectMeta {
+                location: path.clone(),
+                last_modified: chrono::Utc::now(),
+                size: 10,
+                e_tag: None,
+                version: None,
+            };
+            Some(Ok(object_store::GetResult {
+                payload: object_store::GetResultPayload::Stream(body),
+                range: 0..meta.size,
+                meta,
+                attributes: Default::default(),
+                extensions: Default::default(),
+            }))
+        }
+        let rt = runtime();
+        let store: Arc<dyn ObjectStore> = Arc::new(crate::testutil::HookStore {
+            get: Some(hanging_get),
+            ..crate::testutil::HookStore::default()
+        });
+        let location = Location::parse("s3://ops/jobs/a/", "s3://data/events/").unwrap();
+        let mut end = JobEnd::new(
+            Finish::Marker {
+                store,
+                location,
+                window: Duration::from_secs(60),
+            },
+            TestClock::frozen(),
+            rt.handle().clone(),
+            StopSignal::default(),
+        );
+        let (feed, _script) = spate_test::scripted_feed();
+        assert!(!end.idle(&feed, || Ok(Some(0))).unwrap());
+        spate_test::wait_until(Duration::from_secs(30), "the marker read starts", || {
+            STARTED.load(Ordering::SeqCst)
+        });
+        assert!(!DROPPED.load(Ordering::SeqCst), "the read ended on its own");
+        end.busy();
+        spate_test::wait_until(
+            Duration::from_secs(30),
+            "the marker read is aborted",
+            || DROPPED.load(Ordering::SeqCst),
+        );
     }
 }

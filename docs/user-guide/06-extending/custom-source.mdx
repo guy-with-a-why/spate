@@ -341,7 +341,9 @@ To implement a feed backend, keep every method free of waits:
   confirm only once the unit is stored. A confirmer dropped unsettled reads as
   `Retryable`, because the unit may or may not have been stored.
 - Answer `read_depth` if your backend can count what it holds and what it has
-  dead-lettered. Read the counts on your own task and settle the
+  dead-lettered. A bounded job's end check reads both, and the runtime reads
+  the dead-lettered count on every job, so the method may be called from any
+  thread. Read the counts on your own task and settle the
   `DepthReporter` from `depth_reading()`. Set `approximate` when the counts
   are estimates, and count in `unsent` the acknowledgments and failures you
   have accepted and not yet applied. The default returns `None`, and such a

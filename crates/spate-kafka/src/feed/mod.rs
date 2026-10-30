@@ -5,10 +5,11 @@
 //! retry topics as a member of the feed's group. The follower thread reads
 //! the attempt topic into memory. The gate thread records each delivered
 //! unit's attempt before the unit reaches the reader. The depth thread
-//! answers a bounded job's depth reads. One producer writes
-//! publishes, attempt records and their tombstones, retries and dead
-//! letters. The [`Feed`] methods lock the shared state, change it, and hand
-//! any write to the producer, so none of them waits on I/O (INV-2).
+//! answers a bounded job's end check and the runtime's dead-letter reads.
+//! One producer writes publishes, attempt records and their tombstones,
+//! retries and dead letters. The [`Feed`] methods lock the shared state,
+//! change it, and hand any write to the producer, so none of them waits on
+//! I/O (INV-2).
 //!
 //! # Offsets
 //!
@@ -71,8 +72,10 @@ use spate_core::feed::{
     Confirmation, Confirmer, Delivery, DepthOf, DepthReading, DepthReporter, Feed, FeedError,
     FeedErrorKind, FeedWaker, Receipt, Unit, confirmation, depth_reading,
 };
+use spate_core::hash::FastMap;
+use spate_core::task::{ThreadHandle, spawn_thread};
 use startup::TopicAdmin as _;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -146,7 +149,7 @@ pub(crate) struct State {
     /// Deliveries not yet handed to the reader, oldest first.
     pub(crate) ready: VecDeque<Ready>,
     /// Deliveries handed to the reader, by receipt.
-    pub(crate) handed: HashMap<Receipt, Ready>,
+    pub(crate) handed: FastMap<Receipt, Ready>,
     pub(crate) fatal: Option<FeedError>,
     /// A transient consumer failure, returned by the next `receive` only.
     pub(crate) retryable: Option<FeedError>,
@@ -465,9 +468,9 @@ impl Drop for LatchOnPanic {
 pub struct KafkaFeed {
     core: Arc<Core>,
     producer: Producer,
-    thread: Option<std::thread::JoinHandle<()>>,
-    gate: Option<std::thread::JoinHandle<()>>,
-    follower: Option<std::thread::JoinHandle<()>>,
+    thread: Option<ThreadHandle<()>>,
+    gate: Option<ThreadHandle<()>>,
+    follower: Option<ThreadHandle<()>>,
     /// Hands depth reads to the depth thread, which ends once this drops.
     depth: Option<Mutex<mpsc::Sender<(DepthOf, DepthReporter)>>>,
 }
@@ -626,12 +629,9 @@ impl KafkaFeed {
             KafkaFeedError::Unavailable(format!("starting the feed's gate thread: {e}"))
         })?);
         feed.thread = Some(
-            std::thread::Builder::new()
-                .name("spate-kafka-feed".to_owned())
-                .spawn(move || consumer::run(driver))
-                .map_err(|e| {
-                    KafkaFeedError::Unavailable(format!("starting the feed's consumer thread: {e}"))
-                })?,
+            spawn_thread("spate-kafka-feed", move || consumer::run(driver)).map_err(|e| {
+                KafkaFeedError::Unavailable(format!("starting the feed's consumer thread: {e}"))
+            })?,
         );
         feed.depth = Some(Mutex::new(start_depth(&config, &feed.core)?));
         log_started(&config, &checked);
@@ -660,6 +660,10 @@ fn start_depth(
         })?;
     let (tx, rx) = mpsc::channel();
     let core = Arc::clone(core);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the depth thread ends once the feed drops the returned sender, after any read in flight"
+    )]
     std::thread::Builder::new()
         .name("spate-kafka-feed-depth".to_owned())
         .spawn(move || {
@@ -781,17 +785,10 @@ fn parts(
 impl Drop for KafkaFeed {
     fn drop(&mut self) {
         stop(&self.core);
-        for (name, thread) in [
-            ("gate", self.gate.take()),
-            ("follower", self.follower.take()),
-            ("consumer", self.thread.take()),
-        ] {
-            if let Some(thread) = thread
-                && thread.join().is_err()
-            {
-                tracing::error!("the Kafka feed's {name} thread panicked");
-            }
-        }
+        // Each drop joins its thread; a panic in one was logged as it ended.
+        drop(self.gate.take());
+        drop(self.follower.take());
+        drop(self.thread.take());
     }
 }
 

@@ -3,6 +3,11 @@
 //! bundle. The Checkpointer, DrainBarrier, and WatermarkController in the
 //! loop are the real implementations.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "each test joins its pipeline thread, and its io tasks end when the io runtime drops"
+)]
+
 use super::fakes::*;
 use super::*;
 use crate::config::PipelineConfig;
@@ -2604,8 +2609,7 @@ fn the_source_learns_where_its_feed_came_from() {
 }
 
 /// Pins that the source reads through a feed the runtime counts, under the
-/// `feed` component and the backend's key, and times on the injected clock,
-/// and that the runtime publishes the dead-letter depth it reads at startup.
+/// `feed` component and the backend's key, and times on the injected clock.
 #[test]
 fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     use crate::feed::{Feed, Unit};
@@ -2673,58 +2677,69 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     assert_eq!(report.state, ExitState::Completed);
 }
 
+/// The in-process feed, counting the dead-letter reads made on it and failing
+/// each one when `fails` is set.
+struct DeadLetterReads {
+    inner: MemoryFeed,
+    reads: Arc<AtomicUsize>,
+    fails: bool,
+}
+
+impl crate::feed::Feed for DeadLetterReads {
+    fn backend(&self) -> &str {
+        self.inner.backend()
+    }
+    fn set_waker(&self, waker: crate::feed::FeedWaker) {
+        self.inner.set_waker(waker);
+    }
+    fn receive(&self, max: usize) -> Result<Vec<crate::feed::Delivery>, crate::feed::FeedError> {
+        self.inner.receive(max)
+    }
+    fn renew(&self, receipt: crate::feed::Receipt) -> Result<(), crate::feed::FeedError> {
+        self.inner.renew(receipt)
+    }
+    fn acknowledge(&self, receipt: crate::feed::Receipt) -> Result<(), crate::feed::FeedError> {
+        self.inner.acknowledge(receipt)
+    }
+    fn fail(
+        &self,
+        receipt: crate::feed::Receipt,
+        reason: &str,
+    ) -> Result<(), crate::feed::FeedError> {
+        self.inner.fail(receipt, reason)
+    }
+    fn publish(&self, unit: crate::feed::Unit) -> crate::feed::Confirmation {
+        self.inner.publish(unit)
+    }
+    fn read_depth(&self, of: crate::feed::DepthOf) -> Option<crate::feed::DepthReading> {
+        if of == crate::feed::DepthOf::DeadLetters {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.fails {
+                let (reporter, reading) = crate::feed::depth_reading();
+                reporter.report(Err(crate::feed::FeedError::new(
+                    crate::feed::FeedErrorKind::Retryable,
+                    "throttled",
+                )));
+                return Some(reading);
+            }
+        }
+        self.inner.read_depth(of)
+    }
+}
+
 /// Pins that the runtime reads the feed's dead-letter depth once at startup
 /// by default, and makes no such read when `dead_letter_read_interval` is
 /// `None`.
 #[test]
 fn the_runtime_reads_dead_letters_only_on_its_interval() {
-    use crate::feed::{
-        Confirmation, Delivery, DepthOf, DepthReading, Feed, FeedError, FeedWaker, Receipt, Unit,
-    };
-
-    /// The in-process feed, counting the dead-letter reads made on it.
-    struct Counting {
-        inner: MemoryFeed,
-        reads: Arc<AtomicUsize>,
-    }
-
-    impl Feed for Counting {
-        fn backend(&self) -> &str {
-            self.inner.backend()
-        }
-        fn set_waker(&self, waker: FeedWaker) {
-            self.inner.set_waker(waker);
-        }
-        fn receive(&self, max: usize) -> Result<Vec<Delivery>, FeedError> {
-            self.inner.receive(max)
-        }
-        fn renew(&self, receipt: Receipt) -> Result<(), FeedError> {
-            self.inner.renew(receipt)
-        }
-        fn acknowledge(&self, receipt: Receipt) -> Result<(), FeedError> {
-            self.inner.acknowledge(receipt)
-        }
-        fn fail(&self, receipt: Receipt, reason: &str) -> Result<(), FeedError> {
-            self.inner.fail(receipt, reason)
-        }
-        fn publish(&self, unit: Unit) -> Confirmation {
-            self.inner.publish(unit)
-        }
-        fn read_depth(&self, of: DepthOf) -> Option<DepthReading> {
-            if of == DepthOf::DeadLetters {
-                self.reads.fetch_add(1, Ordering::Relaxed);
-            }
-            self.inner.read_depth(of)
-        }
-    }
-
     for (interval, expected) in [(None, 0), (Some(Duration::from_secs(60)), 1)] {
         let mut cfg = test_config(1);
         cfg.feed = feed_section("memory: {}");
         let reads = Arc::new(AtomicUsize::new(0));
-        let feed = Counting {
+        let feed = DeadLetterReads {
             inner: MemoryFeed::new(),
             reads: Arc::clone(&reads),
+            fails: false,
         };
         let options = RuntimeOptions {
             dead_letter_read_interval: interval,
@@ -2742,6 +2757,71 @@ fn the_runtime_reads_dead_letters_only_on_its_interval() {
         assert_eq!(report.state, ExitState::Completed);
         assert_eq!(reads.load(Ordering::Relaxed), expected, "{interval:?}");
     }
+}
+
+/// Pins that the runtime times its dead-letter reads on the injected clock:
+/// one at startup, and the next once that clock has moved an interval.
+#[test]
+fn the_runtime_reads_dead_letters_on_its_clock() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let feed = DeadLetterReads {
+        inner: MemoryFeed::new(),
+        reads: Arc::clone(&reads),
+        fails: false,
+    };
+    let clock = crate::clock::TestClock::frozen();
+    let injected = Arc::clone(&clock);
+    let h = start_prepared(
+        cfg,
+        test_options(),
+        |log| log.accept_feed = true,
+        move |runtime, _| runtime.with_feed(Arc::new(feed)).with_clock(injected),
+        ok_chain,
+    );
+    wait_for("the startup read", Duration::from_secs(5), || {
+        reads.load(Ordering::Relaxed) == 1
+    });
+    clock.advance(crate::feed::DEAD_LETTER_READ_INTERVAL);
+    wait_for("the second read", Duration::from_secs(5), || {
+        reads.load(Ordering::Relaxed) == 2
+    });
+    h.script.lock().unwrap().push_back(Script::Drained);
+    assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
+}
+
+/// Pins that a dead-letter read that fails is logged as a warning naming the
+/// feed.
+#[test]
+fn a_failed_dead_letter_read_warns() {
+    let mut cfg = test_config(1);
+    cfg.feed = feed_section("memory: {}");
+    let feed = DeadLetterReads {
+        inner: MemoryFeed::new(),
+        reads: Arc::default(),
+        fails: true,
+    };
+    let h = start_prepared(
+        cfg,
+        test_options(),
+        |log| log.accept_feed = true,
+        move |runtime, _| runtime.with_feed(Arc::new(feed)),
+        ok_chain,
+    );
+    let warned = || {
+        h.warnings.0.lock().unwrap().iter().any(|fields| {
+            fields
+                .iter()
+                .any(|(name, value)| name == "message" && value.contains("dead-letter destination"))
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "feed" && value.contains("memory"))
+        })
+    };
+    wait_for("the warning", Duration::from_secs(5), warned);
+    h.script.lock().unwrap().push_back(Script::Drained);
+    assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
 }
 
 /// Pins that the runtime hands a feed backend a `Meter` scoped
@@ -5377,4 +5457,38 @@ fn a_thread_with_no_lanes_flushes_at_its_lull_on_the_injected_clock() {
     });
     h.shutdown.trigger();
     h.join.join().unwrap().unwrap();
+}
+
+/// Pins that a sink probe panicking after a successful probe turns readiness
+/// off, so `/readyz` does not keep the last answer once nothing updates it.
+#[test]
+fn a_panicking_probe_does_not_leave_readiness_stale() {
+    let health = crate::admin::HealthState::new(0, crate::admin::HealthThresholds::default());
+    health.set_assignment_received(true);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe: super::SinkProbeFn = {
+        let calls = Arc::clone(&calls);
+        Box::new(move || {
+            assert_eq!(calls.fetch_add(1, Ordering::SeqCst), 0, "the probe panics");
+            Box::pin(async { Ok(()) })
+        })
+    };
+    let joined = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let probing = crate::task::spawn(
+                "sink-probe",
+                super::runtime::probe_sinks(probe, Arc::clone(&health)),
+            );
+            // Time is paused, so the 30 s recheck passes at once.
+            tokio::time::timeout(Duration::from_secs(120), probing)
+                .await
+                .expect("the probe loop ends within the deadline")
+        });
+    assert!(joined.unwrap_err().is_panic());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(!health.ready(), "readiness kept the last probe's answer");
 }

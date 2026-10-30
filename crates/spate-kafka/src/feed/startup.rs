@@ -24,7 +24,7 @@ use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{Producer, ThreadedProducer};
 use spate_core::clock::SyncClock;
 use spate_core::error::ErrorClass;
-use std::collections::HashMap;
+use spate_core::hash::FastMap;
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::pin::Pin;
@@ -84,7 +84,7 @@ pub(crate) trait TopicAdmin: Send + Sync {
     fn configs<'a>(
         &'a self,
         topic: &'a str,
-    ) -> BoxFuture<'a, Result<HashMap<String, Option<String>>, AdminError>>;
+    ) -> BoxFuture<'a, Result<FastMap<String, Option<String>>, AdminError>>;
 
     /// The text of a credential or TLS handshake rejection the client
     /// recorded since it was built, if any.
@@ -139,6 +139,10 @@ impl TopicAdmin for Brokers {
         // `fetch_metadata` blocks, so it runs on a thread of its own, which
         // ends with the read at most `CONNECT_BOUND` later even when the
         // connect bound has already passed.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the check thread ends with its metadata read, at most `CONNECT_BOUND` after it starts"
+        )]
         let spawned = std::thread::Builder::new()
             .name("spate-kafka-feed-check".to_owned())
             .spawn(move || {
@@ -178,7 +182,7 @@ impl TopicAdmin for Brokers {
     fn configs<'a>(
         &'a self,
         topic: &'a str,
-    ) -> BoxFuture<'a, Result<HashMap<String, Option<String>>, AdminError>> {
+    ) -> BoxFuture<'a, Result<FastMap<String, Option<String>>, AdminError>> {
         Box::pin(async move {
             let options = AdminOptions::new().request_timeout(Some(CONNECT_BOUND));
             let results = self
@@ -446,6 +450,10 @@ pub(crate) async fn bounded<T>(
     // Held until `checks` ends: dropping it ends the timing thread.
     let (_finished, done) = mpsc::channel::<()>();
     let deadline = clock.now() + limit;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the timing thread ends when the bound fires or when `_finished` drops after `checks`"
+    )]
     std::thread::Builder::new()
         .name("spate-kafka-feed-bound".to_owned())
         .spawn(move || {
@@ -485,6 +493,10 @@ pub(crate) async fn bounded<T>(
     .await
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test thread ends with the call it runs, or serves a stub until the test process exits"
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,7 +521,7 @@ mod tests {
 
     /// The configuration Apache Kafka describes for a topic created with no
     /// overrides, in part: every entry, its default included, with a value.
-    fn broker_defaults() -> HashMap<String, Option<String>> {
+    fn broker_defaults() -> FastMap<String, Option<String>> {
         [
             ("cleanup.policy", "delete"),
             ("message.timestamp.type", "CreateTime"),
@@ -527,11 +539,11 @@ mod tests {
     /// with `UnknownTopicOrPartition`, for metadata and configuration alike.
     #[derive(Default)]
     struct Scripted {
-        topics: HashMap<String, HashMap<String, Option<String>>>,
+        topics: FastMap<String, FastMap<String, Option<String>>>,
         /// Partition counts by topic; one where a topic has none here.
-        partitions: HashMap<String, usize>,
-        metadata_errors: HashMap<String, AdminError>,
-        config_errors: HashMap<String, AdminError>,
+        partitions: FastMap<String, usize>,
+        metadata_errors: FastMap<String, AdminError>,
+        config_errors: FastMap<String, AdminError>,
         /// A topic whose metadata read (`true`) or configuration read
         /// (`false`) never answers.
         hangs: Option<(&'static str, bool)>,
@@ -597,7 +609,7 @@ mod tests {
         fn configs<'a>(
             &'a self,
             topic: &'a str,
-        ) -> BoxFuture<'a, Result<HashMap<String, Option<String>>, AdminError>> {
+        ) -> BoxFuture<'a, Result<FastMap<String, Option<String>>, AdminError>> {
             let hang = self.hangs == Some((topic, false));
             let answer = match self.config_errors.get(topic) {
                 Some(e) => Err(e.clone()),
@@ -1055,7 +1067,7 @@ mod tests {
             (ATTEMPTS, "attempt"),
         ] {
             let mut admin = Scripted::all();
-            admin.topics.insert(topic.to_owned(), HashMap::new());
+            admin.topics.insert(topic.to_owned(), FastMap::default());
             let message = refusal(run(&admin));
             assert!(
                 message.contains(&format!(

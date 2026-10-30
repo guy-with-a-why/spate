@@ -23,21 +23,22 @@
 use super::leaf::put_string;
 use crate::schema::typeparse::ChType;
 use bytes::{BufMut, BytesMut};
-use std::collections::HashMap;
+use spate_core::hash::QualityMap;
 
-// `map` interns per row, so it uses foldhash rather than std's SipHash.
+// `map` is keyed by row values a producer chooses, so it takes the quality
+// hasher.
 //   1. Wire bytes are hasher-independent. Dictionary order is first-seen
 //      append order into `dict`, so the encoded block is byte-identical
 //      regardless of hash function.
-//   2. The dict is per-block and reset each block (entries ≤ rows per block),
-//      and foldhash's RandomState seeds per instance, so HashDoS exposure is a
-//      bounded per-block probe cost.
-type DictMap = HashMap<Vec<u8>, u64, foldhash::fast::RandomState>;
+//   2. The dict is reset each block (entries ≤ values interned in the block
+//      plus the reserved slots) and keeps one per-instance seed for the life
+//      of the `LowCard`, so a crafted block costs at most a bounded per-block
+//      probe count.
 
 pub(crate) struct LowCard {
     nullable: bool,
     /// Dictionary-entry raw bytes → assigned index.
-    map: DictMap,
+    map: QualityMap<Vec<u8>, u64>,
     /// Accumulated dictionary entries, each `[VarUInt len][bytes]`.
     dict: BytesMut,
     dict_count: u64,
@@ -59,7 +60,7 @@ impl LowCard {
         };
         let mut lc = LowCard {
             nullable,
-            map: DictMap::default(),
+            map: QualityMap::default(),
             dict: BytesMut::new(),
             dict_count: 0,
             keys: Vec::new(),
@@ -189,5 +190,25 @@ fn key_width_code(dict_size: u64) -> u8 {
         2
     } else {
         3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hash::BuildHasher;
+
+    /// `reset` clears the dictionary for the next block and keeps the map's
+    /// per-instance seed.
+    #[test]
+    fn reset_keeps_the_dictionary_seed() {
+        let mut lc = LowCard::build(&ChType::Named("String".into())).expect("builds");
+        for i in 0..64 {
+            lc.intern(format!("v{i}").as_bytes());
+        }
+        let before = lc.map.hasher().hash_one(b"probe".as_slice());
+        lc.reset();
+        assert_eq!(lc.map.len(), 1, "only the reserved default slot remains");
+        assert_eq!(lc.map.hasher().hash_one(b"probe".as_slice()), before);
     }
 }

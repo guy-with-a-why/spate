@@ -9,11 +9,12 @@
 
 use spate_core::checkpoint::AckIssuer;
 use spate_core::error::{ErrorClass, SourceError};
+use spate_core::hash::FastMap;
 use spate_core::record::{PartitionId, RawPayload};
 use spate_core::source::{
     DrainBarrier, LaneId, PayloadBatch, Source, SourceCtx, SourceEvent, SourceLane,
 };
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -43,8 +44,8 @@ enum ScriptEvent {
 
 #[derive(Debug, Default)]
 struct Shared {
-    partitions: HashMap<PartitionId, PartitionQueue>,
-    active: HashMap<LaneId, PartitionId>,
+    partitions: FastMap<PartitionId, PartitionQueue>,
+    active: FastMap<LaneId, PartitionId>,
     paused: BTreeSet<LaneId>,
     committed: Vec<(PartitionId, i64)>,
     flush_commits_calls: usize,
@@ -509,6 +510,7 @@ mod tests {
     use spate_core::checkpoint::Checkpointer;
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "the test joins the thread")]
     fn poll_blocks_until_a_push_from_another_thread() {
         let mut cp = Checkpointer::new();
         let (mut source, handle) = memory_source();

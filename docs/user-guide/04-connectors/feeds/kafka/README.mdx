@@ -44,9 +44,10 @@ its four threads: the consumer thread, which polls the group member; the
 follower thread, which reads the attempt topic; the gate thread, which
 records each unit's attempt before the unit is read (see
 [Counting deliveries](#counting-deliveries)); and the depth thread, which
-answers a bounded job's depth reads (see
-[Ending a bounded job](#ending-a-bounded-job)). The checks read from the
-brokers, so an unreachable broker fails the call within 30 seconds.
+answers a bounded job's end check (see
+[Ending a bounded job](#ending-a-bounded-job)) and the runtime's dead-letter
+reads (see [Metrics](#metrics)). The checks read from the brokers, so an
+unreachable broker fails the call within 30 seconds.
 
 ## Configuration
 
