@@ -68,6 +68,7 @@ use spate_core::feed::{
 };
 use spate_core::record::PartitionId;
 use spate_core::source::{DrainBarrier, LaneId, SourceEvent};
+use spate_core::task;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -928,23 +929,26 @@ impl UnitReader {
         } else {
             part.object.len() as u64
         };
-        // Detached: the fetcher exits when the lane drops its receiver.
-        drop(parts.handle.spawn(run_fetcher(FetcherParams {
-            split: label.clone(),
-            store: Arc::clone(&parts.store),
-            slice: part.object,
-            start_ordinal: 0,
-            resume_etag: None,
-            chunk_bytes: parts.chunk_bytes,
-            range_bytes: parts.range_bytes,
-            tx,
-            pause: Arc::clone(&pause),
-            retry_base: parts.retry_base,
-            retries: parts.metrics.as_ref().map(|m| m.get_retries.clone()),
-            range: part.range,
-            bytes_read: parts.metrics.as_ref().map(|m| m.bytes_read.clone()),
-            origin: part.origin,
-        })));
+        let fetcher = task::spawn_on(
+            "s3-fetcher",
+            run_fetcher(FetcherParams {
+                split: label.clone(),
+                store: Arc::clone(&parts.store),
+                slice: part.object,
+                start_ordinal: 0,
+                resume_etag: None,
+                chunk_bytes: parts.chunk_bytes,
+                range_bytes: parts.range_bytes,
+                tx,
+                pause: Arc::clone(&pause),
+                retry_base: parts.retry_base,
+                retries: parts.metrics.as_ref().map(|m| m.get_retries.clone()),
+                range: part.range,
+                bytes_read: parts.metrics.as_ref().map(|m| m.bytes_read.clone()),
+                origin: part.origin,
+            }),
+            &parts.handle,
+        );
         if let Some(m) = &parts.metrics {
             m.objects_remaining.increment(members as f64);
         }
@@ -952,6 +956,7 @@ impl UnitReader {
             lane,
             partition,
             rx,
+            fetcher,
             parts.handle.clone(),
             Arc::clone(&parts.clock),
             parts.issuer.clone(),
@@ -1781,6 +1786,126 @@ mod tests {
         assert!(
             reader.park.park(Duration::ZERO),
             "the lane's signal did not reach the reader's park"
+        );
+    }
+
+    /// Pins that dropping a lane ends its fetcher while the fetcher backs off
+    /// between failed reads, so it issues no further GET.
+    #[test]
+    fn a_lane_dropped_during_backoff_ends_its_fetcher() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static GETS: AtomicU32 = AtomicU32::new(0);
+        fn failing_get(
+            _: &object_store::path::Path,
+        ) -> Option<object_store::Result<object_store::GetResult>> {
+            GETS.fetch_add(1, Ordering::SeqCst);
+            Some(Err(object_store::Error::Generic {
+                store: "test",
+                source: "injected get failure".into(),
+            }))
+        }
+        let gets = || GETS.load(Ordering::SeqCst);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let (mut reader, script, _idle_rt) = reader();
+        reader.parts.store = Arc::new(crate::testutil::HookStore {
+            get: Some(failing_get),
+            ..crate::testutil::HookStore::default()
+        });
+        reader.parts.handle = rt.handle().clone();
+        reader.parts.retry_base = Duration::from_secs(1);
+        script.deliver(descriptor_unit(0));
+        start(&mut reader);
+        let lanes = lanes_added(poll(&mut reader));
+        assert_eq!(lanes.len(), 1);
+
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while gets() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the fetcher's first GET within the deadline");
+            assert_eq!(gets(), 1);
+            drop(lanes);
+            // Past every backoff a fetcher could take before its last
+            // attempt.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        assert_eq!(gets(), 1, "the fetcher retried after its lane dropped");
+    }
+
+    /// Pins that `get_retries_total` counts only the GET attempts made beyond
+    /// the first, also when a lane drops during its fetcher's backoff.
+    #[test]
+    fn a_lane_dropped_during_backoff_counts_no_retry() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static GETS: AtomicU32 = AtomicU32::new(0);
+        fn failing_get(
+            _: &object_store::path::Path,
+        ) -> Option<object_store::Result<object_store::GetResult>> {
+            GETS.fetch_add(1, Ordering::SeqCst);
+            Some(Err(object_store::Error::Generic {
+                store: "test",
+                source: "injected get failure".into(),
+            }))
+        }
+        let gets = || GETS.load(Ordering::SeqCst);
+
+        let pipeline = unique_name("retries");
+        let rendered = render_local(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            let (mut reader, script, _idle_rt) = reader();
+            reader.parts.metrics = Some(S3Metrics::new(&Meter::with_namespace(
+                "s3",
+                pipeline.clone(),
+                "src",
+                "s3",
+            )));
+            reader.parts.store = Arc::new(crate::testutil::HookStore {
+                get: Some(failing_get),
+                ..crate::testutil::HookStore::default()
+            });
+            reader.parts.handle = rt.handle().clone();
+            reader.parts.retry_base = Duration::from_secs(1);
+            script.deliver(descriptor_unit(0));
+            start(&mut reader);
+            let lanes = lanes_added(poll(&mut reader));
+            assert_eq!(lanes.len(), 1);
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while gets() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the fetcher's first GET within the deadline");
+                // Into the backoff that follows the failed GET.
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                drop(lanes);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        });
+        assert_eq!(gets(), 1, "one GET was made");
+        let retries = metric_value(
+            &rendered,
+            "spate_s3_get_retries_total",
+            &[("pipeline", pipeline.as_str())],
+        )
+        .expect("the counter is registered");
+        assert_eq!(
+            retries,
+            f64::from(gets() - 1),
+            "get_retries_total against the GET attempts beyond the first"
         );
     }
 
