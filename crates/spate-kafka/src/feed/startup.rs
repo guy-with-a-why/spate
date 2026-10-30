@@ -17,11 +17,12 @@
 //! connecting with the rejection's text, as soon as the client reports it.
 
 use super::{KafkaFeedError, Topics};
+use crate::client::SpateContext;
 use crate::sink::SinkContext;
 use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
-use rdkafka::client::DefaultClientContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{Producer, ThreadedProducer};
+use spate_core::clock::SyncClock;
 use spate_core::error::ErrorClass;
 use std::collections::HashMap;
 use std::future::Future;
@@ -31,7 +32,7 @@ use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 /// How long the checks may take, every step included.
@@ -99,16 +100,14 @@ pub(crate) trait TopicAdmin: Send + Sync {
 /// rejection. Every topic's metadata is read before any configuration, so a
 /// rejection is met first on `reader`.
 pub(crate) struct Brokers {
-    admin: Arc<AdminClient<DefaultClientContext>>,
+    admin: Arc<AdminClient<SpateContext<()>>>,
     reader: Arc<ThreadedProducer<SinkContext>>,
 }
 
 impl Brokers {
-    /// Wraps `admin` and `reader`, which must both be built with
-    /// `allow.auto.create.topics` off: with it on, a metadata read of a
-    /// missing topic creates the topic with the broker's defaults.
+    /// Wraps `admin` and `reader`.
     pub(crate) fn new(
-        admin: AdminClient<DefaultClientContext>,
+        admin: AdminClient<SpateContext<()>>,
         reader: ThreadedProducer<SinkContext>,
     ) -> Brokers {
         Brokers {
@@ -420,15 +419,15 @@ pub(crate) async fn check(
     Ok(checked)
 }
 
-/// `checks` under a bound of `limit`, ended early by a rejection
+/// `checks` under a bound of `limit` on `clock`, ended early by a rejection
 /// `rejection` returns. Past the bound, an [`KafkaFeedError::Unavailable`]
 /// naming the step `step` holds.
 ///
 /// The bound is timed on a thread of its own, so it fires on any runtime:
 /// one whose timer nothing drives, as under `Handle::block_on` on a
 /// current-thread runtime, one with timers disabled, and one that has shut
-/// down. The thread calls `rejection` every [`REJECTION_TICK`], and ends
-/// when `checks` does.
+/// down. The thread calls `rejection` every [`REJECTION_TICK`] of real time,
+/// reading `clock` each time, and ends when `checks` does.
 ///
 /// # Errors
 ///
@@ -438,6 +437,7 @@ pub(crate) async fn check(
 pub(crate) async fn bounded<T>(
     step: &Mutex<String>,
     limit: Duration,
+    clock: SyncClock,
     rejection: impl Fn() -> Option<String> + Send + 'static,
     checks: impl Future<Output = Result<T, KafkaFeedError>>,
 ) -> Result<T, KafkaFeedError> {
@@ -445,12 +445,12 @@ pub(crate) async fn bounded<T>(
     let (fire, mut fired) = oneshot::channel::<Option<String>>();
     // Held until `checks` ends: dropping it ends the timing thread.
     let (_finished, done) = mpsc::channel::<()>();
-    let deadline = Instant::now() + limit;
+    let deadline = clock.now() + limit;
     std::thread::Builder::new()
         .name("spate-kafka-feed-bound".to_owned())
         .spawn(move || {
             loop {
-                let left = deadline.saturating_duration_since(Instant::now());
+                let left = deadline.saturating_duration_since(clock.now());
                 if done.recv_timeout(left.min(REJECTION_TICK)) != Err(RecvTimeoutError::Timeout) {
                     return;
                 }
@@ -460,7 +460,7 @@ pub(crate) async fn bounded<T>(
                     let _ = fire.send(Some(text));
                     return;
                 }
-                if Instant::now() >= deadline {
+                if clock.now() >= deadline {
                     let _ = fire.send(None);
                     return;
                 }
@@ -490,6 +490,8 @@ mod tests {
     use super::*;
     use crate::feed::config::KafkaFeedConfig;
     use RDKafkaErrorCode as C;
+    use spate_core::clock::TestClock;
+    use spate_test::wait_until;
 
     const WORK: &str = "units";
     const RETRY: &str = "units-retry";
@@ -915,44 +917,66 @@ mod tests {
         }
     }
 
-    /// A bound short enough that a test waits on it, never on the real one.
+    /// The bound the tests advance a frozen clock past.
     const SHORT: Duration = Duration::from_millis(20);
 
-    /// How long a test waits for the short bound to fire.
+    /// How long a test waits for the bound to fire.
     const DEADLINE: Duration = Duration::from_secs(10);
 
-    /// The checks under [`SHORT`] on a thread of their own, as `connect`
-    /// runs them: through `Handle::block_on` on `io`, with the read of
-    /// `hangs` never answering. `None` when nothing came back within
-    /// [`DEADLINE`].
+    /// The checks under [`SHORT`] on a frozen clock, as `connect` runs them:
+    /// through `Handle::block_on` on `io`, with the read of `hangs` never
+    /// answering. The clock moves past the bound once the checks are on
+    /// `reading`. `None` when nothing came back within [`DEADLINE`].
     fn bounded_on(
         io: tokio::runtime::Handle,
         hangs: (&'static str, bool),
+        reading: &str,
     ) -> Option<Result<Checked, KafkaFeedError>> {
-        bounded_with(io, hangs, SHORT, None)
+        let clock = TestClock::frozen();
+        let run = bounded_with(io, hangs, SHORT, &clock, || None);
+        run.wait_for(reading);
+        clock.advance(SHORT);
+        run.done.recv_timeout(DEADLINE).ok()
     }
 
-    /// [`bounded_on`] under a bound of `limit`, with `rejection` as the
-    /// rejection the client recorded.
+    /// Checks running under [`bounded`] on a thread of their own.
+    struct Bounded {
+        /// The step the checks are on.
+        step: Arc<Mutex<String>>,
+        done: mpsc::Receiver<Result<Checked, KafkaFeedError>>,
+    }
+
+    impl Bounded {
+        /// Wait until the checks are on `reading`.
+        fn wait_for(&self, reading: &str) {
+            wait_until(DEADLINE, reading, || {
+                *self.step.lock().unwrap_or_else(PoisonError::into_inner) == reading
+            });
+        }
+    }
+
+    /// The checks with the read of `hangs` never answering, under a bound of
+    /// `limit` on `clock`, with `rejection` as the client's rejection watch.
     fn bounded_with(
         io: tokio::runtime::Handle,
         hangs: (&'static str, bool),
         limit: Duration,
-        rejection: Option<&'static str>,
-    ) -> Option<Result<Checked, KafkaFeedError>> {
-        let (tx, rx) = mpsc::channel();
+        clock: &Arc<TestClock>,
+        rejection: impl Fn() -> Option<String> + Send + 'static,
+    ) -> Bounded {
+        let (tx, done) = mpsc::channel();
+        let step = Arc::new(Mutex::new("starting".to_owned()));
+        let (running, clock) = (Arc::clone(&step), SyncClock::new(Arc::clone(clock) as _));
         std::thread::spawn(move || {
             let admin = Scripted {
                 hangs: Some(hangs),
                 ..Scripted::all()
             };
-            let step = Mutex::new("starting".to_owned());
             let topics = topics();
-            let checks = check(&admin, &topics, Scope::All, &step);
-            let rejection = move || rejection.map(str::to_owned);
-            let _ = tx.send(io.block_on(bounded(&step, limit, rejection, checks)));
+            let checks = check(&admin, &topics, Scope::All, &running);
+            let _ = tx.send(io.block_on(bounded(&running, limit, clock, rejection, checks)));
         });
-        rx.recv_timeout(DEADLINE).ok()
+        Bounded { step, done }
     }
 
     fn multi_thread() -> tokio::runtime::Runtime {
@@ -978,7 +1002,8 @@ mod tests {
                 "while reading the configuration of the dead-letter topic `units-dead`",
             ),
         ] {
-            match bounded_on(io.handle().clone(), hangs) {
+            let reading = step.trim_start_matches("while ");
+            match bounded_on(io.handle().clone(), hangs, reading) {
                 Some(Err(KafkaFeedError::Unavailable(message))) => {
                     assert!(message.ends_with(step), "{message}");
                 }
@@ -1005,7 +1030,11 @@ mod tests {
             ("timers disabled", untimed.handle().clone()),
             ("shut down", stopped),
         ] {
-            match bounded_on(io, (WORK, true)) {
+            match bounded_on(
+                io,
+                (WORK, true),
+                "reading the metadata of the work topic `units`",
+            ) {
                 Some(Err(KafkaFeedError::Unavailable(message))) => assert!(
                     message.ends_with("while reading the metadata of the work topic `units`"),
                     "{name}: {message}"
@@ -1084,17 +1113,12 @@ mod tests {
     /// however long ago it arrived.
     #[test]
     fn a_rejection_refuses_the_connect_check_at_any_age() {
-        use rdkafka::ClientConfig;
+        use crate::client::testing::raw;
         let clock = spate_core::clock::TestClock::frozen();
-        let context = SinkContext::detached(crate::clock::SyncClock::new(Arc::clone(&clock) as _));
-        let mut config = ClientConfig::new();
-        config.set("bootstrap.servers", crate::testutil::refused_broker());
-        let brokers = Brokers::new(
-            config.create().expect("admin client"),
-            config
-                .create_with_context(context)
-                .expect("metadata client"),
-        );
+        let hooks = crate::sink::SinkHooks::detached(SyncClock::new(Arc::clone(&clock) as _));
+        let broker = crate::testutil::refused_broker();
+        let properties = [("bootstrap.servers", broker.as_str())];
+        let brokers = Brokers::new(raw(&properties, ()), raw(&properties, hooks));
         brokers.reader.context().note_error(C::SSL, ALERT_40);
         clock.advance(Duration::from_secs(3600));
         assert_eq!(brokers.rejection().as_deref(), Some(ALERT_40));
@@ -1107,7 +1131,11 @@ mod tests {
     fn a_recorded_rejection_ends_the_checks_before_the_bound() {
         let io = multi_thread();
         let limit = Duration::from_secs(600);
-        match bounded_with(io.handle().clone(), (RETRY, true), limit, Some(ALERT_40)) {
+        let clock = TestClock::frozen();
+        let run = bounded_with(io.handle().clone(), (RETRY, true), limit, &clock, || {
+            Some(ALERT_40.to_owned())
+        });
+        match run.done.recv_timeout(DEADLINE).ok() {
             Some(Err(KafkaFeedError::Refused(message))) => {
                 assert!(
                     message.starts_with("reading the metadata of the retry topic `units-retry`: "),
@@ -1119,12 +1147,112 @@ mod tests {
         }
     }
 
+    /// Pins that the connect bound fires once `limit` has passed on its
+    /// clock, and not before.
+    #[test]
+    fn the_connect_bound_fires_at_its_limit_on_the_given_clock() {
+        let io = multi_thread();
+        let limit = Duration::from_secs(600);
+        let clock = TestClock::frozen();
+        let asked = Arc::new(Mutex::new(0_usize));
+        let counted = Arc::clone(&asked);
+        let run = bounded_with(
+            io.handle().clone(),
+            (RETRY, true),
+            limit,
+            &clock,
+            move || {
+                *counted.lock().unwrap() += 1;
+                None
+            },
+        );
+        run.wait_for("reading the metadata of the retry topic `units-retry`");
+        // The bound thread asks for a rejection before each deadline check,
+        // so a second ask after the advance follows a check that read it.
+        let sample = {
+            let asked = asked.lock().unwrap();
+            clock.advance(limit - Duration::from_nanos(1));
+            *asked
+        };
+        wait_until(DEADLINE, "the bound checks the advanced clock", || {
+            *asked.lock().unwrap() >= sample + 2
+        });
+        assert!(run.done.try_recv().is_err(), "fired before its limit");
+        clock.advance(Duration::from_nanos(1));
+        match run.done.recv_timeout(DEADLINE) {
+            Ok(Err(KafkaFeedError::Unavailable(message))) => assert!(
+                message.starts_with("the startup checks took longer than 600s"),
+                "{message}"
+            ),
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+    }
+
+    /// Pins that `connect` times its bound on the clock it is given: with a
+    /// broker that accepts connections and never answers, the checks end
+    /// once the clock passes the bound.
+    #[test]
+    fn the_connect_bound_runs_on_the_clock_connect_is_given() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let brokers = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().collect();
+            drop(held);
+        });
+        let section: spate_core::config::FeedSection = serde_yaml::from_str(&format!(
+            "kafka:\n  brokers: \"{brokers}\"\n  group_id: workers\n  topic: {WORK}\n  \
+             retry_topic: {RETRY}\n  dead_letter_topic: {DEAD}\n  attempt_topic: {ATTEMPTS}\n  \
+             statistics_interval: 0s\n"
+        ))
+        .unwrap();
+        let limit = Duration::from_secs(600);
+        let clock = TestClock::frozen();
+        let given = SyncClock::new(Arc::clone(&clock) as _);
+        let (tx, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            let io = multi_thread();
+            let connected = crate::feed::KafkaFeed::connect_with(
+                &section,
+                io.handle(),
+                Scope::Existence,
+                limit,
+                given,
+            );
+            let _ = tx.send(connected.err());
+        });
+        // The bound reads its deadline once the clients are built, which no
+        // signal marks, so the clock moves on until the bound fires.
+        let mut fired = None;
+        wait_until(DEADLINE, "the connect bound fires", || {
+            clock.advance(limit);
+            fired = done.try_recv().ok();
+            fired.is_some()
+        });
+        match fired.flatten() {
+            Some(KafkaFeedError::Unavailable(message)) => assert!(
+                message.starts_with("the startup checks took longer than 600s"),
+                "{message}"
+            ),
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+    }
+
     /// `KafkaFeed::connect` against `brokers` with the passthrough
     /// `rdkafka`, under a bound of `limit`, on a thread of its own. `None`
     /// when nothing came back within [`DEADLINE`].
+    ///
+    /// On the system clock: the tests that use it pin what librdkafka does
+    /// in real time inside the bound.
     fn connect_to(brokers: &str, rdkafka: &str, limit: Duration) -> Option<KafkaFeedError> {
         connect_with_to(brokers, rdkafka, limit, |section, io, limit| {
-            crate::feed::KafkaFeed::connect_with(section, io, Scope::All, limit).err()
+            crate::feed::KafkaFeed::connect_with(
+                section,
+                io,
+                Scope::All,
+                limit,
+                SyncClock::system(),
+            )
+            .err()
         })
     }
 

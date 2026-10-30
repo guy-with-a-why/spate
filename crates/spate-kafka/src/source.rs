@@ -5,7 +5,7 @@
 //! librdkafka runs rebalance callbacks inside `poll()` on the thread that
 //! calls it, which here is the runtime controller calling
 //! [`Source::poll_events`]. For assignment and revocation events the
-//! callback ([`SourceContext::rebalance`]) only records an intent and
+//! callback ([`SourceHooks::rebalance`]) only records an intent and
 //! returns without acknowledging, which leaves the rebalance legally in
 //! progress until we call `assign`/`unassign`. Completion then happens on
 //! the controller thread, interleaved with the runtime's own drain
@@ -64,10 +64,8 @@
 //! [`Source::poll_events`] stands against a librdkafka that stops holding
 //! the contract.
 
-use crate::clock::SyncClock;
 use crate::config::KafkaSourceConfig;
-use crate::context::{Intent, SourceContext};
-use crate::error::redacted_client_error;
+use crate::context::{Intent, SourceContext, SourceHooks};
 use crate::lane::KafkaLane;
 use crate::metrics::KafkaStatsMetrics;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -77,6 +75,7 @@ use rdkafka::statistics::Statistics;
 use rdkafka::{Offset, TopicPartitionList};
 use spate_core::checkpoint::AckIssuer;
 use spate_core::clock::Stopwatch;
+use spate_core::clock::SyncClock;
 use spate_core::error::{ErrorClass, SourceError};
 use spate_core::metrics::SourceMetrics;
 use spate_core::record::PartitionId;
@@ -188,7 +187,7 @@ impl KafkaSource {
     #[cfg(feature = "testing")]
     #[doc(hidden)]
     #[must_use]
-    pub fn with_clock(mut self, clock: crate::clock::SharedClock) -> KafkaSource {
+    pub fn with_clock(mut self, clock: spate_core::clock::SharedClock) -> KafkaSource {
         self.clock = SyncClock::new(clock);
         self
     }
@@ -623,11 +622,14 @@ impl Source for KafkaSource {
         };
         let consumer: BaseConsumer<SourceContext> = self
             .config
-            .client_config()
-            .create_with_context(SourceContext::default())
-            .map_err(|e| SourceError::Client {
+            .base(crate::security::openssl_env_overrides())
+            .create(
+                &crate::config::Consumer(&self.config),
+                SourceHooks::default(),
+            )
+            .map_err(|reason| SourceError::Client {
                 class: ErrorClass::Fatal,
-                reason: format!("create consumer: {}", redacted_client_error(&e)),
+                reason: format!("create consumer: {reason}"),
             })?;
         consumer
             .subscribe(&[&self.config.topic])

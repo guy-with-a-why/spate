@@ -228,8 +228,9 @@ mod tests {
         confirmers: Mutex<Vec<Confirmer>>,
         reporters: Mutex<Vec<DepthReporter>>,
         counts: bool,
-        // Moved by each renewal, so a test can see what the call took.
-        renew_takes: Mutex<Option<(Arc<TestClock>, Duration)>>,
+        // Moved by each renewal and publish, so a test can see what the call
+        // took.
+        call_takes: Mutex<Option<(Arc<TestClock>, Duration)>>,
     }
 
     impl Fake {
@@ -254,6 +255,12 @@ mod tests {
                     .into_iter()
                     .map(|n| Delivery::new(Unit::new(format!("u{n}"), Vec::new()), Receipt(n), 1)),
             );
+        }
+
+        fn take_time(&self) {
+            if let Some((clock, by)) = &*self.call_takes.lock().unwrap() {
+                clock.advance(*by);
+            }
         }
 
         fn take_confirmer(&self) -> Confirmer {
@@ -286,9 +293,7 @@ mod tests {
 
         fn renew(&self, receipt: Receipt) -> Result<(), FeedError> {
             self.log(format!("renew {}", receipt.0));
-            if let Some((clock, by)) = &*self.renew_takes.lock().unwrap() {
-                clock.advance(*by);
-            }
+            self.take_time();
             self.answer()
         }
 
@@ -304,6 +309,7 @@ mod tests {
 
         fn publish(&self, unit: Unit) -> Confirmation {
             self.log(format!("publish {}", unit.id));
+            self.take_time();
             let (confirmer, confirmation) = confirmation();
             self.confirmers.lock().unwrap().push(confirmer);
             confirmation
@@ -538,7 +544,7 @@ mod tests {
     #[test]
     fn every_call_is_timed_under_its_op() {
         let rig = Rig::new("metered-timed");
-        *rig.fake.renew_takes.lock().unwrap() =
+        *rig.fake.call_takes.lock().unwrap() =
             Some((Arc::clone(&rig.clock), Duration::from_millis(2)));
         rig.feed.receive(1).unwrap();
         rig.feed.receive(1).unwrap();
@@ -552,11 +558,35 @@ mod tests {
         for op in ["renew", "acknowledge", "fail", "hand_back", "publish"] {
             assert_eq!(rig.calls_timed(op), 1.0, "{op}");
         }
-        assert_eq!(
-            rig.value("spate_feed_call_duration_seconds_sum", ",op=\"renew\""),
-            Some(0.002)
-        );
+        for op in ["renew", "publish"] {
+            let extra = format!(",op=\"{op}\"");
+            assert_eq!(
+                rig.value("spate_feed_call_duration_seconds_sum", &extra),
+                Some(0.002),
+                "{op}"
+            );
+        }
         assert_eq!(rig.counter("spate_feed_units_published_total"), 0.0);
+    }
+
+    /// Pins that a publish whose backend drops its confirmer unsettled counts
+    /// as a retryable publish error, on a check and on an await.
+    #[test]
+    fn a_publish_the_backend_drops_counts_as_a_retryable_error() {
+        let rig = Rig::new("metered-dropped");
+        let mut checked = rig.feed.publish(Unit::new("a", Vec::new()));
+        drop(rig.fake.take_confirmer());
+        let err = checked.try_outcome().expect("settled").unwrap_err();
+        assert_eq!(err.kind, FeedErrorKind::Retryable);
+        assert_eq!(rig.errors("publish", "retryable"), 1.0);
+
+        let awaited = rig.feed.publish(Unit::new("b", Vec::new()));
+        drop(rig.fake.take_confirmer());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(awaited).unwrap_err();
+        assert_eq!(rig.errors("publish", "retryable"), 2.0);
     }
 
     /// Pins that a publish is counted once, by outcome, when a check or an

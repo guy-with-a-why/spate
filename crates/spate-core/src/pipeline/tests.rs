@@ -2604,8 +2604,8 @@ fn the_source_learns_where_its_feed_came_from() {
 }
 
 /// Pins that the source reads through a feed the runtime counts, under the
-/// `feed` component and the backend's key, and that the runtime publishes
-/// the dead-letter depth it reads at startup.
+/// `feed` component and the backend's key, and times on the injected clock,
+/// and that the runtime publishes the dead-letter depth it reads at startup.
 #[test]
 fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     use crate::feed::{Feed, Unit};
@@ -2624,11 +2624,13 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     drop(backend.publish(Unit::new("work", Vec::new())));
 
     let given = Arc::clone(&backend);
+    let clock = crate::clock::TestClock::frozen();
+    let injected = Arc::clone(&clock);
     let h = start_prepared(
         cfg,
         test_options(),
         |log| log.accept_feed = true,
-        move |runtime, _| runtime.with_feed(given),
+        move |runtime, _| runtime.with_feed(given).with_clock(injected),
         ok_chain,
     );
     wait_for("the source's feed", Duration::from_secs(5), || {
@@ -2647,6 +2649,9 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
         .expect("the source's feed");
     let work = feed.receive(8).unwrap().remove(0);
     feed.acknowledge(work.receipt).unwrap();
+    let mut published = feed.publish(Unit::new("more", Vec::new()));
+    clock.advance(Duration::from_secs(3));
+    published.try_outcome().expect("settled").unwrap();
 
     let series = |name: &str| {
         format!(r#"{name}{{pipeline="{pipeline_name}",component="feed",component_type="memory"}} "#)
@@ -2661,6 +2666,7 @@ fn the_runtime_counts_the_calls_its_source_makes_through_the_feed() {
     assert!(reads("spate_feed_units_received_total", "1"));
     assert!(reads("spate_feed_units_acknowledged_total", "1"));
     assert!(reads("spate_feed_held_units", "0"));
+    assert!(reads("spate_feed_publish_duration_seconds_sum", "3"));
 
     h.script.lock().unwrap().push_back(Script::Drained);
     let report = h.join.join().unwrap().unwrap();

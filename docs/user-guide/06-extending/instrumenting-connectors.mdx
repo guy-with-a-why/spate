@@ -34,9 +34,10 @@ cargo run -p spate --example instrumented_operator
 Every stage is pre-instrumented by the engine, not by the connector. A source's
 records and bytes are counted as the driver polls it; a sink's flushes, batch
 sizes, retries, and errors are counted by the sink worker as it drains and
-writes; the checkpointer owns commit and watermark metrics. A hand-rolled
-`Source`/`RowEncoder`/`ShardWriter` inherits all of it the moment it is wired
-into a pipeline. So the question is never "how do I emit
+writes; the checkpointer owns commit and watermark metrics; the runtime records
+the calls a source makes on its feed. A hand-rolled
+`Source`/`RowEncoder`/`ShardWriter`/`Feed` inherits all of it the moment it is
+wired into a pipeline. So the question is never "how do I emit
 `spate_sink_records_total`", since the framework does, but "what does my
 connector know that the framework can't measure from the outside?"
 
