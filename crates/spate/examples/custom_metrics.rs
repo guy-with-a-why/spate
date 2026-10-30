@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // families read `spate_datagen_source_*` rather than `spate_datagen_*`.
     // The role is derived from where the component sits, never named by the
     // connector, so one crate's source and sink halves stay apart. A local
-    // name must not lead with `source_` or `sink_`.
+    // name must not lead with a role segment, such as `source_`.
 
     // ── Framework handles, side by side ────────────────────────────────
     // The same pattern the engine uses internally, available to custom

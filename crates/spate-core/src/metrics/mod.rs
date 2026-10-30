@@ -852,7 +852,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "role segment")]
     fn custom_meter_rejects_role_prefixed_local_name() {
-        // `sink_`/`source_` are reserved to the runtime's role scoping, so a
+        // A role segment is reserved to the runtime's role scoping, so a
         // hand-written name starting with one can't alias a role-scoped family.
         let _ = Meter::new("p", "c", "t").counter("sink_writes_total", &[]);
     }

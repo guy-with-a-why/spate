@@ -24,12 +24,10 @@
 //! - [`Meter::new`] uses the `custom` namespace → `spate_custom_*`. This is the
 //!   bucket for pipeline-author metrics.
 //! - [`Meter::with_namespace`] takes a segment a connector owns (`"kafka"` →
-//!   `spate_kafka_*`). A connector that can appear at both ends of a pipeline (a
-//!   Kafka source *and* a future Kafka sink) is separated by the runtime into
-//!   `spate_kafka_source_*` / `spate_kafka_sink_*` when it injects the
-//!   component's `Meter`, and a feed backend's families land under
-//!   `spate_<backend>_feed_*`. The role is derived from the wiring position,
-//!   not set by hand.
+//!   `spate_kafka_*`). The runtime keeps a connector's roles apart when it
+//!   injects a component's `Meter`, under `spate_kafka_source_*`,
+//!   `spate_kafka_sink_*` and `spate_kafka_feed_*`. The role is derived from
+//!   the wiring position, not set by hand.
 //!
 //! The namespace is validated once, at construction. It must be a lowercase
 //! `[a-z][a-z0-9_]*` segment and must not be one of the framework's reserved
@@ -41,6 +39,8 @@
 //!   [`ChainCtx::meter`](crate::pipeline::ChainCtx::meter) (the `custom`
 //!   namespace) and close the resolved handle over an operator closure
 //!   (`.inspect` / `.map`).
+//! - **A source, sink or feed backend** receives one from the runtime, scoped
+//!   by its role.
 //! - **Standalone** (a tool, a test, an example) constructs one with
 //!   [`Meter::new`] / [`Meter::with_namespace`].
 //!
@@ -297,8 +297,7 @@ mod tests {
     use super::*;
     use crate::metrics::names::ROLE_SEGMENTS;
 
-    /// Pins that every role's segment is reserved as a local name's lead, so
-    /// no hand-written name can alias a role-scoped family.
+    /// Pins that every role's segment is reserved as a local name's lead.
     #[test]
     fn every_role_segment_is_reserved() {
         let roles = [MetricRole::Source, MetricRole::Sink, MetricRole::Feed];
