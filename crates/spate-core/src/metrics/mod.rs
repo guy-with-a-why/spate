@@ -898,6 +898,43 @@ mod tests {
         let _ = Meter::new("p", "c", "t").counter("feed_items_total", &[]);
     }
 
+    /// Pins the `# Panics` section of `counter`, `gauge` and `histogram`, in a
+    /// namespace of each kind.
+    #[test]
+    fn every_handle_refuses_what_its_panics_section_names() {
+        type Extra = [(&'static str, SharedString)];
+        let shadowed: [(&'static str, SharedString); 1] = [("component", "x".into())];
+        let repeated: [(&'static str, SharedString); 2] = [("k", "a".into()), ("k", "b".into())];
+        let mut cases: Vec<(String, &Extra, &str)> = vec![
+            ("spate_items".to_owned(), &[], "without the `spate_` prefix"),
+            ("items".to_owned(), &shadowed, "shadows a standard label"),
+            ("items".to_owned(), &repeated, "is repeated"),
+        ];
+        for segment in names::ROLE_SEGMENTS {
+            cases.push((format!("{segment}_items"), &[], "role segment"));
+        }
+        let panics_with = |register: &dyn Fn(), expected: &str| {
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(register))
+                .expect_err("the refusal panics");
+            let message = payload
+                .downcast_ref::<String>()
+                .expect("a formatted message");
+            assert!(message.contains(expected), "{message}");
+        };
+        let meters = [
+            Meter::new("p", "c", "t"),
+            Meter::with_namespace("connector", "p", "c", "t"),
+            Meter::for_component("connector", MetricRole::Feed, "p", "c").expect("scopes a family"),
+        ];
+        for meter in &meters {
+            for (name, extra, expected) in &cases {
+                panics_with(&|| drop(meter.counter(name, extra)), expected);
+                panics_with(&|| drop(meter.gauge(name, extra)), expected);
+                panics_with(&|| drop(meter.histogram(name, extra)), expected);
+            }
+        }
+    }
+
     #[test]
     fn duration_histograms_use_configured_buckets() {
         let rendered = render_local(|| {

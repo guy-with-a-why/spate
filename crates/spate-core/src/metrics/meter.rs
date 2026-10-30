@@ -242,12 +242,28 @@ impl Meter {
     /// Follow the taxonomy rules: `_total` suffix on counters, and push
     /// per-instance identity (a topic, a shard) into `extra` labels rather
     /// than the name, keeping the name low-cardinality.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` starts with `spate_`, or if its first `_`-separated
+    /// segment is a role segment in
+    /// [`ROLE_SEGMENTS`](super::names::ROLE_SEGMENTS) (`source`, `sink`,
+    /// `feed`), in every namespace. Panics if `extra` shadows a standard label
+    /// or repeats a key.
     pub fn counter(&self, name: &str, extra: &[(&'static str, SharedString)]) -> Counter {
         self.labels.register_counter(self.qualify(name), extra)
     }
 
     /// Resolve a gauge under this scope (local name, auto-prefixed).
     /// Build-time only.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` starts with `spate_`, or if its first `_`-separated
+    /// segment is a role segment in
+    /// [`ROLE_SEGMENTS`](super::names::ROLE_SEGMENTS) (`source`, `sink`,
+    /// `feed`), in every namespace. Panics if `extra` shadows a standard label
+    /// or repeats a key.
     pub fn gauge(&self, name: &str, extra: &[(&'static str, SharedString)]) -> Gauge {
         self.labels.register_gauge(self.qualify(name), extra)
     }
@@ -255,6 +271,14 @@ impl Meter {
     /// Resolve a histogram under this scope (local name, auto-prefixed).
     /// Build-time only. Give it a unit suffix (`_seconds` / `_bytes` /
     /// `_rows`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` starts with `spate_`, or if its first `_`-separated
+    /// segment is a role segment in
+    /// [`ROLE_SEGMENTS`](super::names::ROLE_SEGMENTS) (`source`, `sink`,
+    /// `feed`), in every namespace. Panics if `extra` shadows a standard label
+    /// or repeats a key.
     pub fn histogram(&self, name: &str, extra: &[(&'static str, SharedString)]) -> Histogram {
         self.labels.register_histogram(self.qualify(name), extra)
     }
