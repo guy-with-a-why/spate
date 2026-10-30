@@ -477,6 +477,26 @@ mod tests {
         assert_eq!(rig.counter("spate_feed_units_published_total"), 0.0);
     }
 
+    /// Pins that a publish whose backend drops its confirmer unsettled counts
+    /// as a retryable publish error, on a check and on an await.
+    #[test]
+    fn a_publish_the_backend_drops_counts_as_a_retryable_error() {
+        let rig = Rig::new("metered-dropped");
+        let mut checked = rig.feed.publish(Unit::new("a", Vec::new()));
+        drop(rig.fake.take_confirmer());
+        let err = checked.try_outcome().expect("settled").unwrap_err();
+        assert_eq!(err.kind, FeedErrorKind::Retryable);
+        assert_eq!(rig.errors("publish", "retryable"), 1.0);
+
+        let awaited = rig.feed.publish(Unit::new("b", Vec::new()));
+        drop(rig.fake.take_confirmer());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(awaited).unwrap_err();
+        assert_eq!(rig.errors("publish", "retryable"), 2.0);
+    }
+
     /// Pins that a publish is counted once, by outcome, when a check or an
     /// await first finds its confirmation settled, timed on the feed's clock,
     /// and that the caller sees the backend's outcome.
