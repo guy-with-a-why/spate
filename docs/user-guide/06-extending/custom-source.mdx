@@ -206,11 +206,11 @@ Assignment changes are where at-least-once is won or lost:
 - **`CommitReady { partitions }` is a latency hint**: the named lanes have
   decided end-of-input, and a commit outside the periodic tick is
   worthwhile now. The runtime commits those partitions only, at a
-  tightened cadence for one commit interval and then on every
-  control-plane poll, until their lanes leave through `LanesRetired` or
-  `LanesRevoked` or a new `LanesAssigned` begins. A partition whose lane
-  never leaves stays on that cadence for the life of the lane. Correctness
-  never depends on it.
+  tightened cadence for one commit interval and then on each control-plane
+  poll that finds a partition's acked watermark advanced, until their lanes
+  leave through `LanesRetired` or `LanesRevoked` or a new `LanesAssigned`
+  begins. A partition whose lane never leaves is committed this way for the
+  life of the lane. Correctness never depends on it.
 
 :::warning
 Never block inside `poll_events` waiting on data-plane progress you
