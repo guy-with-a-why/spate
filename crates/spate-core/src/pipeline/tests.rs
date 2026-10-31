@@ -5188,6 +5188,11 @@ fn a_chase_window_closes_at_its_end_on_the_injected_clock() {
         h.shared.lock().unwrap().hinted_at.is_some()
     });
     let last_poll = |h: &Harness| *h.shared.lock().unwrap().poll_timeouts.last().unwrap();
+    // The fake logs the hint as it hands it over, before the controller reads
+    // the clock for the window's end. Advancing earlier would move that end.
+    wait_for("the chase to open", Duration::from_secs(5), || {
+        last_poll(&h) == super::controller::FAST_COMMIT_POLL
+    });
 
     clock.advance(window - Duration::from_millis(1));
     passes(&h, 3);
