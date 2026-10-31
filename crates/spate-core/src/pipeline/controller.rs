@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 /// ([`SourceEvent::CommitReady`]). Tight enough that a finishing lane's
 /// final ack commits within ~a millisecond of resolving, bounded to one
 /// commit interval by the chase deadline, after which the partition is
-/// committed on the ordinary cadence.
+/// polled at the ordinary cadence and committed when it advances.
 pub(crate) const FAST_COMMIT_POLL: Duration = Duration::from_millis(1);
 
 /// How long before the drain deadline the drivers and the sink drain end

@@ -145,7 +145,8 @@ pub enum SourceEvent<L> {
     /// by committing those partitions *only* (flowing partitions keep the
     /// periodic tick) at a tightened cadence for one commit interval, then
     /// on each control-plane poll that finds a partition's acked watermark
-    /// advanced, while any of its lanes remains assigned. A partition leaves
+    /// advanced, while any of its lanes remains assigned. The periodic tick
+    /// still commits them and retries a failed commit. A partition leaves
     /// when its lanes are retired or revoked, or a new assignment begins.
     /// This is a latency optimization; correctness does not depend on it,
     /// and sources that never emit it get the periodic cadence.

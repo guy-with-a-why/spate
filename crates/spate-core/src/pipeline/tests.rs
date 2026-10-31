@@ -5316,6 +5316,44 @@ fn a_later_hint_gets_a_window_of_its_own() {
     h.join.join().unwrap().unwrap();
 }
 
+/// A commit that failed past a partition's window is retried by the periodic
+/// tick, and not before it.
+#[test]
+fn a_failed_post_window_commit_is_retried_on_the_tick() {
+    let clock = crate::clock::TestClock::frozen();
+    let interval = Duration::from_secs(600);
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = interval;
+    let h = start_on_clock_with(
+        cfg,
+        no_idle_flush(),
+        &clock,
+        |runtime| runtime.with_chase_window(Duration::ZERO),
+        ok_chain,
+    );
+    h.shared.lock().unwrap().fail_commits = true;
+    assign_one_lane(&h, std::slice::from_ref(&(0..10)));
+    wait_for("the batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 10
+    });
+    hint(&h, PartitionId(0));
+    wait_for("a failed commit", Duration::from_secs(5), || {
+        logged(&h, "commit-failed")
+    });
+
+    h.shared.lock().unwrap().fail_commits = false;
+    passes(&h, 3);
+    assert!(h.shared.lock().unwrap().committed.is_empty());
+
+    clock.advance(interval);
+    wait_for("the tick retries", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().committed.get(&PartitionId(0)) == Some(&10)
+    });
+
+    h.shutdown.trigger();
+    h.join.join().unwrap().unwrap();
+}
+
 /// A revoked partition leaves the chase past its window, so a position it failed
 /// to commit waits for the tick while another partition's chase commits.
 #[test]
