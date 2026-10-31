@@ -3686,6 +3686,119 @@ mod cluster {
         assert_eq!(d.paused, owned, "after a rebalance error");
     }
 
+    /// Pins when the feed releases its per-partition statistics: a
+    /// revocation keeps every series, the next assignment zeroes the
+    /// partitions it dropped and keeps the rest, and a rebalance error zeroes
+    /// every one.
+    #[test]
+    fn per_partition_statistics_are_released_by_the_next_assignment() {
+        use spate_core::feed::FeedMetricsCtx;
+        use spate_core::metrics::Meter;
+        let cluster = cluster_with(0);
+        let brokers = cluster.bootstrap_servers();
+        let group = spate_test::unique_name("stats-release");
+        let mut config = KafkaFeedConfig::from_section(&section(&brokers, &group)).unwrap();
+        config.statistics_interval = Duration::from_secs(5);
+        let (core, _producer, mut d) =
+            super::super::parts(&config, TWO, SyncClock::system()).unwrap();
+        drive(&mut d, "the driver owns its partitions", |d| owns(d) == 2);
+        let assigned = d.consumer.assignment().unwrap();
+        let mut work_only = TopicPartitionList::new();
+        work_only.add_partition("units", 0);
+        let intents = |d: &Driver, intent: Intent| {
+            d.consumer
+                .context()
+                .intents
+                .lock()
+                .unwrap()
+                .push_back(intent);
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let prom = recorder.handle();
+        let stopped = |topic: &str| {
+            spate_test::metric_value(
+                &prom.render(),
+                "spate_kafka_feed_partition_not_fetching",
+                &[("topic", topic), ("partition", "0")],
+            )
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let meter = Meter::with_namespace("kafka_feed", group.clone(), "feed", "kafka");
+            core.attach_metrics(FeedMetricsCtx::new(Some(meter)).with_partition_detail(true));
+            let owned: Vec<Tp> = owned_tps(&core).into_iter().collect();
+            core.publish_consumer_stats(&super::feed_metrics::consumer_snapshot(6), &owned);
+        });
+        assert_eq!(
+            (stopped("units"), stopped("units-retry")),
+            (Some(1.0), Some(1.0))
+        );
+
+        intents(&d, Intent::Revoke(assigned));
+        d.serve_intents();
+        assert_eq!(
+            (stopped("units"), stopped("units-retry")),
+            (Some(1.0), Some(1.0)),
+            "a revocation releases nothing"
+        );
+        intents(&d, Intent::Assign(work_only));
+        d.serve_intents();
+        assert_eq!(
+            (stopped("units"), stopped("units-retry")),
+            (Some(1.0), Some(0.0)),
+            "the assignment releases what it dropped"
+        );
+        d.consumer.context().rebalance(
+            &d.consumer,
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_REBALANCE_IN_PROGRESS,
+            &mut TopicPartitionList::new(),
+        );
+        d.serve_intents();
+        assert_eq!(
+            stopped("units"),
+            Some(0.0),
+            "a rebalance error releases all"
+        );
+    }
+
+    /// Pins that the consumer loop's drain names the partitions the feed
+    /// holds, so each renders its own per-partition series.
+    #[test]
+    fn the_consumer_drain_publishes_the_partitions_it_holds() {
+        use spate_core::feed::FeedMetricsCtx;
+        use spate_core::metrics::Meter;
+        let cluster = cluster_with(0);
+        let brokers = cluster.bootstrap_servers();
+        let group = spate_test::unique_name("stats-drain");
+        let mut config = KafkaFeedConfig::from_section(&section(&brokers, &group)).unwrap();
+        // Long enough that librdkafka's own snapshot never replaces the one
+        // the test places.
+        config.statistics_interval = Duration::from_secs(3600);
+        let (core, _producer, mut d) =
+            super::super::parts(&config, TWO, SyncClock::system()).unwrap();
+        drive(&mut d, "the driver owns its partitions", |d| owns(d) == 2);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let prom = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let meter = Meter::with_namespace("kafka_feed", group.clone(), "feed", "kafka");
+            core.attach_metrics(FeedMetricsCtx::new(Some(meter)).with_partition_detail(true));
+            *d.consumer.context().stats.lock().unwrap() =
+                Some(Box::new(super::feed_metrics::consumer_snapshot(6)));
+            d.publish_stats();
+        });
+        let rendered = prom.render();
+        for topic in ["units", "units-retry"] {
+            assert_eq!(
+                spate_test::metric_value(
+                    &rendered,
+                    "spate_kafka_feed_partition_not_fetching",
+                    &[("topic", topic), ("partition", "0")],
+                ),
+                Some(1.0),
+                "{topic}"
+            );
+        }
+    }
+
     /// Wait until `n` units are buffered, receive them all in the order of
     /// their ids, which is their offsets' order, and stop the follower and
     /// the gate. The gate buffers units in the order their attempt writes
@@ -4626,4 +4739,520 @@ fn a_certificate_the_client_rejects_latches_the_publisher() {
         "{}",
         err.reason
     );
+}
+
+/// The feed's own metric families: the write counts at the event seam and
+/// the clients' statistics, read from a test-local exposition.
+#[expect(
+    clippy::disallowed_types,
+    reason = "rdkafka's `Statistics` fields are std maps"
+)]
+mod feed_metrics {
+    use super::*;
+    use crate::client::Hooks as _;
+    use rdkafka::statistics::{ConsumerGroup, Partition, Statistics, Topic};
+    use spate_core::feed::FeedMetricsCtx;
+    use spate_core::metrics::Meter;
+    use spate_test::{metric_value, render_metrics, unique_name};
+    use std::collections::HashMap;
+
+    /// The scope the runtime hands a Kafka feed, under a pipeline of its own.
+    fn feed_meter() -> Meter {
+        Meter::with_namespace("kafka_feed", unique_name("feed-metrics"), "feed", "kafka")
+    }
+
+    fn attached(detail: bool) -> FeedMetricsCtx {
+        FeedMetricsCtx::new(Some(feed_meter())).with_partition_detail(detail)
+    }
+
+    fn value(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        metric_value(rendered, &format!("spate_kafka_feed_{name}"), labels)
+    }
+
+    /// A `Core` whose clients would emit statistics every `interval`.
+    fn core_with_statistics(interval: &str) -> Core {
+        Core::new(
+            &statistics_config(interval),
+            TWO,
+            SyncClock::new(TestClock::frozen()),
+        )
+    }
+
+    /// The section of a feed whose clients reach no broker, emitting
+    /// statistics every `interval`.
+    fn statistics_config(interval: &str) -> KafkaFeedConfig {
+        let section: FeedSection = serde_yaml::from_str(&format!(
+            "kafka:\n  brokers: 127.0.0.1:1\n  group_id: workers\n  topic: units\n  \
+             retry_topic: units-retry\n  dead_letter_topic: units-dead\n  \
+             attempt_topic: units-attempts\n  statistics_interval: {interval}\n"
+        ))
+        .unwrap();
+        KafkaFeedConfig::from_section(&section).unwrap()
+    }
+
+    /// A confirmed-or-not move of the delivery at `offset` of `tp(0)` to `to`.
+    fn move_to(core: &Core, offset: i64, to: Destination) -> Write {
+        let receipt = core.lock().tracker.deliver(&tp(0), offset).unwrap();
+        let position = core.lock().tracker.release(receipt).unwrap();
+        let unit = Unit::new("u", b"b".to_vec());
+        let topic = match to {
+            Destination::Retry => &core.topics.retry,
+            Destination::DeadLetter(_) => &core.topics.dead_letter,
+        };
+        Write::Move(Move::new(
+            Outgoing::unit(Arc::clone(topic), &unit, 1, None),
+            position,
+            to,
+            Some(unit.id),
+            1,
+            Finish::Complete,
+            &**core.clock(),
+        ))
+    }
+
+    fn snapshot(tx: i64) -> Statistics {
+        Statistics {
+            tx,
+            ..Default::default()
+        }
+    }
+
+    /// A consumer snapshot carrying the work and retry topics' partition 0,
+    /// both stopped, as a consumer with one forwarded queue reports them:
+    /// each partition with the whole queue's `queued` entries.
+    pub(super) fn consumer_snapshot(queued: i64) -> Statistics {
+        let topic = |name: &str| {
+            (
+                name.to_owned(),
+                Topic {
+                    topic: name.to_owned(),
+                    partitions: HashMap::from([(
+                        0,
+                        Partition {
+                            partition: 0,
+                            fetchq_cnt: queued,
+                            fetch_state: "stopped".to_owned(),
+                            consumer_lag_stored: -1,
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            )
+        };
+        Statistics {
+            topics: HashMap::from([topic("units"), topic("units-retry")]),
+            cgrp: Some(ConsumerGroup {
+                state: "up".to_owned(),
+                join_state: "steady".to_owned(),
+                assignment_size: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn both_partition_zeros() -> Vec<Tp> {
+        vec![tp(0), Tp::new(&Arc::from("units-retry"), 0)]
+    }
+
+    /// Pins that a confirmed attempt write is counted once and timed on the
+    /// feed's clock from its first send, and counts as no move.
+    #[test]
+    fn a_confirmed_attempt_counts_and_times_its_write() {
+        let clock = TestClock::frozen();
+        let core = core_on(10, Arc::clone(&clock));
+        core.lock().tracker.assign([tp(0)]);
+        let write = attempt_write(&core, gated(&core, 0));
+        clock.advance(Duration::from_secs(3));
+        let rendered = render_metrics(|| {
+            core.attach_metrics(attached(false));
+            core.settle(write, Ok(()));
+        });
+        assert_eq!(
+            value(&rendered, "attempt_write_duration_seconds_count", &[]),
+            Some(1.0)
+        );
+        assert_eq!(
+            value(&rendered, "attempt_write_duration_seconds_sum", &[]),
+            Some(3.0)
+        );
+        assert_eq!(value(&rendered, "retry_writes_total", &[]), Some(0.0));
+        for reason in ["attempt_cap", "no_unit"] {
+            assert_eq!(
+                value(&rendered, "dead_letter_writes_total", &[("reason", reason)]),
+                Some(0.0),
+                "{reason}"
+            );
+        }
+    }
+
+    /// Pins that a confirmed move counts under its destination: a retry write
+    /// once, and a dead-letter write under its reason.
+    #[test]
+    fn a_confirmed_move_counts_under_its_destination() {
+        let core = core(10);
+        core.lock().tracker.assign([tp(0)]);
+        let moves = [
+            move_to(&core, 0, Destination::Retry),
+            move_to(&core, 1, Destination::DeadLetter(Cause::AttemptCap)),
+            move_to(&core, 2, Destination::DeadLetter(Cause::NoUnit)),
+            move_to(&core, 3, Destination::DeadLetter(Cause::NoUnit)),
+        ];
+        let rendered = render_metrics(|| {
+            core.attach_metrics(attached(false));
+            for write in moves {
+                core.settle(write, Ok(()));
+            }
+        });
+        assert_eq!(value(&rendered, "retry_writes_total", &[]), Some(1.0));
+        assert_eq!(
+            value(
+                &rendered,
+                "dead_letter_writes_total",
+                &[("reason", "attempt_cap")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            value(
+                &rendered,
+                "dead_letter_writes_total",
+                &[("reason", "no_unit")]
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            value(&rendered, "attempt_write_duration_seconds_count", &[]),
+            Some(0.0)
+        );
+    }
+
+    /// Pins that a write sent again after a retryable failure counts once, on
+    /// its confirmation, with its time running from the first send.
+    #[test]
+    fn a_write_sent_again_counts_once_on_confirmation() {
+        let clock = TestClock::frozen();
+        let core = core_on(10, Arc::clone(&clock));
+        core.lock().tracker.assign([tp(0)]);
+        let write = attempt_write(&core, gated(&core, 0));
+        let rendered = render_metrics(|| {
+            core.attach_metrics(attached(false));
+            clock.advance(Duration::from_secs(2));
+            core.settle(write, Err(failure(C::MessageTimedOut)));
+            let resend = core
+                .lock()
+                .resends
+                .pop()
+                .expect("queued to be sent again")
+                .1;
+            clock.advance(Duration::from_secs(1));
+            core.settle(resend, Ok(()));
+        });
+        assert_eq!(
+            value(&rendered, "attempt_write_duration_seconds_count", &[]),
+            Some(1.0)
+        );
+        assert_eq!(
+            value(&rendered, "attempt_write_duration_seconds_sum", &[]),
+            Some(3.0)
+        );
+    }
+
+    /// Pins that a write the brokers refuse is not counted.
+    #[test]
+    fn a_refused_write_counts_nothing() {
+        let core = core(10);
+        core.lock().tracker.assign([tp(0)]);
+        let write = move_to(&core, 0, Destination::DeadLetter(Cause::AttemptCap));
+        let rendered = render_metrics(|| {
+            core.attach_metrics(attached(false));
+            core.settle(write, Err(failure(C::UnknownTopicOrPartition)));
+        });
+        assert!(core.latched());
+        assert_eq!(
+            value(
+                &rendered,
+                "dead_letter_writes_total",
+                &[("reason", "attempt_cap")]
+            ),
+            Some(0.0)
+        );
+    }
+
+    /// Pins that a move confirmed after its partition left the feed is still
+    /// counted: the write reached the topic.
+    #[test]
+    fn a_write_confirmed_after_its_partition_left_is_counted() {
+        let core = core(10);
+        core.lock().tracker.assign([tp(0)]);
+        let write = move_to(&core, 0, Destination::Retry);
+        core.lock().tracker.unassign_all();
+        let rendered = render_metrics(|| {
+            core.attach_metrics(attached(false));
+            core.settle(write, Ok(()));
+        });
+        assert_eq!(value(&rendered, "retry_writes_total", &[]), Some(1.0));
+    }
+
+    /// Pins the attach: every write series renders at 0 from it, a write
+    /// before it goes uncounted, and a context without a `Meter` registers
+    /// nothing.
+    #[test]
+    fn writes_count_from_the_attach_on() {
+        let core = core(10);
+        core.lock().tracker.assign([tp(0)]);
+        let before = move_to(&core, 0, Destination::Retry);
+        let after = move_to(&core, 1, Destination::Retry);
+        let rendered = render_metrics(|| {
+            core.settle(before, Ok(()));
+            core.attach_metrics(attached(false));
+            core.settle(after, Ok(()));
+        });
+        assert_eq!(value(&rendered, "retry_writes_total", &[]), Some(1.0));
+
+        let unattached = super::core(10);
+        unattached.lock().tracker.assign([tp(0)]);
+        let write = move_to(&unattached, 0, Destination::Retry);
+        let rendered = render_metrics(|| {
+            unattached.attach_metrics(FeedMetricsCtx::new(None));
+            unattached.settle(write, Ok(()));
+        });
+        assert!(!rendered.contains("spate_kafka_feed_"), "{rendered}");
+    }
+
+    /// Pins that a second attach replaces the first: later writes count under
+    /// the second pipeline's labels, and an attach without a `Meter` stops
+    /// the counting.
+    #[test]
+    fn a_second_attach_replaces_the_first() {
+        let feed = idle_feed();
+        feed.core.lock().tracker.assign([tp(0)]);
+        let writes: Vec<Write> = (0..3)
+            .map(|offset| move_to(&feed.core, offset, Destination::Retry))
+            .collect();
+        let (first, second) = (unique_name("first"), unique_name("second"));
+        let rendered = render_metrics(|| {
+            let mut writes = writes.into_iter();
+            for pipeline in [&first, &second] {
+                let meter = Meter::with_namespace("kafka_feed", pipeline.clone(), "feed", "kafka");
+                feed.attach_metrics(FeedMetricsCtx::new(Some(meter)));
+                feed.core.settle(writes.next().unwrap(), Ok(()));
+            }
+            feed.attach_metrics(FeedMetricsCtx::new(None));
+            feed.core.settle(writes.next().unwrap(), Ok(()));
+        });
+        for pipeline in [&first, &second] {
+            assert_eq!(
+                value(&rendered, "retry_writes_total", &[("pipeline", pipeline)]),
+                Some(1.0),
+                "{pipeline}"
+            );
+        }
+    }
+
+    /// Pins that a second attach replaces the statistics translators too:
+    /// later snapshots render under the second pipeline with its
+    /// per-partition setting, and an attach without a `Meter` stops them.
+    #[test]
+    fn a_second_attach_replaces_the_statistics_translators() {
+        let core = Arc::new(core_with_statistics("5s"));
+        let hooks = FeedProducerHooks::new(Arc::clone(&core));
+        let (first, second) = (unique_name("first"), unique_name("second"));
+        let attach = |pipeline: &str, detail: bool| {
+            let meter = Meter::with_namespace("kafka_feed", pipeline.to_owned(), "feed", "kafka");
+            core.attach_metrics(FeedMetricsCtx::new(Some(meter)).with_partition_detail(detail));
+        };
+        let mut later = consumer_snapshot(6);
+        later.tx = 31;
+        let mut last = consumer_snapshot(6);
+        last.tx = 50;
+        let rendered = render_metrics(|| {
+            attach(&first, false);
+            attach(&second, true);
+            core.publish_consumer_stats(&later, &both_partition_zeros());
+            hooks.stats(snapshot(7));
+            core.attach_metrics(FeedMetricsCtx::new(None));
+            core.publish_consumer_stats(&last, &both_partition_zeros());
+            hooks.stats(snapshot(9));
+        });
+        for (client, tx) in [("consumer", 31.0), ("producer", 7.0)] {
+            for (pipeline, expected) in [(&first, 0.0), (&second, tx)] {
+                assert_eq!(
+                    value(
+                        &rendered,
+                        "tx_requests_total",
+                        &[("pipeline", pipeline), ("client", client)]
+                    ),
+                    Some(expected),
+                    "{pipeline} {client}"
+                );
+            }
+        }
+        assert_eq!(
+            value(
+                &rendered,
+                "partition_not_fetching",
+                &[("pipeline", &second), ("topic", "units")]
+            ),
+            Some(1.0)
+        );
+    }
+
+    /// Pins that a zero `statistics_interval` registers the write families
+    /// and no statistics family, and a non-zero one registers the fixed
+    /// statistics families of both clients at the attach.
+    #[test]
+    fn statistics_families_follow_the_interval() {
+        let off = core_with_statistics("0s");
+        let rendered = render_metrics(|| off.attach_metrics(attached(false)));
+        assert_eq!(value(&rendered, "retry_writes_total", &[]), Some(0.0));
+        assert!(!rendered.contains("tx_requests_total"), "{rendered}");
+
+        let on = core_with_statistics("5s");
+        let rendered = render_metrics(|| on.attach_metrics(attached(false)));
+        for client in ["consumer", "producer"] {
+            assert_eq!(
+                value(&rendered, "tx_requests_total", &[("client", client)]),
+                Some(0.0),
+                "{client}"
+            );
+        }
+        assert_eq!(
+            value(
+                &rendered,
+                "group_assignment_size",
+                &[("client", "consumer")]
+            ),
+            Some(0.0)
+        );
+    }
+
+    /// Pins that the consumer's and producer's statistics render as two
+    /// series, and that a producer snapshot writes no group family.
+    #[test]
+    fn the_feed_clients_statistics_render_apart() {
+        let core = Arc::new(core_with_statistics("5s"));
+        let hooks = FeedProducerHooks::new(Arc::clone(&core));
+        let mut consumer = consumer_snapshot(0);
+        consumer.tx = 31;
+        let rendered = render_metrics(|| {
+            core.attach_metrics(attached(false));
+            core.publish_consumer_stats(&consumer, &[]);
+            hooks.stats(snapshot(7));
+        });
+        assert_eq!(
+            value(&rendered, "tx_requests_total", &[("client", "consumer")]),
+            Some(31.0)
+        );
+        assert_eq!(
+            value(&rendered, "tx_requests_total", &[("client", "producer")]),
+            Some(7.0)
+        );
+        assert_eq!(
+            value(&rendered, "group_healthy", &[("client", "producer")]),
+            None
+        );
+        assert_eq!(
+            value(&rendered, "group_healthy", &[("client", "consumer")]),
+            Some(1.0)
+        );
+    }
+
+    /// Pins the per-partition statistics: absent without detail; with it,
+    /// one series per topic and partition held. The fetch queue is reported
+    /// once, since every partition reports the one forwarded queue, and has
+    /// no per-partition series.
+    #[test]
+    fn per_partition_statistics_carry_the_topic() {
+        let off = core_with_statistics("5s");
+        let rendered = render_metrics(|| {
+            off.attach_metrics(attached(false));
+            off.publish_consumer_stats(&consumer_snapshot(6), &both_partition_zeros());
+        });
+        assert!(!rendered.contains("partition=\""), "{rendered}");
+        assert_eq!(value(&rendered, "fetch_queue_messages", &[]), Some(6.0));
+
+        let on = core_with_statistics("5s");
+        let rendered = render_metrics(|| {
+            on.attach_metrics(attached(true));
+            on.publish_consumer_stats(&consumer_snapshot(6), &both_partition_zeros());
+        });
+        assert_eq!(value(&rendered, "fetch_queue_messages", &[]), Some(6.0));
+        for topic in ["units", "units-retry"] {
+            assert_eq!(
+                value(
+                    &rendered,
+                    "partition_not_fetching",
+                    &[("topic", topic), ("partition", "0"), ("client", "consumer")]
+                ),
+                Some(1.0),
+                "{topic}"
+            );
+        }
+        assert!(
+            !rendered.contains("partition_fetch_queue_messages"),
+            "{rendered}"
+        );
+
+        let work_only = core_with_statistics("5s");
+        let rendered = render_metrics(|| {
+            work_only.attach_metrics(attached(true));
+            work_only.publish_consumer_stats(&consumer_snapshot(6), &[tp(0)]);
+        });
+        assert_eq!(
+            value(
+                &rendered,
+                "partition_not_fetching",
+                &[("topic", "units-retry")]
+            ),
+            None
+        );
+    }
+
+    /// Pins that a release zeroes only the partitions outside the new
+    /// assignment.
+    #[test]
+    fn a_release_zeroes_only_the_partitions_given_up() {
+        let core = core_with_statistics("5s");
+        let rendered = render_metrics(|| {
+            core.attach_metrics(attached(true));
+            core.publish_consumer_stats(&consumer_snapshot(6), &both_partition_zeros());
+            core.release_consumer_partitions(&[tp(0)]);
+        });
+        assert_eq!(
+            value(&rendered, "partition_not_fetching", &[("topic", "units")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            value(
+                &rendered,
+                "partition_not_fetching",
+                &[("topic", "units-retry")]
+            ),
+            Some(0.0)
+        );
+    }
+
+    /// Pins that the publish-only handle registers no feed family, even with
+    /// statistics on and a snapshot to translate.
+    #[test]
+    fn a_publisher_registers_no_feed_families() {
+        let config = statistics_config("5s");
+        let core = Arc::new(Core::new(&config, TWO, SyncClock::system()));
+        let hooks = FeedProducerHooks::new(Arc::clone(&core));
+        let producer = config
+            .base(false)
+            .create::<super::super::write::Producer, _>(
+                &config.client(FeedRole::Producer),
+                FeedProducerHooks::new(Arc::clone(&core)),
+            )
+            .unwrap();
+        let publisher = KafkaFeedPublisher::from_parts(Arc::clone(&core), producer);
+        let rendered = render_metrics(|| {
+            publisher.attach_metrics(attached(true));
+            hooks.stats(snapshot(7));
+        });
+        assert!(!rendered.contains("spate_kafka_feed_"), "{rendered}");
+    }
 }
