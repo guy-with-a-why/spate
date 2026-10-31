@@ -5149,23 +5149,23 @@ fn the_commit_tick_fires_at_the_interval_on_the_injected_clock() {
     h.join.join().unwrap().unwrap();
 }
 
-/// A hinted partition is chased at the tightened cadence until its window
-/// ends on the pipeline's clock, and at the ordinary cadence after.
-#[test]
-fn a_chase_window_closes_at_its_end_on_the_injected_clock() {
+/// Starts a runtime on `clock` that holds every ack, which keeps a hinted
+/// partition chased until its window closes. Also returns what releases the
+/// acks, which the run needs before it can drain.
+fn start_holding_acks(
+    cfg: PipelineConfig,
+    clock: &Arc<crate::clock::TestClock>,
+    customize: impl FnOnce(PipelineRuntime<FakeSource>) -> PipelineRuntime<FakeSource>,
+) -> (Harness, impl FnOnce()) {
     let held: Arc<Mutex<Vec<crate::checkpoint::AckRef>>> = Arc::new(Mutex::new(Vec::new()));
     let release = Arc::new(AtomicBool::new(false));
     let held_c = Arc::clone(&held);
     let release_c = Arc::clone(&release);
-    let clock = crate::clock::TestClock::frozen();
-    let window = Duration::from_secs(600);
-    let mut cfg = test_config(1);
-    cfg.checkpoint.interval = Duration::from_secs(3600);
     let h = start_on_clock_with(
         cfg,
         no_idle_flush(),
-        &clock,
-        |runtime| runtime.with_chase_window(window),
+        clock,
+        customize,
         move |shared, log| FakeChain {
             shared,
             log,
@@ -5176,23 +5176,58 @@ fn a_chase_window_closes_at_its_end_on_the_injected_clock() {
             batches_seen: 0,
         },
     );
+    let release_acks = move || {
+        release.store(true, Ordering::Relaxed);
+        held.lock().unwrap().clear();
+    };
+    (h, release_acks)
+}
+
+/// Hints `partition` and waits for the next pass, so a test may move the clock.
+// The fake logs the hint as it hands it over, before the controller reads the
+// clock for the window's end. Advancing earlier would move that end.
+//
+// `cfg(test)` is redundant for the compiler. cargo-mutants skips an item under
+// exactly `cfg(test)`, and a mutant here only reopens that race.
+#[cfg(test)]
+fn hint(h: &Harness, partition: PartitionId) {
+    let before = h.shared.lock().unwrap().hinted_at;
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::CommitReady(vec![partition]));
+    wait_for("a poll after the hint", Duration::from_secs(5), || {
+        let log = h.shared.lock().unwrap();
+        log.hinted_at != before
+            && log
+                .hinted_at
+                .is_some_and(|at| log.poll_timeouts.len() > at + 1)
+    });
+}
+
+/// The timeout of the controller's latest poll.
+fn last_poll(h: &Harness) -> Duration {
+    *h.shared.lock().unwrap().poll_timeouts.last().unwrap()
+}
+
+/// Asserts that a hinted partition is polled at the tightened cadence until
+/// `window` has passed on the pipeline's clock, and at the ordinary cadence
+/// after.
+// Redundant for the compiler. cargo-mutants skips an item under exactly
+// `cfg(test)`, and a mutant here only empties the tests that call it.
+#[cfg(test)]
+fn assert_chase_closes_after(
+    window: Duration,
+    cfg: PipelineConfig,
+    customize: impl FnOnce(PipelineRuntime<FakeSource>) -> PipelineRuntime<FakeSource>,
+) {
+    let clock = crate::clock::TestClock::frozen();
+    let (h, release_acks) = start_holding_acks(cfg, &clock, customize);
     assign_one_lane(&h, std::slice::from_ref(&(0..10)));
     wait_for("the batch consumed", Duration::from_secs(5), || {
         h.chain.consumed.load(Ordering::Relaxed) == 10
     });
-    h.script
-        .lock()
-        .unwrap()
-        .push_back(Script::CommitReady(vec![PartitionId(0)]));
-    wait_for("the hint delivered", Duration::from_secs(5), || {
-        h.shared.lock().unwrap().hinted_at.is_some()
-    });
-    let last_poll = |h: &Harness| *h.shared.lock().unwrap().poll_timeouts.last().unwrap();
-    // The fake logs the hint as it hands it over, before the controller reads
-    // the clock for the window's end. Advancing earlier would move that end.
-    wait_for("the chase to open", Duration::from_secs(5), || {
-        last_poll(&h) == super::controller::FAST_COMMIT_POLL
-    });
+    hint(&h, PartitionId(0));
 
     clock.advance(window - Duration::from_millis(1));
     passes(&h, 3);
@@ -5202,8 +5237,96 @@ fn a_chase_window_closes_at_its_end_on_the_injected_clock() {
     passes(&h, 3);
     assert_eq!(last_poll(&h), test_options().event_poll_timeout);
 
-    release.store(true, Ordering::Relaxed);
-    held.lock().unwrap().clear();
+    release_acks();
+    h.shutdown.trigger();
+    h.join.join().unwrap().unwrap();
+}
+
+/// A hinted partition is chased at the tightened cadence until its window
+/// ends on the pipeline's clock, and at the ordinary cadence after.
+#[test]
+fn a_chase_window_closes_at_its_end_on_the_injected_clock() {
+    let window = Duration::from_secs(600);
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = Duration::from_secs(3600);
+    assert_chase_closes_after(window, cfg, |runtime| runtime.with_chase_window(window));
+}
+
+/// Pins the length `SourceEvent::CommitReady` promises a source: one commit
+/// interval.
+#[test]
+fn a_chase_window_lasts_one_commit_interval_by_default() {
+    let interval = Duration::from_secs(600);
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = interval;
+    assert_chase_closes_after(interval, cfg, |runtime| runtime);
+}
+
+/// Hinting a partition already being chased leaves the end of its window where
+/// it was.
+#[test]
+fn a_repeated_hint_does_not_extend_a_chase() {
+    let clock = crate::clock::TestClock::frozen();
+    let window = Duration::from_secs(600);
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = Duration::from_secs(3600);
+    let (h, release_acks) =
+        start_holding_acks(cfg, &clock, |runtime| runtime.with_chase_window(window));
+    assign_one_lane(&h, std::slice::from_ref(&(0..10)));
+    wait_for("the batch consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 10
+    });
+    hint(&h, PartitionId(0));
+    clock.advance(window - Duration::from_millis(1));
+    hint(&h, PartitionId(0));
+
+    clock.advance(Duration::from_millis(1));
+    passes(&h, 3);
+    assert_eq!(last_poll(&h), test_options().event_poll_timeout);
+
+    release_acks();
+    h.shutdown.trigger();
+    h.join.join().unwrap().unwrap();
+}
+
+/// A partition hinted during another's chase gets a whole window of its own.
+#[test]
+fn a_later_hint_gets_a_window_of_its_own() {
+    let clock = crate::clock::TestClock::frozen();
+    let window = Duration::from_secs(600);
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = Duration::from_secs(3600);
+    let (h, release_acks) =
+        start_holding_acks(cfg, &clock, |runtime| runtime.with_chase_window(window));
+    h.script.lock().unwrap().push_back(Script::Assign(vec![
+        LaneSpec {
+            id: LaneId(0),
+            partition: PartitionId(0),
+            batches: batches(std::slice::from_ref(&(0..10))),
+        },
+        LaneSpec {
+            id: LaneId(1),
+            partition: PartitionId(1),
+            batches: batches(std::slice::from_ref(&(0..10))),
+        },
+    ]));
+    wait_for("the batches consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 20
+    });
+    hint(&h, PartitionId(0));
+    clock.advance(window - Duration::from_millis(1));
+    hint(&h, PartitionId(1));
+
+    // The first partition's window has ended and the second's has not.
+    clock.advance(Duration::from_millis(1));
+    passes(&h, 3);
+    assert_eq!(last_poll(&h), super::controller::FAST_COMMIT_POLL);
+
+    clock.advance(window - Duration::from_millis(1));
+    passes(&h, 3);
+    assert_eq!(last_poll(&h), test_options().event_poll_timeout);
+
+    release_acks();
     h.shutdown.trigger();
     h.join.join().unwrap().unwrap();
 }
