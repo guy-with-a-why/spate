@@ -5317,7 +5317,7 @@ fn a_later_hint_gets_a_window_of_its_own() {
 }
 
 /// A commit that failed past a partition's window is retried by the periodic
-/// tick, and not before it.
+/// tick, and not before it, when no other partition is in its window.
 #[test]
 fn a_failed_post_window_commit_is_retried_on_the_tick() {
     let clock = crate::clock::TestClock::frozen();
