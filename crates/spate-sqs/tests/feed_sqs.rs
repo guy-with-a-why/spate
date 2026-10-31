@@ -18,8 +18,8 @@ use spate_core::clock::TestClock as StopClock;
 use spate_core::clock::tokio::TestClock;
 use spate_core::config::{FeedSection, PipelineConfig};
 use spate_core::feed::{
-    Confirmation, Delivery, DepthOf, DepthReading, Feed, FeedError, FeedWaker, Receipt,
-    STOP_RESERVE, Unit, wake_channel,
+    Confirmation, Delivery, DepthOf, DepthReading, Feed, FeedError, FeedMetricsCtx, FeedWaker,
+    Receipt, STOP_RESERVE, Unit, wake_channel,
 };
 use spate_core::ops::chain_owned;
 use spate_core::pipeline::{ExitState, Pipeline, RuntimeOptions, ShutdownHandle};
@@ -152,6 +152,10 @@ impl Feed for Recording {
 
     fn set_waker(&self, waker: FeedWaker) {
         self.inner.set_waker(waker);
+    }
+
+    fn attach_metrics(&self, cx: FeedMetricsCtx) {
+        self.inner.attach_metrics(cx);
     }
 
     fn receive(&self, max: usize) -> Result<Vec<Delivery>, FeedError> {
