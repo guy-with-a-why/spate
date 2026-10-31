@@ -5149,19 +5149,16 @@ fn the_commit_tick_fires_at_the_interval_on_the_injected_clock() {
     h.join.join().unwrap().unwrap();
 }
 
-/// Starts a runtime on `clock` that holds every ack, which keeps a hinted
-/// partition chased until its window closes. Also returns what releases the
-/// acks, which the run needs before it can drain.
+/// Starts a runtime on `clock` that holds every ack for the whole run, so a
+/// chase window closes with its acks outstanding.
 fn start_holding_acks(
     cfg: PipelineConfig,
     clock: &Arc<crate::clock::TestClock>,
     customize: impl FnOnce(PipelineRuntime<FakeSource>) -> PipelineRuntime<FakeSource>,
-) -> (Harness, impl FnOnce()) {
+) -> Harness {
     let held: Arc<Mutex<Vec<crate::checkpoint::AckRef>>> = Arc::new(Mutex::new(Vec::new()));
     let release = Arc::new(AtomicBool::new(false));
-    let held_c = Arc::clone(&held);
-    let release_c = Arc::clone(&release);
-    let h = start_on_clock_with(
+    start_on_clock_with(
         cfg,
         no_idle_flush(),
         clock,
@@ -5170,17 +5167,12 @@ fn start_holding_acks(
             shared,
             log,
             mode: ChainMode::HoldAcks {
-                held: Arc::clone(&held_c),
-                release: Arc::clone(&release_c),
+                held: Arc::clone(&held),
+                release: Arc::clone(&release),
             },
             batches_seen: 0,
         },
-    );
-    let release_acks = move || {
-        release.store(true, Ordering::Relaxed);
-        held.lock().unwrap().clear();
-    };
-    (h, release_acks)
+    )
 }
 
 /// Hints `partition` and waits for the next pass, so a test may move the clock.
@@ -5222,7 +5214,7 @@ fn assert_chase_closes_after(
     customize: impl FnOnce(PipelineRuntime<FakeSource>) -> PipelineRuntime<FakeSource>,
 ) {
     let clock = crate::clock::TestClock::frozen();
-    let (h, release_acks) = start_holding_acks(cfg, &clock, customize);
+    let h = start_holding_acks(cfg, &clock, customize);
     assign_one_lane(&h, std::slice::from_ref(&(0..10)));
     wait_for("the batch consumed", Duration::from_secs(5), || {
         h.chain.consumed.load(Ordering::Relaxed) == 10
@@ -5237,7 +5229,6 @@ fn assert_chase_closes_after(
     passes(&h, 3);
     assert_eq!(last_poll(&h), test_options().event_poll_timeout);
 
-    release_acks();
     h.shutdown.trigger();
     h.join.join().unwrap().unwrap();
 }
@@ -5252,8 +5243,7 @@ fn a_chase_window_closes_at_its_end_on_the_injected_clock() {
     assert_chase_closes_after(window, cfg, |runtime| runtime.with_chase_window(window));
 }
 
-/// Pins the length `SourceEvent::CommitReady` promises a source: one commit
-/// interval.
+/// Pins the one commit interval `SourceEvent::CommitReady` promises a source.
 #[test]
 fn a_chase_window_lasts_one_commit_interval_by_default() {
     let interval = Duration::from_secs(600);
@@ -5270,8 +5260,7 @@ fn a_repeated_hint_does_not_extend_a_chase() {
     let window = Duration::from_secs(600);
     let mut cfg = test_config(1);
     cfg.checkpoint.interval = Duration::from_secs(3600);
-    let (h, release_acks) =
-        start_holding_acks(cfg, &clock, |runtime| runtime.with_chase_window(window));
+    let h = start_holding_acks(cfg, &clock, |runtime| runtime.with_chase_window(window));
     assign_one_lane(&h, std::slice::from_ref(&(0..10)));
     wait_for("the batch consumed", Duration::from_secs(5), || {
         h.chain.consumed.load(Ordering::Relaxed) == 10
@@ -5284,7 +5273,6 @@ fn a_repeated_hint_does_not_extend_a_chase() {
     passes(&h, 3);
     assert_eq!(last_poll(&h), test_options().event_poll_timeout);
 
-    release_acks();
     h.shutdown.trigger();
     h.join.join().unwrap().unwrap();
 }
@@ -5296,8 +5284,7 @@ fn a_later_hint_gets_a_window_of_its_own() {
     let window = Duration::from_secs(600);
     let mut cfg = test_config(1);
     cfg.checkpoint.interval = Duration::from_secs(3600);
-    let (h, release_acks) =
-        start_holding_acks(cfg, &clock, |runtime| runtime.with_chase_window(window));
+    let h = start_holding_acks(cfg, &clock, |runtime| runtime.with_chase_window(window));
     h.script.lock().unwrap().push_back(Script::Assign(vec![
         LaneSpec {
             id: LaneId(0),
@@ -5317,16 +5304,82 @@ fn a_later_hint_gets_a_window_of_its_own() {
     clock.advance(window - Duration::from_millis(1));
     hint(&h, PartitionId(1));
 
-    // The first partition's window has ended and the second's has not.
-    clock.advance(Duration::from_millis(1));
+    clock.advance(window - Duration::from_millis(1));
     passes(&h, 3);
     assert_eq!(last_poll(&h), super::controller::FAST_COMMIT_POLL);
 
-    clock.advance(window - Duration::from_millis(1));
+    clock.advance(Duration::from_millis(1));
     passes(&h, 3);
     assert_eq!(last_poll(&h), test_options().event_poll_timeout);
 
-    release_acks();
+    h.shutdown.trigger();
+    h.join.join().unwrap().unwrap();
+}
+
+/// A revoked partition leaves the chase past its window, so a position it failed
+/// to commit waits for the tick while another partition's chase commits.
+#[test]
+fn a_revoked_partition_leaves_the_post_window_chase() {
+    let clock = crate::clock::TestClock::frozen();
+    let window = Duration::from_secs(600);
+    let mut cfg = test_config(1);
+    cfg.checkpoint.interval = Duration::from_secs(3600);
+    let h = start_on_clock_with(
+        cfg,
+        no_idle_flush(),
+        &clock,
+        |runtime| runtime.with_chase_window(window),
+        ok_chain,
+    );
+    h.shared.lock().unwrap().fail_commits = true;
+    h.script.lock().unwrap().push_back(Script::Assign(vec![
+        LaneSpec {
+            id: LaneId(0),
+            partition: PartitionId(0),
+            batches: batches(std::slice::from_ref(&(0..10))),
+        },
+        LaneSpec {
+            id: LaneId(1),
+            partition: PartitionId(1),
+            batches: batches(std::slice::from_ref(&(0..5))),
+        },
+    ]));
+    wait_for("the batches consumed", Duration::from_secs(5), || {
+        h.chain.consumed.load(Ordering::Relaxed) == 15
+    });
+    hint(&h, PartitionId(0));
+    clock.advance(window);
+    passes(&h, 3);
+    hint(&h, PartitionId(1));
+    wait_for("a failed commit", Duration::from_secs(5), || {
+        logged(&h, "commit-failed")
+    });
+
+    let flushed = h.shared.lock().unwrap().flush_commits;
+    h.script
+        .lock()
+        .unwrap()
+        .push_back(Script::Revoke(vec![LaneId(0)]));
+    wait_for("the revocation", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().flush_commits > flushed
+    });
+    // The pass handling the revocation finishes before the next poll, and it is
+    // the pass that drops the revoked partition from the chase.
+    passes(&h, 2);
+    h.shared.lock().unwrap().fail_commits = false;
+
+    wait_for("the chase commits", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().committed.get(&PartitionId(1)) == Some(&5)
+    });
+    assert!(
+        !h.shared
+            .lock()
+            .unwrap()
+            .committed
+            .contains_key(&PartitionId(0)),
+        "a revoked partition stayed in the chase"
+    );
+
     h.shutdown.trigger();
     h.join.join().unwrap().unwrap();
 }
