@@ -144,11 +144,11 @@ pub enum SourceEvent<L> {
     /// watermark reaches it through `Source::commit`. The runtime responds
     /// by committing those partitions *only* (flowing partitions keep the
     /// periodic tick) at a tightened cadence for one commit interval, then
-    /// on every control-plane poll while any of their lanes remains
-    /// assigned. A partition leaves when its lanes are retired or revoked,
-    /// or a new assignment begins. This is a latency optimization;
-    /// correctness does not depend on it, and sources that never emit it
-    /// get the periodic cadence.
+    /// on each control-plane poll that finds a partition's acked watermark
+    /// advanced, while any of its lanes remains assigned. A partition leaves
+    /// when its lanes are retired or revoked, or a new assignment begins.
+    /// This is a latency optimization; correctness does not depend on it,
+    /// and sources that never emit it get the periodic cadence.
     CommitReady {
         /// Partitions whose final acks are worth chasing.
         partitions: Vec<PartitionId>,
